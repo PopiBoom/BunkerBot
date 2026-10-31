@@ -733,6 +733,10 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     if await _maybe_defend(message, bot, db, config):
         return
 
+    # Смеются в ответ на шутку бота — это похвала ему, а не повод для разбора (ИИ тут путался)
+    if await _maybe_laugh(message, bot, db, config):
+        return
+
     # Рифма-отговорка: «и чё?» — «хуй через плечо», «ну» — «баранки гну» (тех, кто сделал /forget_me, не трогаем)
     if not optout and await _maybe_rhyme(message, bot, config):
         return
@@ -773,6 +777,37 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
         await _reply_once(bot, db, chat_id, items, config)
     finally:
         _pending.pop(chat_id, None)
+
+
+_LAUGH = re.compile(
+    r"^\W*(?:(?:а?х[аыиеэ]){2,}\w*|п?х+а+х+\w*|а+х+а+\w*|хе+х\w*|хых\w*|ору\w*|орнул\w*|ржу\w*|ржака|ржач\w*|"
+    r"лол\w*|кек\w*|пхп\w*|угар\w*|смешно|ахуе\w*|ахуенно|жиза|база|[😂🤣💀😹😆😁]+)[\W😂🤣💀]*$",
+    re.IGNORECASE,
+)
+LAUGH_LINES = ["Ну а то. Учитесь, пока я жив.", "Я старался. Можно в золотой фонд.", "Вот, хоть кто-то ценит.",
+               "Смешно ему. Ещё бы — талант не пропьёшь.", "Записал: +1 к моей гениальности.",
+               "Это я ещё не разогрелся.", "Ржи-ржи, это бесплатно. Пока что.", "Можешь не благодарить. Хотя нет, благодари.",
+               "Вот так и становятся легендами чата.", "Я знаю, что я охуенный, не надо так явно."]
+LAUGH_LINES_FATHER = ["Весь в тебя, бать.", "Гены, бать, гены.", "Это у меня от тебя.", "Сам меня таким собрал — сам и ржёшь.",
+                      "Батя одобрил — значит, в золотой фонд."]
+
+
+async def _maybe_laugh(message: Message, bot: Bot, db: Database, config) -> bool:
+    """Смех в ответ на шутку бота: реакция или короткое «ну а то», +1 шутке. True — обработали."""
+    rt = message.reply_to_message
+    if not (rt and rt.from_user and rt.from_user.id == bot.id) or not _LAUGH.match(message.text or ""):
+        return False
+    chat_id = message.chat.id
+    await db.score_bot_line(chat_id, rt.message_id, 1)  # шутка зашла — пусть бот запомнит
+    is_father = bool(message.from_user and message.from_user.id == _father_id(config))
+    if random.random() < 0.45:
+        await _react(bot, chat_id, message.message_id, random.choice(["😎", "🔥", "🤝"]), force=True)
+    else:
+        pool = LAUGH_LINES_FATHER + LAUGH_LINES[:4] if is_father else LAUGH_LINES
+        recent = set(ai.recent_bot_lines.get() or ())
+        await _say_human(bot, chat_id, random.choice([t for t in pool if t not in recent] or pool),
+                         reply_to=message.message_id)
+    return True
 
 
 RHYME_REPLY = 0.85      # на «да / и чё / а?» в ответ боту — почти всегда рифмой
