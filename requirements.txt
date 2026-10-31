@@ -4,3 +4,4 @@ python-dotenv>=1.0
 anthropic>=2.3,<3  # нужны output_config (effort) и fallbacks
 pillow>=10  # карточки-картинки
 aiohttp_socks>=0.8  # нужен только если используешь BOT_PROXY
+av>=12  # кадр из середины кружков/видео (ffmpeg уже внутри пакета)

@@ -30,6 +30,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message, MessageReactionUpdated, ReactionTypeEmoji, ReplyParameters
 
 import ai
+import frames
 import links
 from database import Database
 
@@ -498,13 +499,19 @@ async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
             sizes = sorted(message.photo, key=lambda p: p.width)
             photo = next((p for p in reversed(sizes) if p.width <= 1280), sizes[0])
             image = ((await bot.download(photo)).read(), "image/jpeg")
-        else:  # у видео и гифок смотрим хотя бы превью
-            thumb = getattr(message.video or message.animation or message.video_note, "thumbnail", None)
-            if thumb is not None:
-                data = (await bot.download(thumb)).read()
-                if ai.image_mime(data):
-                    image = (data, ai.image_mime(data))
-                    media = f"{media} (ты видишь только его превью — первый кадр)"
+        else:  # у видео — кадр из середины (первый часто тёмный), у гифок — превью
+            vid = message.video or message.video_note
+            frame = await _video_frame(bot, vid) if vid is not None else None
+            if frame:
+                image = (frame, "image/jpeg")
+                media = f"{media} (ты видишь один кадр из середины)"
+            else:
+                thumb = getattr(message.video or message.animation or message.video_note, "thumbnail", None)
+                if thumb is not None:
+                    data = (await bot.download(thumb)).read()
+                    if ai.image_mime(data):
+                        image = (data, ai.image_mime(data))
+                        media = f"{media} (ты видишь только его превью — первый кадр)"
         await asyncio.sleep(random.uniform(3.0, 6.0))  # «прочитал» пост
         await bot.send_chat_action(chat_id, "typing")
         await _remember_lines(db, chat_id)
@@ -1089,16 +1096,32 @@ async def on_group_video(message: Message, bot: Bot, db: Database, config=None) 
     if not leader:
         return
     media = message.video_note or message.video
-    thumb = getattr(media, "thumbnail", None)
+    frame = await _video_frame(bot, media) if ai.available() else None
     if message.video_note:
-        label, kind = "кружок", "кружок (видеосообщение; ты видишь только первый кадр)"
+        label, kind = "кружок", "кружок (видеосообщение; ты видишь один кадр из середины)"
     else:
-        label, kind = "видео", "видео (ты видишь только первый кадр)"
-    await _visual(message, bot, db, config, thumb, label, kind, caption, count)
+        label, kind = "видео", "видео (ты видишь один кадр из середины)"
+    await _visual(message, bot, db, config, getattr(media, "thumbnail", None), label, kind, caption, count,
+                  data=frame)
+
+
+VIDEO_MAX = 20 * 1024 * 1024  # больше Telegram боту скачать не даст
+
+
+async def _video_frame(bot: Bot, media) -> bytes | None:
+    """Кадр из середины видео (у кружков первый кадр — темнота). None — возьмём превью Telegram."""
+    if media is None or (getattr(media, "file_size", 0) or 0) > VIDEO_MAX:
+        return None
+    try:
+        data = (await bot.download(media)).read()
+        return await asyncio.to_thread(frames.middle_frame, data)
+    except Exception as e:
+        logger.debug("video frame failed: %s", e)
+        return None
 
 
 async def _visual(message: Message, bot: Bot, db: Database, config, src_file, label: str, kind: str,
-                  caption: str, count: int) -> None:
+                  caption: str, count: int, data: bytes | None = None) -> None:
     """Общее для фото, кружков и видео: рассмотреть, запомнить, иногда прокомментировать."""
     user = message.from_user
     chat_id = message.chat.id
@@ -1108,9 +1131,9 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
     # Смотрим КАЖДОЕ: короткое описание идёт в память чата, чтобы бот знал, что там,
     # даже если сейчас комментировать не будет (потом — в подколах, прожарках, ответах)
     img, mime, descr = None, "image/jpeg", ""
-    if ai.available() and src_file is not None:
+    if ai.available() and (data is not None or src_file is not None):
         try:
-            img = (await bot.download(src_file)).read()
+            img = data if data is not None else (await bot.download(src_file)).read()
             mime = ai.image_mime(img) or "image/jpeg"
             descr = await ai.describe_photo(img)
         except Exception as e:
