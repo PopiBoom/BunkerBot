@@ -494,9 +494,7 @@ async def cmd_bunker(message: Message, command: CommandObject, db: Database) -> 
 
     game = Game(chat_id=chat_id, host_id=user.id, db=db)
     arg = (command.args or "").strip().lower()
-    for key, (title, _style_txt) in C.MODES.items():
-        if arg and arg in title.lower():
-            game.mode = key
+    game.mode = C.MODE_ALIASES.get(arg, game.mode)
     try:
         game.bot_username = (await message.bot.me()).username or ""
     except Exception:

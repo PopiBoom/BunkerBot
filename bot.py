@@ -35,7 +35,7 @@ async def set_commands(bot: Bot, config) -> None:
         BotCommand(command="top", description="Рейтинг выживших в Бункере"),
     ]
     group = [
-        BotCommand(command="bunker", description="Начать игру «Бункер»"),
+        BotCommand(command="bunker", description="Начать «Бункер» (можно: /bunker злой, добрый, кринж)"),
         BotCommand(command="bunker_stop", description="Остановить игру (только ведущий)"),
         BotCommand(command="top", description="Рейтинг выживших"),
     ]

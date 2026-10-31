@@ -164,3 +164,10 @@ MODES: dict[str, tuple[str, str]] = {
                            "неуместный пафос, эмодзи словами."),
 }
 MODE_ORDER = list(MODES)
+# Как можно написать режим в команде: /bunker злой
+MODE_ALIASES = {
+    "классика": "classic", "классический": "classic", "обычный": "classic",
+    "злой": "evil", "злобный": "evil", "жёсткий": "evil", "жесткий": "evil",
+    "ласковый": "kind", "добрый": "kind", "милый": "kind",
+    "кринж": "cringe", "кринжовый": "cringe", "зумер": "cringe",
+}
