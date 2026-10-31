@@ -55,6 +55,182 @@ class Database:
                 )
                 """
             )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    chat_id  INTEGER NOT NULL,
+                    msg_id   INTEGER NOT NULL,
+                    user_id  INTEGER NOT NULL,
+                    name     TEXT,
+                    username TEXT,
+                    text     TEXT NOT NULL,
+                    ts       INTEGER NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_messages ON chat_messages (chat_id, ts)"
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dossiers (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    name    TEXT,
+                    text    TEXT NOT NULL,
+                    updated INTEGER NOT NULL,
+                    PRIMARY KEY (chat_id, user_id)
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS roast_optout (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    PRIMARY KEY (chat_id, user_id)
+                )
+                """
+            )
+            await db.commit()
+
+    # --- память чата (стёб-бот) ---
+
+    async def add_chat_message(self, chat_id: int, msg_id: int, user_id: int, name: str,
+                               username: str | None, text: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO chat_messages (chat_id, msg_id, user_id, name, username, text, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (chat_id, msg_id, user_id, name, username, text, int(time.time())),
+            )
+            await db.commit()
+
+    async def recent_messages(self, chat_id: int, limit: int = 40, user_id: int | None = None,
+                              since: int = 0) -> list[tuple]:
+        """[(msg_id, user_id, name, text, ts)] от старых к новым, без тех, кто отказался."""
+        sql = ("SELECT m.msg_id, m.user_id, m.name, m.text, m.ts FROM chat_messages m "
+               "WHERE m.chat_id = ? AND m.ts >= ? AND NOT EXISTS (SELECT 1 FROM roast_optout o "
+               "WHERE o.chat_id = m.chat_id AND o.user_id = m.user_id)")
+        args: list = [chat_id, since]
+        if user_id is not None:
+            sql += " AND m.user_id = ?"
+            args.append(user_id)
+        sql += " ORDER BY m.ts DESC LIMIT ?"
+        args.append(limit)
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(sql, args)
+            rows = list(await cur.fetchall())
+        return rows[::-1]
+
+    async def count_messages_since(self, chat_id: int, since: int) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM chat_messages WHERE chat_id = ? AND ts >= ?", (chat_id, since)
+            )
+            row = await cur.fetchone()
+            return int(row[0]) if row else 0
+
+    async def active_chats(self, since: int) -> list[int]:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT DISTINCT chat_id FROM chat_messages WHERE ts >= ?", (since,))
+            return [int(r[0]) for r in await cur.fetchall()]
+
+    async def find_user(self, chat_id: int, username: str) -> tuple | None:
+        """(user_id, name) по @username среди тех, кто писал в чат."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT user_id, name FROM chat_messages WHERE chat_id = ? AND lower(username) = lower(?) "
+                "ORDER BY ts DESC LIMIT 1", (chat_id, username.lstrip("@")),
+            )
+            return await cur.fetchone()
+
+    async def users_needing_dossier(self, min_new: int = 30, stale_new: int = 5,
+                                    stale_after: int = 86400, limit: int = 5) -> list[tuple]:
+        """(chat_id, user_id, name, старое досье) — у кого накопилось новое для сжатия."""
+        now = int(time.time())
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                """
+                SELECT m.chat_id, m.user_id, MAX(m.name), COALESCE(d.text, ''), COUNT(*) AS n,
+                       COALESCE(d.updated, 0) AS upd
+                FROM chat_messages m
+                LEFT JOIN dossiers d ON d.chat_id = m.chat_id AND d.user_id = m.user_id
+                WHERE m.ts > COALESCE(d.updated, 0)
+                  AND NOT EXISTS (SELECT 1 FROM roast_optout o
+                                  WHERE o.chat_id = m.chat_id AND o.user_id = m.user_id)
+                GROUP BY m.chat_id, m.user_id
+                HAVING n >= ? OR (n >= ? AND ? - upd >= ?)
+                ORDER BY n DESC LIMIT ?
+                """,
+                (min_new, stale_new, now, stale_after, limit),
+            )
+            return [(r[0], r[1], r[2], r[3]) for r in await cur.fetchall()]
+
+    async def messages_since_dossier(self, chat_id: int, user_id: int, limit: int = 120) -> list[str]:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                """
+                SELECT m.text FROM chat_messages m
+                LEFT JOIN dossiers d ON d.chat_id = m.chat_id AND d.user_id = m.user_id
+                WHERE m.chat_id = ? AND m.user_id = ? AND m.ts > COALESCE(d.updated, 0)
+                ORDER BY m.ts DESC LIMIT ?
+                """,
+                (chat_id, user_id, limit),
+            )
+            return [r[0] for r in await cur.fetchall()][::-1]
+
+    async def set_dossier(self, chat_id: int, user_id: int, name: str, text: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO dossiers (chat_id, user_id, name, text, updated) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(chat_id, user_id) DO UPDATE SET name = excluded.name, "
+                "text = excluded.text, updated = excluded.updated",
+                (chat_id, user_id, name, text, int(time.time())),
+            )
+            await db.commit()
+
+    async def get_dossier(self, chat_id: int, user_id: int) -> str:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT text FROM dossiers WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+            )
+            row = await cur.fetchone()
+            return row[0] if row else ""
+
+    async def chat_dossiers(self, chat_id: int) -> dict[str, str]:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT name, text FROM dossiers d WHERE chat_id = ? AND NOT EXISTS ("
+                "SELECT 1 FROM roast_optout o WHERE o.chat_id = d.chat_id AND o.user_id = d.user_id)",
+                (chat_id,),
+            )
+            return {r[0]: r[1] for r in await cur.fetchall()}
+
+    async def is_optout(self, chat_id: int, user_id: int) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT 1 FROM roast_optout WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+            )
+            return await cur.fetchone() is not None
+
+    async def forget_user(self, chat_id: int, user_id: int) -> None:
+        """Удаляет всё о человеке в этом чате и больше его не запоминает."""
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("DELETE FROM chat_messages WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+            await db.execute("DELETE FROM dossiers WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+            await db.execute("INSERT OR IGNORE INTO roast_optout (chat_id, user_id) VALUES (?, ?)",
+                             (chat_id, user_id))
+            await db.commit()
+
+    async def unforget_user(self, chat_id: int, user_id: int) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("DELETE FROM roast_optout WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+            await db.commit()
+
+    async def purge_old_messages(self, older_than: int) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("DELETE FROM chat_messages WHERE ts < ?", (older_than,))
             await db.commit()
 
     # --- расходы на ИИ ---

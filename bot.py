@@ -19,7 +19,8 @@ from aiogram.types import (
 from config import load_config
 from database import Database
 from games import bunker_router
-from handlers import admin_router, user_router
+from handlers import admin_router, roast_router, user_router
+from handlers.roast import background as roast_background
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +40,10 @@ async def set_commands(bot: Bot, config) -> None:
         BotCommand(command="bunker_stop", description="Остановить игру (только ведущий)"),
         BotCommand(command="bunker_bots", description="Добавить в лобби тестовых ботов (временно)"),
         BotCommand(command="top", description="Рейтинг выживших"),
+        BotCommand(command="roast", description="Прожарить (ответом на сообщение или @ник)"),
+        BotCommand(command="week", description="Итоги недели чата"),
+        BotCommand(command="forget_me", description="Забыть меня и не стебать"),
+        BotCommand(command="remember_me", description="Снова запоминать меня"),
     ]
     admin = private + [BotCommand(command="admin", description="Панель администратора")]
     try:
@@ -74,6 +79,8 @@ async def main() -> None:
     dp.include_router(admin_router)
     dp.include_router(bunker_router)
     dp.include_router(user_router)
+    # Стёб-бот последним: ловит все остальные сообщения групп
+    dp.include_router(roast_router)
 
     await set_commands(bot, config)
 
@@ -81,6 +88,7 @@ async def main() -> None:
     logger.info("Бот @%s запущен. Требуемые чаты: %s", me.username, config.required_chats)
 
     await bot.delete_webhook(drop_pending_updates=True)
+    roast_task = asyncio.create_task(roast_background(bot, db))  # noqa: F841 — живёт всё время работы
     await dp.start_polling(bot)
 
 

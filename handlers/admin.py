@@ -66,6 +66,24 @@ async def admin_stats(call: CallbackQuery, db: Database, config: Config) -> None
         )
 
 
+@router.callback_query(F.data == "admin:roast_toggle")
+async def admin_roast_toggle(call: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    on = (await db.get_setting("roast_enabled", "1")) == "1"
+    await db.set_setting("roast_enabled", "0" if on else "1")
+    state = "выключен ⛔" if on else "включён 🔥"
+    await call.answer(f"Стёб-бот {state}", show_alert=True)
+    if call.message:
+        await call.message.answer(
+            f"🔥 Стёб-бот {state}\n\n"
+            "Когда включён: запоминает сообщения в группах (30 дней), ведёт досье, "
+            "иногда сам подкалывает, отвечает на обращения, /roast, /week. "
+            "Участники могут отказаться: /forget_me."
+        )
+
+
 @router.callback_query(F.data == "admin:ai_costs")
 async def admin_ai_costs(call: CallbackQuery, db: Database, config: Config) -> None:
     if not _is_admin(call.from_user.id, config):
