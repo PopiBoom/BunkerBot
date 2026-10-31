@@ -20,6 +20,7 @@ from config import load_config
 from database import Database
 from games import bunker_router
 from handlers import admin_router, roast_router, user_router
+from handlers.admin import auto_backup_loop
 from handlers.roast import background as roast_background
 
 logging.basicConfig(
@@ -93,8 +94,16 @@ async def main() -> None:
     logger.info("Бот @%s запущен. Требуемые чаты: %s", me.username, config.required_chats)
 
     await bot.delete_webhook(drop_pending_updates=True)
-    roast_task = asyncio.create_task(roast_background(bot, db))  # noqa: F841 — живёт всё время работы
-    await dp.start_polling(bot)
+    # Фоновые задачи живут всё время работы; ссылки держим, чтобы их не собрал GC
+    background = [
+        asyncio.create_task(roast_background(bot, db)),
+        asyncio.create_task(auto_backup_loop(bot, db, config)),  # ночной бэкап базы бате в личку
+    ]
+    try:
+        await dp.start_polling(bot)
+    finally:
+        for task in background:
+            task.cancel()
 
 
 if __name__ == "__main__":

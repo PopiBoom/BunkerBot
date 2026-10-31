@@ -1,7 +1,7 @@
 """Рисование карточки игрока («пропуск в бункер») через Pillow.
 
 Шаблон целиком в коде: тёмный фон, сигнальная лента, поля с иконками,
-карта действия, тайная цель и (по желанию) штамп ДОПУЩЕН / ОТКАЗАНО.
+карта действия и (по желанию) штамп ДОПУЩЕН / ОТКАЗАНО / ПОГИБ.
 """
 from __future__ import annotations
 
@@ -142,8 +142,7 @@ def render_card_image(
     card: dict,
     serial: int,
     action: str | None = None,
-    goal: str | None = None,
-    stamp: str | None = None,          # "in" | "out" | None
+    stamp: str | None = None,          # "in" | "out" | "dead" | None
     revealed: set[str] | None = None,  # None — показать всё; иначе скрытые поля помечаются
     subtitle: str = "ПРОПУСК В БУНКЕР",
 ) -> Image.Image:
@@ -162,8 +161,6 @@ def render_card_image(
     if action and action in ACTIONS:
         emoji, title, desc, _when, _t = ACTIONS[action]
         extra.append(("КАРТА ДЕЙСТВИЯ", title, desc, ACCENT))
-    if goal:
-        extra.append(("ТАЙНАЯ ЦЕЛЬ", "", goal, (120, 170, 255)))
     extra_layout = []
     for head, title, desc, col in extra:
         body = (f"{title}. {desc}" if title else desc)
@@ -206,7 +203,7 @@ def render_card_image(
         y += h
         d.line([(text_x, y - 12), (W - PAD, y - 12)], fill=LINE, width=1)
 
-    # Карта действия / цель
+    # Карта действия
     y += 20
     for head, lines, col, h in extra_layout:
         d.rounded_rectangle([PAD, y, W - PAD, y + h], radius=18, fill=PANEL, outline=col, width=3)

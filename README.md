@@ -97,6 +97,6 @@ keyboards.py      # клавиатуры шлюза подписки
 texts.py          # тексты по умолчанию
 ai.py             # ведущий игры на Claude (сценарий, карточки, шутки)
 handlers/         # user.py (подписка), admin.py (админка), roast.py (стёб-бот)
-games/bunker/     # game.py (ход игры), content.py (карты, цели, режимы), render.py (картинки)
+games/bunker/     # game.py (ход игры), content.py (карты, режимы), render.py (картинки)
 assets/fonts/     # шрифты DejaVu для карточек
 ```

@@ -113,7 +113,7 @@ class Game:
     revealed_this_round: set[int] = field(default_factory=set)
     round_reveals: list[dict] = field(default_factory=list)
     # голосование
-    votes: dict[int, int] = field(default_factory=dict)            # игрок -> цель
+    votes: dict[int, int] = field(default_factory=dict)            # кто голосует -> против кого
     vote_targets: set[int] = field(default_factory=set)  # за кого можно голосовать (при ничьей — только равные)
     revote: int = 0                                        # номер переголосования (0 — основное)
     immune: set[int] = field(default_factory=set)
@@ -790,7 +790,7 @@ async def cmd_top(message: Message, db: Database) -> None:
         return
     medals = ["🥇", "🥈", "🥉"]
     blocks = [f"🏆 <b>РЕЙТИНГ ВЫЖИВШИХ</b>\n{HR}"]
-    for i, (name, games_n, surv, _first_out, _goals) in enumerate(rows):
+    for i, (name, games_n, surv, _first_out) in enumerate(rows):
         place = medals[i] if i < 3 else f"<b>{i + 1}.</b>"
         rate = surv / games_n if games_n else 0
         filled = round(rate * 10)
@@ -1803,7 +1803,7 @@ async def _finish(bot: Bot, game: Game) -> None:
         logger.warning("postcard failed: %s", e)
 
     results = [{"user_id": p.user_id, "name": p.name, "survived": p.alive,
-                "first_out": p.user_id == game.first_out, "goal_done": False}
+                "first_out": p.user_id == game.first_out}
                for p in game.players.values() if not p.is_bot]
 
     if game.db:

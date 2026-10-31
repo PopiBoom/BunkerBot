@@ -253,12 +253,18 @@ async def admin_react_set(call: CallbackQuery, db: Database, config: Config) -> 
 _DB_TABLES = {"users", "settings", "chat_messages", "dossiers", "bunker_stats"}  # stickers досоздаст init()
 
 
+AUTO_BACKUP_KEY = "auto_backup"         # "1" — каждый день присылать бэкап админу в личку
+AUTO_BACKUP_LAST = "auto_backup_last"   # дата (МСК) последнего автобэкапа
+AUTO_BACKUP_HOUR = 5                    # МСК: ночью, когда в чате тихо
+MAX_BACKUP_SIZE = 48 * 1024 * 1024      # Telegram не даст боту отправить файл больше 50 МБ
+
+
 @router.message(Command("backup"))
 async def cmd_backup(message: Message, bot: Bot, db: Database, config: Config) -> None:
     if message.from_user is None or not _is_admin(message.from_user.id, config):
         await message.answer(texts.ADMIN_ONLY)
         return
-    await _send_backup(message, bot, db)
+    await _send_backup(bot, db, message.chat.id)
 
 
 @router.callback_query(F.data == "admin:backup")
@@ -268,31 +274,87 @@ async def admin_backup(call: CallbackQuery, bot: Bot, db: Database, config: Conf
         return
     await call.answer()
     if call.message:
-        await _send_backup(call.message, bot, db)
+        await _send_backup(bot, db, call.message.chat.id)
 
 
-async def _send_backup(message: Message, bot: Bot, db: Database) -> None:
-    """Согласованная копия базы (через sqlite backup API) — файлом в личку."""
+@router.callback_query(F.data == "admin:auto_backup")
+async def admin_auto_backup(call: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    on = (await db.get_setting(AUTO_BACKUP_KEY, "1")) == "1"
+    await db.set_setting(AUTO_BACKUP_KEY, "0" if on else "1")
+    state = "выключен ⛔" if on else "включён ✅"
+    await call.answer(f"Автобэкап {state}", show_alert=True)
+    if call.message:
+        await call.message.answer(
+            f"🗄 Автобэкап {state}\n\n"
+            f"Когда включён: каждую ночь (около {AUTO_BACKUP_HOUR}:00 МСК) бот присылает сюда файл "
+            "с базой — досье, переписка, рейтинг, обещания, настройки. Если с сервером что-то "
+            "случится, пришлите последний файл боту в личку — всё восстановится."
+        )
+
+
+def _make_backup(path: str) -> str:
+    """Согласованная копия базы через sqlite backup API (работает и пока бот пишет в базу)."""
     import sqlite3
     import tempfile
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
+    src = sqlite3.connect(path)
+    dst = sqlite3.connect(tmp)
+    try:
+        with dst:
+            src.backup(dst)
+    finally:
+        src.close()
+        dst.close()
+    return tmp
+
+
+async def _send_backup(bot: Bot, db: Database, chat_id: int, auto: bool = False) -> bool:
+    """Бэкап базы файлом в личку. True — отправлен."""
     import time as _t
 
     from aiogram.types import FSInputFile
 
-    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
-    src = sqlite3.connect(db.path)
-    dst = sqlite3.connect(tmp)
-    with dst:
-        src.backup(dst)
-    src.close()
-    dst.close()
-    name = f"bunkerbot-backup-{_t.strftime('%Y%m%d-%H%M')}.db"
-    await bot.send_document(
-        message.chat.id, FSInputFile(tmp, filename=name),
-        caption="💾 Бэкап базы: досье, переписка, рейтинги, обещания, настройки.\n\n"
-                "Чтобы восстановить на другом сервере — просто пришлите этот файл боту в личку.",
-    )
-    os.remove(tmp)
+    tmp = await asyncio.to_thread(_make_backup, db.path)
+    try:
+        size = os.path.getsize(tmp)
+        if size > MAX_BACKUP_SIZE:
+            await bot.send_message(chat_id, f"⚠️ База выросла до {size // (1024 * 1024)} МБ — "
+                                            "Telegram не даст отправить её файлом. Скажи Claude, чтобы ужал бэкап.")
+            return False
+        name = f"bunkerbot-backup-{_t.strftime('%Y%m%d-%H%M')}.db"
+        head = "🗄 Ночной автобэкап базы" if auto else "💾 Бэкап базы"
+        await bot.send_document(
+            chat_id, FSInputFile(tmp, filename=name), disable_notification=auto,
+            caption=f"{head}: досье, переписка, рейтинги, обещания, настройки.\n\n"
+                    "Чтобы восстановить на другом сервере — просто пришлите этот файл боту в личку.",
+        )
+        return True
+    finally:
+        os.remove(tmp)
+
+
+async def auto_backup_loop(bot: Bot, db: Database, config: Config) -> None:
+    """Раз в сутки ночью присылает бэкап базы первому админу (бате). Запускается из bot.py."""
+    from datetime import datetime, timedelta, timezone
+
+    msk = timezone(timedelta(hours=3))
+    while True:
+        try:
+            now = datetime.now(msk)
+            today = now.strftime("%Y-%m-%d")
+            if (now.hour >= AUTO_BACKUP_HOUR and config.admin_ids
+                    and (await db.get_setting(AUTO_BACKUP_KEY, "1")) == "1"
+                    and (await db.get_setting(AUTO_BACKUP_LAST, "")) != today):
+                await db.set_setting(AUTO_BACKUP_LAST, today)  # не чаще раза в сутки, даже если сбой
+                await _send_backup(bot, db, config.admin_ids[0], auto=True)
+                logger.info("auto backup sent")
+        except Exception:
+            logger.exception("auto backup failed")
+        await asyncio.sleep(600)
 
 
 async def _restore_db(message: Message, bot: Bot, db: Database) -> None:
