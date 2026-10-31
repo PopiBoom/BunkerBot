@@ -1406,7 +1406,7 @@ async def _play_action(bot: Bot, game: Game, p: Player, target: Player | None) -
 
 def _threat_scores(game: Game) -> dict[int, float]:
     scores = {p.user_id: 0.0 for p in _alive(game)}
-    for voter, target in game.threat_votes.items():
+    for _voter, target in game.threat_votes.items():
         if target in scores:
             scores[target] += 1.0
     return scores

@@ -72,7 +72,7 @@ _RUDE = re.compile(
     re.IGNORECASE,
 )
 _SEND_OFF = re.compile(r"на\s*хуй|нахуй|\bнах\b|в\s*жоп|в\s*пизд", re.IGNORECASE)
-# Бате бот не грубит — даже если батя послал его первым
+# Ответ бате на «иди нахуй» в добрый раз (в «грубый» — обычные MIRRORS с «бать»)
 FATHER_MIRRORS = ["Не могу, бать, кто ж тогда за чатом следить будет.", "Понял, ухожу… минут через пять.",
                   "И я тебя люблю, батя.", "Бать, ты меня таким и собрал — сам виноват.",
                   "Ладно-ладно, пап, не кипятись."]
@@ -235,6 +235,7 @@ QUIET_AFTER_SPEAKING = 20                  # сам не встревает, е�
 
 BOT_SELF = "🤖 ты (бот)"  # так собственные реплики бота подписаны в контексте для ИИ
 _db_ref: list = []         # база для записи своих реплик (заполняется при первом сообщении)
+_cfg_ref: list = []        # config для фоновых задач (там его нет) — чтобы знать id бати
 
 
 # ---------- реакции ----------
@@ -681,6 +682,8 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     chat_id = message.chat.id
     if not _db_ref:
         _db_ref.append(db)
+    if config is not None and not _cfg_ref:
+        _cfg_ref.append(config)  # фоновым задачам нужен id бати, а config им не передаётся
     if not await _enabled(db):
         return
     optout = await db.is_optout(chat_id, user.id)
@@ -704,7 +707,7 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
                 await _ensure_genders(db, chat_id)
                 await db.add_gender_hits(chat_id, user.id, m, f)
     if src:  # пересланный текст — чужие слова: не обещание, не грубость боту и не наезд на батю
-        if not _bunker_active(chat_id):
+        if not _bunker_active(chat_id) and not optout:
             _spawn(_maybe_react(bot, db, message, False))
         return
 
@@ -720,8 +723,8 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     if await _maybe_defend(message, bot, db, config):
         return
 
-    # Рифма-отговорка: «и чё?» — «хуй через плечо», «ну» — «баранки гну»
-    if await _maybe_rhyme(message, bot, config):
+    # Рифма-отговорка: «и чё?» — «хуй через плечо», «ну» — «баранки гну» (тех, кто сделал /forget_me, не трогаем)
+    if not optout and await _maybe_rhyme(message, bot, config):
         return
 
     # Обращаются ли к боту?
@@ -733,7 +736,8 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     by_name = bool(_BOT_NAME.search(text))
     addressed = reply_to_bot or mentioned or by_name or bool(_BOT_WORD.search(text))
     if not addressed:
-        _spawn(_maybe_react(bot, db, message, user.id == _father_id(config)))
+        if not optout:  # /forget_me — «не трогаю»: без реакций
+            _spawn(_maybe_react(bot, db, message, user.id == _father_id(config)))
         return
     if _RUDE.search(text):
         _spawn(_react(bot, chat_id, message.message_id, "🖕", force=True))
@@ -1132,7 +1136,7 @@ async def on_group_photo(message: Message, bot: Bot, db: Database, config=None) 
 
 @router.message(F.video_note | F.video)
 async def on_group_video(message: Message, bot: Bot, db: Database, config=None) -> None:
-    """Кружки и видео: бот смотрит первый кадр (превью) — как фото."""
+    """Кружки и видео: бот смотрит кадр из середины (первый у кружков обычно тёмный) — как фото."""
     user = message.from_user
     if user is None or user.is_bot:
         return
@@ -1328,8 +1332,15 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int, interval: int) -> No
         return  # пока думали, бот уже успел ответить кому-то — молчим
     if result["text"]:
         reply_to = result["reply_to"] if result["reply_to"] in new_ids else None
-        trigger = next((r[3] for r in rows if r[0] == reply_to), rows[-1][3])
-        text = await ai.polish(result["text"], trigger, _as_dicts(rows))
+        target = next((r for r in rows if r[0] == reply_to), rows[-1])
+        trigger = target[3]
+        is_father = target[1] == _father_id(_cfg_ref[0] if _cfg_ref else None)
+        if is_father:  # подкол бате — в его режиме (иногда грубо, чаще по-доброму)
+            ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)
+        text = await ai.polish(result["text"], trigger, _as_dicts(rows),
+                               author=ai.FATHER_NAME if is_father else (target[2] or "" if target[1] > 0 else ""))
+        if is_father:
+            text = ai.vary_father(text)
         if chat_id in _pending or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
             return
         if text:

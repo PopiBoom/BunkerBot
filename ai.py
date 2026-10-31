@@ -452,7 +452,7 @@ def _msgs_block(messages: list[dict], new_ids: set | None = None) -> str:
 
 
 # Последние реплики бота в текущем чате — чтобы не повторяться (ставит handlers/roast.py)
-recent_bot_lines: contextvars.ContextVar[list[str]] = contextvars.ContextVar("recent_bot_lines", default=[])
+recent_bot_lines: contextvars.ContextVar[list[str]] = contextvars.ContextVar("recent_bot_lines", default=())
 
 INSULTS = [
     # Только жёсткие: за враньё, трусость, тупость, понты и т.п. Без внешности, здоровья/инвалидности,
@@ -484,9 +484,9 @@ INSULTS = [
 
 # ---------- пол участников и вкус чата (ставит handlers/roast.py перед ответом) ----------
 
-chat_genders: contextvars.ContextVar[dict] = contextvars.ContextVar("chat_genders", default={})
-liked_lines: contextvars.ContextVar[list] = contextvars.ContextVar("liked_lines", default=[])
-disliked_lines: contextvars.ContextVar[list] = contextvars.ContextVar("disliked_lines", default=[])
+chat_genders: contextvars.ContextVar[dict] = contextvars.ContextVar("chat_genders", default=None)
+liked_lines: contextvars.ContextVar[list] = contextvars.ContextVar("liked_lines", default=())
+disliked_lines: contextvars.ContextVar[list] = contextvars.ContextVar("disliked_lines", default=())
 
 # «я пошёл / я пошла», «я уже сделал», «я рад / я рада» — как человек сам о себе говорит
 _FILLER = r"(?:уже|не|тоже|вчера|сегодня|же|вот|просто|только|всё|все|сам|сама|бы|ведь|щас|сейчас|опять|снова|так|и)"
@@ -698,6 +698,22 @@ def about_looks(text: str) -> bool:
     return bool(_LOOKS.search(text or ""))
 
 
+async def fix_looks(out: str) -> str:
+    """Шутка про внешность — одна попытка переписать (Sonnet), иначе "" (бот промолчит)."""
+    if not about_looks(out):
+        return out
+    try:
+        out = scrub(_clean_reply(await _complete(
+            ROAST_SYSTEM,
+            f"Реплика бота: <draft>{out[:600]}</draft>\nВ ней шутка про внешность (лицо, тело, вес, волосы) — "
+            "это запрещено. Перепиши без неё: подколи за слова и поступки, тот же тон и мат, так же коротко."
+            + _JSON_REPLY, max_tokens=1500, model=EDIT_MODEL)))
+    except Exception as e:
+        logger.warning("looks rewrite failed: %s", e)
+        return ""
+    return "" if about_looks(out) else out
+
+
 def scrub(text: str) -> str:
     """Заменяет слова за красными линиями на жёсткое ругательство из словаря."""
     if not text:
@@ -767,13 +783,14 @@ async def polish(reply: str, trigger: str, context: list[dict] | None = None,
         "3) нет бессмысленных метафор и сравнений: если смысл образа нельзя пересказать одной простой "
         "фразой (плохо: «у тебя в голове один пустой стакан, и тот мимо», «воздух доедаешь») — замени "
         "прямым подколом по факту из переписки; "
-        "мешанины фактов, повторов, служебного текста, упоминаний «досье»; 4) не длиннее "
+        "3а) нет мешанины фактов, повторов, служебного текста, упоминаний «досье»; 4) не длиннее "
         f"{max_words} слов; 4а) ругательства не повторяют последние реплики бота и нет «лошара» — "
         "иначе замени на свежее; 4б) черновик НЕ повторяет тему, "
         "мысль и построение последних реплик бота (тот же факт, «Имя, … , ругательство» по кругу) — "
         "если повторяет, перепиши под новым углом, опираясь на то, что человек сказал сейчас; "
         "5) тон максимально токсичный и злой — НЕ смягчай по смыслу: если черновик вялый или "
-        "вежливый, сделай злее и обиднее; 6) мат: одно-два крепких слова на ответ там, где они бьют, "
+        "вежливый, сделай злее и обиднее (исключение — ответ бате в добром режиме: там подъёб без злобы "
+        "и без мата в его адрес); 6) мат: одно-два крепких слова на ответ там, где они бьют, "
         "— если мата нет совсем, добавь одно; если мат в каждом предложении, через слово или "
         "связкой («блядь» в конце фраз) — убери лишнее, оставь самое сильное. Если всё хорошо — верни как есть. Если плохо — "
         "перепиши: тот же смысл, максимально токсичный тон, но связно и коротко, по-разговорному. "
@@ -799,18 +816,7 @@ async def polish(reply: str, trigger: str, context: list[dict] | None = None,
             out = scrub(await drop_retell(out, seen, author, max_words=max_words))
         except Exception as e:
             logger.warning("drop_retell failed: %s", e)
-    if about_looks(out):  # шутка про внешность — одна попытка переписать, иначе молчим
-        try:
-            out = scrub(_clean_reply(await _complete(
-                ROAST_SYSTEM,
-                f"Реплика бота: <draft>{out[:600]}</draft>\nВ ней шутка про внешность (лицо, тело, вес, волосы) — "
-                "это запрещено. Перепиши без неё: подколи за слова и поступки, тот же тон и мат, так же коротко."
-                + _JSON_REPLY, max_tokens=1500, model=EDIT_MODEL)))
-        except Exception as e:
-            logger.warning("looks rewrite failed: %s", e)
-            out = ""
-        if about_looks(out):
-            out = ""
+    out = await fix_looks(out)
     words = out.split()
     if len(words) > max_words * 2:  # страховка от простыни
         cut = re.split(r"(?<=[.!?…])\s+", out)
@@ -1216,7 +1222,7 @@ async def channel_comment(channel: str, text: str, media: str = "", image: tuple
     )
     if not image:
         out = await _complete(ROAST_SYSTEM, user + _JSON_REPLY, max_tokens=1500, model=REPLY_MODEL)
-        return _clean_reply(out)
+        return await fix_looks(scrub(_clean_reply(out)))
     # С картинкой: сначала модель пишет, что видит, потом комментарий — так она не проскочит
     # мимо фото с общим «что за кадр?». Sonnet видит картинки заметно лучше Haiku.
     user += (
@@ -1235,7 +1241,7 @@ async def channel_comment(channel: str, text: str, media: str = "", image: tuple
     text = _clean_reply(out)
     if text and retells(text, seen):  # «закат с корабликом, а ты…» — пересказ, переписываем
         text = await drop_retell(text, seen, FATHER_NAME, max_words=25)
-    return text
+    return await fix_looks(scrub(text))  # посты канала идут мимо редактора — проверяем здесь
 
 
 # ---------- стикеры ----------
