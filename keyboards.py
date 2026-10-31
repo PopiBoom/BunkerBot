@@ -29,6 +29,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     builder.row(InlineKeyboardButton(text="📢 Рассылка", callback_data="admin:broadcast"))
     builder.row(InlineKeyboardButton(text="💰 Расходы ИИ", callback_data="admin:ai_costs"))
     builder.row(InlineKeyboardButton(text="🔥 Стёб-бот: вкл/выкл", callback_data="admin:roast_toggle"))
+    builder.row(InlineKeyboardButton(text="⏱ Как часто бот встревает", callback_data="admin:roast_freq"))
     builder.row(
         InlineKeyboardButton(text="✏️ Текст приветствия", callback_data="admin:edit_welcome"),
         InlineKeyboardButton(text="🎁 Текст награды", callback_data="admin:edit_reward"),
@@ -48,4 +49,17 @@ def confirm_broadcast_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="✅ Отправить всем", callback_data="admin:broadcast_go"),
         InlineKeyboardButton(text="✖️ Отмена", callback_data="admin:cancel"),
     )
+    return builder.as_markup()
+
+
+def roast_interval_keyboard(current: int) -> InlineKeyboardMarkup:
+    """Выбор частоты, с которой стёб-бот сам встревает в разговор."""
+    from handlers.roast import INTERVALS
+
+    builder = InlineKeyboardBuilder()
+    for sec, label, _ in INTERVALS:
+        mark = "✅ " if sec == current else ""
+        builder.button(text=f"{mark}{label}", callback_data=f"admin:roast_freq:{sec}")
+    builder.adjust(3)
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:cancel"))
     return builder.as_markup()

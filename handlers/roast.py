@@ -33,10 +33,15 @@ router.message.filter(F.chat.type.in_({"group", "supergroup"}))
 
 ENABLED_KEY = "roast_enabled"
 KEEP_DAYS = 30                 # сколько хранить сырые сообщения
-AUTO_MIN_MESSAGES = 20         # столько новых сообщений нужно, чтобы бот сам подколол
-AUTO_COOLDOWN = 90 * 60        # не чаще раза в 1,5 часа на чат
-AUTO_CHANCE = 0.5              # и то не всегда
-LOOP_EVERY = 10 * 60           # как часто фоновая задача проверяет чаты
+INTERVAL_KEY = "roast_interval"  # как часто бот может сам встревать (сек, 0 — никогда)
+DEFAULT_INTERVAL = 90 * 60
+# (секунды, подпись, сколько новых сообщений нужно, чтобы был повод встрять)
+INTERVALS = [
+    (10, "10 сек", 1), (60, "1 мин", 2), (5 * 60, "5 мин", 3), (15 * 60, "15 мин", 5),
+    (30 * 60, "30 мин", 8), (60 * 60, "1 час", 12), (90 * 60, "1,5 часа", 15),
+    (3 * 3600, "3 часа", 20), (6 * 3600, "6 часов", 20), (0, "выкл", 0),
+]
+HEAVY_EVERY = 10 * 60          # досье, чистка, итоги недели — раз в 10 минут
 ROAST_COOLDOWN = 30            # сек между /roast в одном чате
 WEEK_COOLDOWN = 3600           # /week не чаще раза в час
 MSK = timezone(timedelta(hours=3))
@@ -67,6 +72,21 @@ _last_auto: dict[int, float] = {}
 _last_roast: dict[int, float] = {}
 _last_week_cmd: dict[int, float] = {}
 _last_reply: dict[tuple[int, int], float] = {}
+
+
+async def get_interval(db: Database) -> int:
+    try:
+        return int(await db.get_setting(INTERVAL_KEY, str(DEFAULT_INTERVAL)))
+    except ValueError:
+        return DEFAULT_INTERVAL
+
+
+def interval_label(seconds: int) -> str:
+    return next((label for sec, label, _ in INTERVALS if sec == seconds), f"{seconds} сек")
+
+
+def _min_messages(seconds: int) -> int:
+    return next((n for sec, _, n in INTERVALS if sec == seconds), 10)
 
 
 async def _enabled(db: Database) -> bool:
@@ -267,37 +287,33 @@ async def on_group_message(message: Message, bot: Bot, db: Database) -> None:
 # ---------- фоновая работа ----------
 
 
-async def _auto_roast(bot: Bot, db: Database, chat_id: int) -> None:
+async def _auto_roast(bot: Bot, db: Database, chat_id: int, interval: int) -> None:
     now = time.time()
     last = _last_auto.get(chat_id)
     if last is None:  # после перезапуска не набрасываемся сразу
         _last_auto[chat_id] = now
         return
-    if now - last < AUTO_COOLDOWN or _bunker_active(chat_id):
+    if now - last < interval or _bunker_active(chat_id):
         return
-    if await db.count_messages_since(chat_id, int(last)) < AUTO_MIN_MESSAGES:
+    if await db.count_messages_since(chat_id, int(last)) < _min_messages(interval):
         return
     _last_auto[chat_id] = now
-    if random.random() > AUTO_CHANCE:
-        return
-    rows = await db.recent_messages(chat_id, limit=40, since=int(last))
-    if len(rows) < 5:
+    # Контекст — последние сообщения, отвечать можно только на новые (с прошлой проверки)
+    rows = await db.recent_messages(chat_id, limit=30)
+    new_ids = {r[0] for r in rows if r[4] >= int(last)}
+    if not new_ids:
         return
     names = {r[2] for r in rows}
     dossiers = {n: d for n, d in (await db.chat_dossiers(chat_id)).items() if n in names}
-    result = await ai.roast_auto(_as_dicts(rows), dossiers)
+    result = await ai.roast_auto(_as_dicts(rows), dossiers, new_ids)
     if result["text"]:
-        ids = {r[0] for r in rows}
-        reply_to = result["reply_to"] if result["reply_to"] in ids else None
+        reply_to = result["reply_to"] if result["reply_to"] in new_ids else None
         await _say(bot, chat_id, result["text"], reply_to=reply_to)
 
 
-async def _tick(bot: Bot, db: Database) -> None:
-    if not await _enabled(db) or not ai.available():
-        return
+async def _heavy(bot: Bot, db: Database) -> None:
+    """Раз в 10 минут: чистка старого, досье, итоги недели."""
     await db.purge_old_messages(int(time.time()) - KEEP_DAYS * 86400)
-
-    # Досье: сжимаем накопившееся
     for chat_id, user_id, name, old in await db.users_needing_dossier():
         msgs = await db.messages_since_dossier(chat_id, user_id)
         if not msgs:
@@ -309,15 +325,9 @@ async def _tick(bot: Bot, db: Database) -> None:
         except Exception as e:
             logger.warning("dossier update failed: %s", e)
 
-    for chat_id in await db.active_chats(int(time.time()) - 7 * 86400):
-        # Спонтанный подкол
-        try:
-            await _auto_roast(bot, db, chat_id)
-        except Exception as e:
-            logger.warning("auto roast failed in %s: %s", chat_id, e)
-        # Итоги недели — по воскресеньям после 20:00 МСК
-        now_msk = datetime.now(MSK)
-        if now_msk.weekday() == 6 and now_msk.hour >= 20:
+    now_msk = datetime.now(MSK)
+    if now_msk.weekday() == 6 and now_msk.hour >= 20:  # итоги недели — воскресенье после 20:00 МСК
+        for chat_id in await db.active_chats(int(time.time()) - 7 * 86400):
             key = f"roast_week:{chat_id}"
             last = float(await db.get_setting(key, "0") or 0)
             if time.time() - last > 6 * 86400:
@@ -329,10 +339,23 @@ async def _tick(bot: Bot, db: Database) -> None:
 
 
 async def background(bot: Bot, db: Database) -> None:
-    """Запускается из bot.py: раз в LOOP_EVERY сек обновляет досье, подкалывает, подводит итоги."""
+    """Запускается из bot.py. Подколы — с частотой из /admin, тяжёлая работа — раз в 10 минут."""
+    last_heavy = 0.0
     while True:
+        interval = DEFAULT_INTERVAL
         try:
-            await _tick(bot, db)
+            interval = await get_interval(db)
+            if await _enabled(db) and ai.available():
+                if time.time() - last_heavy >= HEAVY_EVERY:
+                    last_heavy = time.time()
+                    await _heavy(bot, db)
+                if interval > 0:
+                    for chat_id in await db.active_chats(int(time.time()) - 86400):
+                        try:
+                            await _auto_roast(bot, db, chat_id, interval)
+                        except Exception as e:
+                            logger.warning("auto roast failed in %s: %s", chat_id, e)
         except Exception:
             logger.exception("roast background tick failed")
-        await asyncio.sleep(LOOP_EVERY)
+        # Проверяем чаще, чем интервал, но не реже раза в минуту
+        await asyncio.sleep(min(60, max(5, interval // 2)) if interval > 0 else 60)

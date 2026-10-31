@@ -84,6 +84,51 @@ async def admin_roast_toggle(call: CallbackQuery, db: Database, config: Config) 
         )
 
 
+@router.callback_query(F.data == "admin:roast_freq")
+async def admin_roast_freq(call: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    from handlers.roast import get_interval, interval_label
+    from keyboards import roast_interval_keyboard
+
+    current = await get_interval(db)
+    await call.answer()
+    if call.message:
+        await call.message.answer(
+            f"⏱ <b>Как часто стёб-бот сам встревает в разговор</b>\n\n"
+            f"Сейчас: <b>{interval_label(current)}</b>\n\n"
+            "Бот встревает, только если с прошлого раза в чате появились новые сообщения: "
+            "чем чаще интервал, тем меньше их нужно. На ответы на грубость и обращения это не влияет.",
+            reply_markup=roast_interval_keyboard(current),
+        )
+
+
+@router.callback_query(F.data.startswith("admin:roast_freq:"))
+async def admin_roast_freq_set(call: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    from handlers.roast import INTERVAL_KEY, INTERVALS, interval_label
+    from keyboards import roast_interval_keyboard
+
+    try:
+        sec = int((call.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await call.answer()
+        return
+    if sec not in {s for s, _, _ in INTERVALS}:
+        await call.answer()
+        return
+    await db.set_setting(INTERVAL_KEY, str(sec))
+    await call.answer(f"Готово: {interval_label(sec)}")
+    if call.message:
+        try:
+            await call.message.edit_reply_markup(reply_markup=roast_interval_keyboard(sec))
+        except Exception:
+            pass
+
+
 @router.callback_query(F.data == "admin:ai_costs")
 async def admin_ai_costs(call: CallbackQuery, db: Database, config: Config) -> None:
     if not _is_admin(call.from_user.id, config):

@@ -377,9 +377,10 @@ ROAST_SYSTEM = (
 )
 
 
-def _msgs_block(messages: list[dict]) -> str:
+def _msgs_block(messages: list[dict], new_ids: set | None = None) -> str:
     return "\n".join(
-        f'<msg id="{m.get("id", "")}" name={json.dumps(m["name"], ensure_ascii=False)}>'
+        f'<msg id="{m.get("id", "")}"' + (' new="1"' if new_ids and m.get("id") in new_ids else "")
+        + f' name={json.dumps(m["name"], ensure_ascii=False)}>'
         f'{str(m["text"])[:400]}</msg>'
         for m in messages
     )
@@ -410,13 +411,14 @@ async def roast_user(name: str, dossier: str, messages: list[dict]) -> str:
     return await _complete(ROAST_SYSTEM, user, max_tokens=3000)
 
 
-async def roast_auto(messages: list[dict], dossiers: dict[str, str]) -> dict:
+async def roast_auto(messages: list[dict], dossiers: dict[str, str], new_ids: set | None = None) -> dict:
     """Спонтанный подкол: {"reply_to": id или null, "text": "..."} или пустой text, если повода нет."""
     doss = "\n".join(f"<dossier name={json.dumps(n, ensure_ascii=False)}>{d}</dossier>"
                      for n, d in dossiers.items())
     user = (
-        f"Досье участников:\n{doss or 'пусто'}\nСвежая переписка:\n{_msgs_block(messages)}\n"
-        "Найди ОДИН лучший повод подколоть кого-то из свежей переписки: противоречие с досье, "
+        f"Досье участников:\n{doss or 'пусто'}\nПереписка:\n{_msgs_block(messages, new_ids)}\n"
+        "Найди ОДИН лучший повод подколоть автора одного из НОВЫХ сообщений (new=\"1\"), "
+        "остальные — только контекст: противоречие с досье, "
         "нарушенное обещание, нытьё, хвастовство, глупое заявление. Если хорошего повода нет — "
         "верни пустой text. Ответ — 1-2 коротких предложения, обращение на «ты». Верни СТРОГО JSON: "
         '{"reply_to": <id сообщения, на которое ответить, или null>, "text": "..."}'
