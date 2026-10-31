@@ -136,6 +136,8 @@ async def _maybe_defend(message: Message, bot: Bot, db: Database, config) -> boo
     return True
 
 
+# Имя бота в чате: на него откликается всегда
+_BOT_NAME = re.compile(r"(?<!\w)пиздю(к|ч|ш)\w*", re.IGNORECASE)
 _BOT_WORD = re.compile(r"\bбот(ик|яра|ина)?\b", re.IGNORECASE)
 
 _last_auto: dict[int, float] = {}
@@ -342,13 +344,14 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
                         and message.reply_to_message.from_user.id == bot.id)
     me = await bot.me()
     mentioned = bool(me.username and f"@{me.username.lower()}" in text.lower())
-    addressed = reply_to_bot or mentioned or bool(_BOT_WORD.search(text))
+    by_name = bool(_BOT_NAME.search(text))
+    addressed = reply_to_bot or mentioned or by_name or bool(_BOT_WORD.search(text))
     if not addressed:
         return
 
     rude = bool(_RUDE.search(text))
     # Простое упоминание слова «бот» без ответа и без грубости — отвечаем не всегда
-    if not rude and not reply_to_bot and not mentioned and random.random() > 0.3:
+    if not rude and not reply_to_bot and not mentioned and not by_name and random.random() > 0.3:
         return
 
     # Как человек: пару секунд «читаем», собираем всё, что написали боту, и отвечаем ОДИН раз
@@ -393,7 +396,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
                 jab = await ai.comeback(name, text, short=True, dossier=dossier, samples=samples, is_father=is_father)
                 if jab:  # редактор проверяет ответ целиком, как одно сообщение
                     full = await ai.polish(f"{answer} {jab}", text,
-                                           _as_dicts(await db.recent_messages(chat_id, limit=8)), max_words=20)
+                                           _as_dicts(await db.recent_messages(chat_id, limit=8)), max_words=20,
+                                           author=ai.FATHER_NAME if is_father else name)
                     if full:
                         answer = full
             except Exception as e:
@@ -410,7 +414,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
                 ctx = await db.recent_messages(chat_id, limit=25)
                 answer = await ai.banter(name, text, _as_dicts(ctx), dossier=dossier, samples=samples, is_father=is_father)
             if answer:  # редактор: связно ли, к месту ли, коротко ли
-                answer = await ai.polish(answer, text, _as_dicts(await db.recent_messages(chat_id, limit=20)))
+                answer = await ai.polish(answer, text, _as_dicts(await db.recent_messages(chat_id, limit=20)),
+                                         author=ai.FATHER_NAME if is_father else name)
         except Exception as e:
             logger.warning("bot reply failed: %s", e)
     if not answer and rude:
