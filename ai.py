@@ -115,7 +115,8 @@ async def _record(model: str, usage) -> None:
 
 
 async def _complete(system: str, user: str, max_tokens: int = 4000, fast: bool = False,
-                    model: str | None = None, image: tuple[bytes, str] | None = None) -> str:
+                    model: str | None = None, image: tuple[bytes, str] | None = None,
+                    effort: str = "low") -> str:
     """Один запрос к Claude, возвращает текст ответа.
 
     fast=True — дешёвая модель для коротких реплик. max_tokens берём с запасом:
@@ -127,7 +128,7 @@ async def _complete(system: str, user: str, max_tokens: int = 4000, fast: bool =
         model=model,
         max_tokens=max_tokens,
         system=system,
-        output_config={"effort": "low"},
+        output_config={"effort": effort},  # low — для коротких реплик; для юмора-постов выше
         messages=[{"role": "user", "content": user}],
     )
     if image:  # картинка + текст в одном сообщении
@@ -1447,19 +1448,6 @@ async def question_of_day(recent: list[dict], dossiers: dict[str, str], samples:
 # ---------- посты бота «от себя» в канал бати ----------
 
 
-_POST_FORMS = [
-    "одна хлёсткая строка, как высечено на надгробии",
-    "наблюдение — «Люди, которые …»",
-    "«Правило дня:» и одно циничное правило",
-    "мини-сценка в две-три строки без имён и чем она кончится",
-    "«Напоминаю:» и неприятная правда",
-    "сравнение двух вещей",
-    "совет от бота, которому не нужно ни спать, ни умирать",
-    "вопрос и хлёсткий ответ",
-    "ложная инструкция «Как правильно …» в 2-3 пунктах",
-    "объявление/вывеска: «Внимание: …»",
-    "прогноз на неделю для всех, кто это читает",
-]
 # Конкретные житейские темы — каждый пост про своё, чтобы не крутить одно и то же «когда-нибудь»
 _POST_TOPICS = [
     "соседи с перфоратором", "голосовые сообщения по 3 минуты", "самокатчики на тротуаре",
@@ -1480,45 +1468,41 @@ _BANNED_TOPICS = ("«когда-нибудь», «потом», откладыв
                   "листание ленты")
 
 
-async def own_channel_post(examples: list[str], previous: list[str]) -> str:
-    """Короткий пост бота в канал бати. Канал публичный: без имён из чата и пересказа переписки."""
+POST_MODEL = os.getenv("AI_MODEL_POSTS", "").strip() or MODEL   # кто пишет посты в канал
+POST_EFFORT = os.getenv("AI_POSTS_EFFORT", "").strip() or "high"  # юмору нужно подумать
+
+
+async def own_channel_post(examples: list[str], previous: list[str], model: str | None = None,
+                           effort: str | None = None) -> str:
+    """Пост в канал: сначала смешно, ругань — там, где бьёт. Модель и глубина — из настроек."""
     prev_text = " ".join(previous[-12:]).lower()
     topics = [t for t in _POST_TOPICS if t not in _recent_topics
               and t.split()[0][:5].lower() not in prev_text] or _POST_TOPICS
     topic = random.choice(topics)
     _recent_topics.append(topic)
-    del _recent_topics[:-15]  # последние 15 тем не повторяем
-    form = random.choice(_POST_FORMS)
-    with_death = random.random() < 0.35
-    one_liner = random.random() < 0.3
-    simple = [w for w in INSULTS if " " not in w]
-    used = [w for w in simple if w.lower() in prev_text]  # ругательства из прошлых постов — не повторяем
-    fresh = [w for w in simple if w not in used] or simple
-    words = ", ".join(random.sample(fresh, min(8, len(fresh))))
-    last_q = bool(previous) and previous[-1].strip().split(".")[0].endswith("?") or (
-        bool(previous) and "?" in previous[-1][:120])
+    del _recent_topics[:-15]
     ex = "\n".join(f"<post>{t[:300]}</post>" for t in examples[-8:])
     prev = "\n".join(f"<post>{t[:300]}</post>" for t in previous[-10:])
     user = (
-        f"Ты пишешь пост от себя в канал своего отца {FATHER_NAME} — «Memento Mori». Ты — Пиздюк, "
-        "его наглый бот-сын, у тебя своя рубрика в канале.\n"
-        + (f"Так пишет сам батя в этом канале (лови настроение, не копируй):\n{ex}\n" if ex else "")
-        + (f"Твои прошлые посты — НЕ повторяй их темы, мысли, построение и ругательства:\n{prev}\n" if prev else "")
-        + f"Тема поста: {topic}. Форма: {form}. "
-        + ("Длина: одна строка. " if one_liner else "Длина: 2-3 коротких предложения. ")
-        + ("Можно мрачно связать тему со смертью и тщетностью, но не концовкой «а потом вы умрёте». "
-           if with_death else "Про смерть, похороны и «помни о смерти» в этот раз НЕ пиши вообще — просто злой "
-           "смешной пост на тему. ")
-        + f"Запрещённые темы-штампы (уже надоели): {_BANNED_TOPICS}. "
-        + ("Прошлый пост начинался с вопроса — этот начни НЕ с вопроса. " if last_q else "")
-        + "Канал публичный: никаких имён, никого из чата, никакой переписки. Не начинай с «Ты». "
-        "Без хэштегов, без «Привет», максимум одна эмодзи. "
-        "Тон — злой и оскорбительный: крой читателей и людей вообще жёстко, с матом (два-три крепких "
-        f"слова на пост) — возьми свежие, например из этих: {words}"
-        + (f"; НЕ используй уже бывшие: {', '.join(used[:15])}" if used else "") + ". "
-        "Оскорбления — в адрес «вас»/«людей» в целом, без имён. Без запретных тем (внешность, здоровье и "
-        "болезни, семья, деньги, национальность, религия, ориентация, политика)."
+        f"Ты — Пиздюк, наглый бот-сын {FATHER_NAME}, ведёшь свою рубрику в его канале «Memento Mori». "
+        "Аудитория — взрослые люди с чёрным юмором, которые подписались ради злых смешных постов.\n"
+        + (f"Так пишет сам батя (настроение, не копируй):\n{ex}\n" if ex else "")
+        + (f"Твои прошлые посты — не повторяй их темы, ходы и слова:\n{prev}\n" if prev else "")
+        + f"Тема: {topic}.\n"
+        "Задача — чтобы было РЕАЛЬНО смешно, как у хорошего стендапера или в лучших злых пабликах:\n"
+        "- одно точное, узнаваемое наблюдение, которое каждый узнает про себя («да, блядь, это я»);\n"
+        "- неожиданный поворот или панчлайн в КОНЦЕ — самое смешное последним словом;\n"
+        "- конкретика вместо общих слов (не «вы ленивые», а точная деталь, как это выглядит);\n"
+        "- коротко: 1-3 предложения, ни одного лишнего слова, без вступлений и морали;\n"
+        "- мат и оскорбления — только там, где они усиливают удар, а не для количества;\n"
+        "- если тема позволяет — мрачный поворот про тщетность/смерть (это канал Memento Mori), но не штампом.\n"
+        f"Не используй штампы: {_BANNED_TOPICS}; не начинай с «Люди, которые», «Ты», «Вы когда-нибудь», "
+        "«Напоминаю». Канал публичный: без имён и без людей из чата. Без хэштегов и эмодзи. Без запретных тем "
+        "(внешность, здоровье и болезни, семья, деньги, национальность, религия, ориентация, политика).\n"
+        "Придумай про себя 3 варианта и выдай только самый смешной."
         + _JSON_REPLY
     )
-    out = _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, model=REPLY_MODEL))
+    out = _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=16000, model=model or POST_MODEL,
+                                       effort=effort or POST_EFFORT))
     return await fix_looks(scrub(out))
+
