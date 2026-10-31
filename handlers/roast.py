@@ -412,6 +412,10 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
         await db.add_chat_message(chat_id, message.message_id, user.id, _name(message),
                                   user.username, message.text[:1000])
 
+    # Обещание с датой? Запомним и в срок напомним (в фоне, ответ не задерживает)
+    if not optout and _PROMISE_HINT.search(message.text):
+        _spawn(_check_promise(db, message))
+
     # Защита бати: если кого-то обзывают — реагируем сразу, раньше всего остального
     if await _maybe_defend(message, bot, db, config):
         return
@@ -537,6 +541,167 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
             _thread.setdefault((chat_id, who.id), []).append(time.time())
 
 
+# ---------- ловушка на обещания ----------
+
+_PROMISE_HINT = re.compile(
+    r"с\s+понедельника|с\s+завтра\w*|завтра|послезавтра|на\s+(этой|следующей)\s+неделе|через\s+(неделю|месяц|\d+)|"
+    r"до\s+(нового\s+года|конца|понедельника|пятницы|лета|выходных)|обещаю|клянусь|зуб\s+даю|больше\s+(не|никогда)|"
+    r"брошу|бросаю|начну|начинаю|сегодня\s+же|к\s+(лету|понедельнику|пятнице|выходным)|"
+    r"в\s+(понедельник|вторник|среду|четверг|пятницу|субботу|воскресенье)",
+    re.IGNORECASE,
+)
+_promise_last: dict[tuple[int, int], float] = {}
+
+
+async def _check_promise(db: Database, message: Message) -> None:
+    user = message.from_user
+    if not user or not ai.available():
+        return
+    key = (message.chat.id, user.id)
+    if time.time() - _promise_last.get(key, 0) < 60:  # не дёргаем ИИ на каждое сообщение подряд
+        return
+    _promise_last[key] = time.time()
+    now = datetime.now(MSK)
+    try:
+        data = await ai.extract_promise(message.text or "", _name(message), now.strftime("%Y-%m-%d %H:%M, %A"))
+    except Exception as e:
+        logger.debug("promise extract failed: %s", e)
+        return
+    if not data.get("promise") or not data.get("due") or not data.get("what"):
+        return
+    try:
+        hh, mm = (str(data.get("time") or "12:00")[:5]).split(":")
+        due = datetime.strptime(str(data["due"])[:10], "%Y-%m-%d").replace(
+            hour=int(hh), minute=int(mm), tzinfo=MSK)
+    except (ValueError, TypeError):
+        return
+    due_ts = int(due.timestamp())
+    if due_ts < time.time() + 600 or due_ts > time.time() + 60 * 86400:
+        return
+    what = str(data["what"])[:120]
+    if await db.has_similar_promise(message.chat.id, user.id, what):
+        return
+    await db.add_promise(message.chat.id, user.id, _name(message), message.message_id,
+                         (message.text or "")[:500], what, due_ts)
+    logger.info("promise saved: %s — %s до %s", _name(message), what, due.isoformat())
+
+
+async def _remind_promises(bot: Bot, db: Database) -> None:
+    for pid, chat_id, user_id, name, msg_id, text, what, _due in await db.due_promises(int(time.time())):
+        await db.mark_promise(pid)
+        try:
+            await _remember_lines(db, chat_id)
+            answer = await ai.promise_reminder(name or "Аноним", what, text or "",
+                                               await db.get_dossier(chat_id, user_id),
+                                               await db.style_sample(chat_id))
+        except Exception as e:
+            logger.warning("promise reminder failed: %s", e)
+            answer = ""
+        if not answer:
+            answer = f"{name}, ну что, «{what}»? Срок вышел. Рассказывай, как слился 🤡"
+        await _say(bot, chat_id, answer, reply_to=msg_id)
+
+
+@router.message(Command("promises"))
+async def cmd_promises(message: Message, db: Database) -> None:
+    rows = await db.open_promises(message.chat.id)
+    if not rows:
+        await message.reply("Никто ничего не обещал. Или я пока не слышал 👀")
+        return
+    lines = ["📝 <b>Обещания, которые я слежу</b>", "━━━━━━━━━━━━━━━", ""]
+    for name, what, due_ts in rows[:20]:
+        due = datetime.fromtimestamp(due_ts, MSK).strftime("%d.%m %H:%M")
+        lines.append(f"• <b>{html.escape(name or '?')}</b> — {html.escape(what)} <i>(проверю {due})</i>")
+    await message.reply("\n".join(lines))
+
+
+# ---------- стёб по фото ----------
+
+PHOTO_CHANCE = 0.35  # на фото без обращения к боту отвечает примерно на каждое третье
+
+
+@router.message(F.photo)
+async def on_group_photo(message: Message, bot: Bot, db: Database, config=None) -> None:
+    user = message.from_user
+    if user is None or user.is_bot or not message.photo:
+        return
+    chat_id = message.chat.id
+    if not _db_ref:
+        _db_ref.append(db)
+    if not await _enabled(db) or await db.is_optout(chat_id, user.id):
+        return
+    caption = message.caption or ""
+    await db.add_chat_message(chat_id, message.message_id, user.id, _name(message), user.username,
+                              f"[фото] {caption}".strip()[:1000])
+    if not ai.available() or _bunker_active(chat_id):
+        return
+    reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user
+                        and message.reply_to_message.from_user.id == bot.id)
+    addressed = reply_to_bot or bool(_BOT_NAME.search(caption) or _BOT_WORD.search(caption))
+    if not addressed:
+        if random.random() > PHOTO_CHANCE or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
+            return
+    is_father = user.id == _father_id(config)
+    # берём не самый большой размер — модели хватит, а качать быстрее
+    sizes = sorted(message.photo, key=lambda p: p.width)
+    photo = next((p for p in reversed(sizes) if p.width <= 1280), sizes[0])
+    try:
+        await bot.send_chat_action(chat_id, "typing")
+        buf = await bot.download(photo)
+        await _remember_lines(db, chat_id)
+        draft = await ai.roast_photo(buf.read(), "image/jpeg", _name(message), caption, is_father,
+                                     await db.style_sample(chat_id))
+        answer = await ai.polish(draft, caption or "[фото]", _as_dicts(await db.recent_messages(chat_id, limit=10)),
+                                 author=ai.FATHER_NAME if is_father else _name(message), about_photo=True)
+    except Exception as e:
+        logger.warning("photo roast failed: %s", e)
+        return
+    if answer:
+        await _say(bot, chat_id, answer, reply_to=message.message_id)
+
+
+# ---------- «Клоун дня» ----------
+
+CLOWN_HOUR = 21  # МСК: в это время (и позже) бот выбирает клоуна дня
+
+
+async def _clown_of_day(bot: Bot, db: Database, chat_id: int) -> bool:
+    day_start = int(datetime.now(MSK).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    rows = await db.recent_messages(chat_id, limit=1500, since=day_start)
+    by_user: dict[int, tuple[str, list[str]]] = {}
+    for _mid, uid, name, text, _ts in rows:
+        if uid == 0:
+            continue
+        by_user.setdefault(uid, (name, []))[1].append(text)
+    active = {uid: v for uid, v in by_user.items() if len(v[1]) >= 3}
+    if len(active) < 2:
+        return False
+    samples = {name: msgs[-25:] for name, msgs in active.values()}
+    result = await ai.clown_of_day(samples, await db.chat_dossiers(chat_id))
+    winner = next((uid for uid, (name, _) in active.items() if name == result["name"]), None)
+    if winner is None or not result["reason"]:
+        return False
+    await db.add_clown(chat_id, winner, result["name"])
+    total = dict((n, c) for n, c in await db.clown_top(chat_id, 50)).get(result["name"], 1)
+    await _say(bot, chat_id, f"🤡 КЛОУН ДНЯ — {result['name']}\n\n{result['reason']}\n\n"
+                             f"Клоун уже {total}-й раз. Таблица позора: /clowns")
+    return True
+
+
+@router.message(Command("clowns"))
+async def cmd_clowns(message: Message, db: Database) -> None:
+    rows = await db.clown_top(message.chat.id)
+    if not rows:
+        await message.reply("Клоунов ещё не выбирали. Первый — сегодня в 21:00 🤡")
+        return
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🤡 <b>ТАБЛИЦА ПОЗОРА</b>", "━━━━━━━━━━━━━━━", ""]
+    for i, (name, count) in enumerate(rows):
+        place = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{place} <b>{html.escape(name or '?')}</b> — клоун дня ×{count}")
+    await message.reply("\n".join(lines))
+
+
 # ---------- фоновая работа ----------
 
 
@@ -591,6 +756,17 @@ async def _heavy(bot: Bot, db: Database) -> None:
             logger.warning("dossier update failed: %s", e)
 
     now_msk = datetime.now(MSK)
+    if now_msk.hour >= CLOWN_HOUR:  # клоун дня — раз в сутки, после 21:00 МСК
+        today = now_msk.strftime("%Y-%m-%d")
+        for chat_id in await db.active_chats(int(time.time()) - 86400):
+            key = f"roast_clown:{chat_id}"
+            if await db.get_setting(key, "") == today:
+                continue
+            await db.set_setting(key, today)
+            try:
+                await _clown_of_day(bot, db, chat_id)
+            except Exception as e:
+                logger.warning("clown of day failed in %s: %s", chat_id, e)
     if now_msk.weekday() == 6 and now_msk.hour >= 20:  # итоги недели — воскресенье после 20:00 МСК
         for chat_id in await db.active_chats(int(time.time()) - 7 * 86400):
             key = f"roast_week:{chat_id}"
@@ -614,6 +790,10 @@ async def background(bot: Bot, db: Database) -> None:
                 if time.time() - last_heavy >= HEAVY_EVERY:
                     last_heavy = time.time()
                     await _heavy(bot, db)
+                try:
+                    await _remind_promises(bot, db)
+                except Exception as e:
+                    logger.warning("promise reminders failed: %s", e)
                 if interval > 0:
                     for chat_id in await db.active_chats(int(time.time()) - 86400):
                         try:

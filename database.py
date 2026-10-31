@@ -92,7 +92,98 @@ class Database:
                 )
                 """
             )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS promises (
+                    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id  INTEGER NOT NULL,
+                    user_id  INTEGER NOT NULL,
+                    name     TEXT,
+                    msg_id   INTEGER,
+                    text     TEXT,
+                    what     TEXT NOT NULL,
+                    due_ts   INTEGER NOT NULL,
+                    created  INTEGER NOT NULL,
+                    reminded INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS clown_stats (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    name    TEXT,
+                    count   INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (chat_id, user_id)
+                )
+                """
+            )
             await db.commit()
+
+    # --- обещания (ловушка на обещания) ---
+
+    async def add_promise(self, chat_id: int, user_id: int, name: str, msg_id: int, text: str,
+                          what: str, due_ts: int) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO promises (chat_id, user_id, name, msg_id, text, what, due_ts, created) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (chat_id, user_id, name, msg_id, text, what, due_ts, int(time.time())),
+            )
+            await db.commit()
+
+    async def due_promises(self, now: int, limit: int = 5) -> list[tuple]:
+        """(id, chat_id, user_id, name, msg_id, text, what, due_ts) — срок вышел, ещё не напоминали."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT p.id, p.chat_id, p.user_id, p.name, p.msg_id, p.text, p.what, p.due_ts FROM promises p "
+                "WHERE p.reminded = 0 AND p.due_ts <= ? AND NOT EXISTS (SELECT 1 FROM roast_optout o "
+                "WHERE o.chat_id = p.chat_id AND o.user_id = p.user_id) ORDER BY p.due_ts LIMIT ?",
+                (now, limit),
+            )
+            return list(await cur.fetchall())
+
+    async def mark_promise(self, promise_id: int) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("UPDATE promises SET reminded = 1 WHERE id = ?", (promise_id,))
+            await db.commit()
+
+    async def open_promises(self, chat_id: int) -> list[tuple]:
+        """(name, what, due_ts) — ещё не наступившие/не напомненные обещания чата."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT name, what, due_ts FROM promises WHERE chat_id = ? AND reminded = 0 ORDER BY due_ts",
+                (chat_id,),
+            )
+            return list(await cur.fetchall())
+
+    async def has_similar_promise(self, chat_id: int, user_id: int, what: str) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT 1 FROM promises WHERE chat_id = ? AND user_id = ? AND reminded = 0 AND lower(what) = lower(?)",
+                (chat_id, user_id, what),
+            )
+            return await cur.fetchone() is not None
+
+    # --- «Клоун дня» ---
+
+    async def add_clown(self, chat_id: int, user_id: int, name: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO clown_stats (chat_id, user_id, name, count) VALUES (?, ?, ?, 1) "
+                "ON CONFLICT(chat_id, user_id) DO UPDATE SET name = excluded.name, count = count + 1",
+                (chat_id, user_id, name),
+            )
+            await db.commit()
+
+    async def clown_top(self, chat_id: int, limit: int = 10) -> list[tuple]:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT name, count FROM clown_stats WHERE chat_id = ? ORDER BY count DESC LIMIT ?",
+                (chat_id, limit),
+            )
+            return list(await cur.fetchall())
 
     # --- память чата (стёб-бот) ---
 

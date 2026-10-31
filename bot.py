@@ -42,6 +42,8 @@ async def set_commands(bot: Bot, config) -> None:
         BotCommand(command="top", description="Рейтинг выживших"),
         BotCommand(command="roast", description="Прожарить (ответом на сообщение или @ник)"),
         BotCommand(command="week", description="Итоги недели чата"),
+        BotCommand(command="promises", description="Чьи обещания бот проверит"),
+        BotCommand(command="clowns", description="Таблица позора: клоуны дня"),
         BotCommand(command="forget_me", description="Забыть меня и не стебать"),
         BotCommand(command="remember_me", description="Снова запоминать меня"),
     ]
