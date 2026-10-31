@@ -519,6 +519,7 @@ async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
         await asyncio.sleep(random.uniform(3.0, 6.0))  # «прочитал» пост
         await bot.send_chat_action(chat_id, "typing")
         await _remember_lines(db, chat_id)
+        ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)  # пост бати: иногда и нагрубить
         answer = await ai.channel_comment(channel, text, media, image, await db.style_sample(chat_id),
                                           repost_from=repost_from)
     except Exception as e:
@@ -803,6 +804,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     await _remember_lines(db, chat_id)
     # «Отец» бота — первый админ из .env (или BOT_FATHER_ID)
     is_father = bool(who and who.id == _father_id(config))
+    if is_father:  # бате иногда (≈1 из 3) можно нагрубить по-сыновьи, остальное — подъёб по-доброму
+        ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)
 
     # Как человек: в затянувшейся перепалке отвечает всё реже, на пустое «да/и че» — реакцией
     if who and not is_father:
@@ -820,7 +823,10 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
 
     if rude and _SEND_OFF.search(text):
         # Посылают — отвечаем зеркально, в лоб, а ИИ добавляет короткий подкол
-        answer = random.choice(FATHER_MIRRORS) if is_father else random.choice(MIRRORS).format(n=name)
+        if is_father and not ai.father_rude.get():
+            answer = random.choice(FATHER_MIRRORS)
+        else:
+            answer = random.choice(MIRRORS).format(n="бать" if is_father else name)
         if ai.available():
             try:
                 jab = await ai.comeback(name, text, short=True, dossier=dossier, samples=samples, is_father=is_father)
@@ -854,7 +860,7 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
         except Exception as e:
             logger.warning("bot reply failed: %s", e)
     if not answer and rude:
-        answer = random.choice(FATHER_MIRRORS) if is_father else random.choice(COMEBACKS)
+        answer = random.choice(FATHER_MIRRORS) if is_father and not ai.father_rude.get() else random.choice(COMEBACKS)
     if answer and is_father:
         answer = ai.vary_father(answer)
     if answer:
@@ -1158,6 +1164,8 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
         if random.random() > PHOTO_CHANCE or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
             return
     is_father = user.id == _father_id(config)
+    if is_father:
+        ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)
     try:
         await bot.send_chat_action(chat_id, "typing")
         await _remember_lines(db, chat_id)
