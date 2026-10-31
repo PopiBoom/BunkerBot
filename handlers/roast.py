@@ -932,11 +932,24 @@ async def on_group_photo(message: Message, bot: Bot, db: Database, config=None) 
         return
     # Переслано из чужого канала/чата — это не слова и не фото самого человека
     src = None if _forwarded_from_father_channel(message) else _forward_source(message)
-    what = f"[альбом, {count} фото]" if count > 1 else "[фото]"
     note = f"[переслано из {src[0]}] " if src else ""
+    # берём не самый большой размер — модели хватит, а качать быстрее
+    sizes = sorted(message.photo, key=lambda p: p.width)
+    photo = next((p for p in reversed(sizes) if p.width <= 1280), sizes[0])
+    # Смотрим КАЖДОЕ фото: короткое описание идёт в память чата, чтобы бот знал, что на нём,
+    # даже если сейчас комментировать не будет (потом — в подколах, прожарках, ответах)
+    img, descr = None, ""
+    if ai.available():
+        try:
+            img = (await bot.download(photo)).read()
+            descr = await ai.describe_photo(img)
+        except Exception as e:
+            logger.warning("photo describe failed: %s", e)
+    what = f"альбом, {count} фото" if count > 1 else "фото"
+    what = f"[{what}: {descr}]" if descr else f"[{what}]"
     await db.add_chat_message(chat_id, message.message_id, user.id, _name(message), user.username,
                               f"{note}{what} {caption}".strip()[:1000])
-    if not ai.available() or _bunker_active(chat_id):
+    if img is None or _bunker_active(chat_id):
         return
     reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user
                         and message.reply_to_message.from_user.id == bot.id)
@@ -945,12 +958,8 @@ async def on_group_photo(message: Message, bot: Bot, db: Database, config=None) 
         if random.random() > PHOTO_CHANCE or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
             return
     is_father = user.id == _father_id(config)
-    # берём не самый большой размер — модели хватит, а качать быстрее
-    sizes = sorted(message.photo, key=lambda p: p.width)
-    photo = next((p for p in reversed(sizes) if p.width <= 1280), sizes[0])
     try:
         await bot.send_chat_action(chat_id, "typing")
-        img = (await bot.download(photo)).read()
         await _remember_lines(db, chat_id)
         draft = await ai.roast_photo(img, "image/jpeg", _name(message), caption, is_father,
                                      await db.style_sample(chat_id), forwarded_from=src[0] if src else None,
@@ -1027,6 +1036,15 @@ async def cmd_clowns(message: Message, db: Database) -> None:
 # ---------- фоновая работа ----------
 
 
+def _replyable(text: str) -> bool:
+    """Можно ли подколоть это сообщение в фоне: живой текст или фото с описанием."""
+    t = str(text)
+    if not t.startswith("["):
+        return True
+    head = t.split("]", 1)[0]
+    return (t.startswith("[фото: ") or t.startswith("[альбом, ")) and ": " in head
+
+
 async def _auto_roast(bot: Bot, db: Database, chat_id: int, interval: int) -> None:
     now = time.time()
     last = _last_auto.get(chat_id)
@@ -1044,10 +1062,10 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int, interval: int) -> No
     rows = await db.recent_messages(chat_id, limit=30)
     answered = _answered.get(chat_id, set())
     since = max(int(last), int(_last_bot_msg.get(chat_id, 0)))
-    # Отвечать можно только на живой текст: на «[фото]», «[стикер…]», «[переслано…]» здесь бот
-    # не видит самого содержимого и ответил бы мимо — по прошлым сообщениям. Они — только фон.
+    # Отвечать можно на живой текст и на фото, которое бот уже рассмотрел («[фото: что на нём]»).
+    # На фото без описания, стикеры и пересланное — нет: ответил бы мимо, по прошлым сообщениям.
     new_ids = {r[0] for r in rows if r[4] >= since and r[0] not in answered and r[1] > 0
-               and not str(r[3]).startswith("[")}
+               and _replyable(r[3])}
     if not new_ids:
         return
     await _remember_lines(db, chat_id)
