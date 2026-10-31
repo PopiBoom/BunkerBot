@@ -106,6 +106,39 @@ class Database:
             )
             await db.commit()
 
+    async def import_messages(self, chat_id: int, rows: list[tuple]) -> int:
+        """Импорт из выгрузки Telegram: rows = [(msg_id, user_id, name, text, ts)]. Дубли пропускаются."""
+        added = 0
+        async with aiosqlite.connect(self.path) as db:
+            for msg_id, user_id, name, text, ts in rows:
+                cur = await db.execute(
+                    "SELECT 1 FROM chat_messages WHERE chat_id = ? AND msg_id = ?", (chat_id, msg_id)
+                )
+                if await cur.fetchone():
+                    continue
+                await db.execute(
+                    "INSERT INTO chat_messages (chat_id, msg_id, user_id, name, username, text, ts) "
+                    "VALUES (?, ?, ?, ?, NULL, ?, ?)",
+                    (chat_id, msg_id, user_id, name, text, ts),
+                )
+                added += 1
+            await db.commit()
+        return added
+
+    async def style_sample(self, chat_id: int, n: int = 25) -> list[str]:
+        """Случайные живые фразы из чата — образец манеры общения для бота."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT text FROM chat_messages WHERE chat_id = ? AND length(text) BETWEEN 3 AND 160 "
+                "ORDER BY RANDOM() LIMIT ?", (chat_id, n),
+            )
+            return [r[0] for r in await cur.fetchall()]
+
+    async def optout_ids(self, chat_id: int) -> set[int]:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT user_id FROM roast_optout WHERE chat_id = ?", (chat_id,))
+            return {int(r[0]) for r in await cur.fetchall()}
+
     async def recent_messages(self, chat_id: int, limit: int = 40, user_id: int | None = None,
                               since: int = 0) -> list[tuple]:
         """[(msg_id, user_id, name, text, ts)] от старых к новым, без тех, кто отказался."""
@@ -228,9 +261,15 @@ class Database:
             await db.execute("DELETE FROM roast_optout WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
             await db.commit()
 
-    async def purge_old_messages(self, older_than: int) -> None:
+    async def purge_old_messages(self, older_than: int, keep_last: int = 3000) -> None:
+        """Удаляет сообщения старше older_than, но последние keep_last в каждом чате оставляет."""
         async with aiosqlite.connect(self.path) as db:
-            await db.execute("DELETE FROM chat_messages WHERE ts < ?", (older_than,))
+            await db.execute(
+                "DELETE FROM chat_messages WHERE ts < ? AND rowid NOT IN ("
+                "SELECT c2.rowid FROM chat_messages c2 WHERE c2.chat_id = chat_messages.chat_id "
+                "ORDER BY c2.ts DESC LIMIT ?)",
+                (older_than, keep_last),
+            )
             await db.commit()
 
     # --- расходы на ИИ ---

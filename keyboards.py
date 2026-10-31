@@ -30,6 +30,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     builder.row(InlineKeyboardButton(text="💰 Расходы ИИ", callback_data="admin:ai_costs"))
     builder.row(InlineKeyboardButton(text="🔥 Стёб-бот: вкл/выкл", callback_data="admin:roast_toggle"))
     builder.row(InlineKeyboardButton(text="⏱ Как часто бот встревает", callback_data="admin:roast_freq"))
+    builder.row(InlineKeyboardButton(text="📥 Загрузить историю чата", callback_data="admin:roast_import"))
     builder.row(
         InlineKeyboardButton(text="✏️ Текст приветствия", callback_data="admin:edit_welcome"),
         InlineKeyboardButton(text="🎁 Текст награды", callback_data="admin:edit_reward"),

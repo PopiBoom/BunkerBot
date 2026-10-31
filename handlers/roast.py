@@ -71,7 +71,6 @@ _BOT_WORD = re.compile(r"\bбот(ик|яра|ина)?\b", re.IGNORECASE)
 _last_auto: dict[int, float] = {}
 _last_roast: dict[int, float] = {}
 _last_week_cmd: dict[int, float] = {}
-_last_reply: dict[tuple[int, int], float] = {}
 
 
 async def get_interval(db: Database) -> int:
@@ -111,10 +110,22 @@ def _bunker_active(chat_id: int) -> bool:
         return False
 
 
+_last_bot_msg: dict[int, float] = {}       # когда бот последний раз писал в чат
+_answered: dict[int, set[int]] = {}        # на какие сообщения уже ответил
+_pending: dict[int, dict] = {}             # ответ, который бот «печатает» прямо сейчас
+REPLY_DELAY = (2.0, 4.0)                   # «читает» пару секунд, собирая все обращения
+QUIET_AFTER_SPEAKING = 20                  # сам не встревает, если только что что-то сказал
+
+
 async def _say(bot: Bot, chat_id: int, text: str, reply_to: int | None = None) -> None:
     kwargs = {}
     if reply_to:
         kwargs["reply_parameters"] = ReplyParameters(message_id=reply_to, allow_sending_without_reply=True)
+        answered = _answered.setdefault(chat_id, set())
+        answered.add(reply_to)
+        if len(answered) > 500:
+            answered.clear()
+    _last_bot_msg[chat_id] = time.time()
     await bot.send_message(chat_id, html.escape(text.strip())[:4000], **kwargs)
 
 
@@ -246,43 +257,66 @@ async def on_group_message(message: Message, bot: Bot, db: Database) -> None:
     if not addressed:
         return
 
-    key = (chat_id, user.id)
-    now = time.time()
     rude = bool(_RUDE.search(text))
-    if now - _last_reply.get(key, 0) < (10 if rude else 30):
-        return
     # Простое упоминание слова «бот» без ответа и без грубости — отвечаем не всегда
     if not rude and not reply_to_bot and not mentioned and random.random() > 0.3:
         return
-    _last_reply[key] = now
 
-    answer = ""
+    # Как человек: пару секунд «читаем», собираем всё, что написали боту, и отвечаем ОДИН раз
+    pending = _pending.get(chat_id)
+    if pending:
+        pending["items"].append((message, rude))
+        return
+    _pending[chat_id] = {"items": [(message, rude)]}
+    try:
+        await asyncio.sleep(random.uniform(*REPLY_DELAY))
+        try:
+            await bot.send_chat_action(chat_id, "typing")
+        except Exception:
+            pass
+        items = _pending[chat_id]["items"]
+        await _reply_once(bot, db, chat_id, items)
+    finally:
+        _pending.pop(chat_id, None)
+
+
+async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Message, bool]]) -> None:
+    last_msg, _ = items[-1]
+    who = last_msg.from_user
+    name = _name(last_msg)
+    texts = [m.text or "" for m, _ in items if m.from_user and who and m.from_user.id == who.id]
+    text = "\n".join(texts) or (last_msg.text or "")
+    rude = any(r for m, r in items if m.from_user and who and m.from_user.id == who.id)
+    samples = await db.style_sample(chat_id)
+    dossier = await db.get_dossier(chat_id, who.id) if who else ""
+
     if rude and _SEND_OFF.search(text):
         # Посылают — отвечаем зеркально, в лоб, а ИИ добавляет короткий подкол
-        answer = random.choice(MIRRORS).format(n=_name(message))
+        answer = random.choice(MIRRORS).format(n=name)
         if ai.available():
             try:
-                dossier = await db.get_dossier(chat_id, user.id)
-                jab = await ai.comeback(_name(message), text, short=True, dossier=dossier)
+                jab = await ai.comeback(name, text, short=True, dossier=dossier, samples=samples)
                 if jab:
-                    answer = f"{answer}\n\n{jab}"
+                    answer = f"{answer}\n{jab}"
             except Exception as e:
                 logger.warning("comeback failed: %s", e)
-        await _say(bot, chat_id, answer, reply_to=message.message_id)
+        await _say(bot, chat_id, answer, reply_to=last_msg.message_id)
         return
+
+    answer = ""
     if ai.available():
         try:
             if rude:
-                answer = await ai.comeback(_name(message), text, dossier=await db.get_dossier(chat_id, user.id))
+                answer = await ai.comeback(name, text, dossier=dossier, samples=samples)
             else:
-                ctx = await db.recent_messages(chat_id, limit=12)
-                answer = await ai.banter(_name(message), text, _as_dicts(ctx))
+                ctx = await db.recent_messages(chat_id, limit=15)
+                answer = await ai.banter(name, text, _as_dicts(ctx), dossier=dossier, samples=samples)
         except Exception as e:
             logger.warning("bot reply failed: %s", e)
     if not answer and rude:
         answer = random.choice(COMEBACKS)
     if answer:
-        await _say(bot, chat_id, answer, reply_to=message.message_id)
+        await _say(bot, chat_id, answer, reply_to=last_msg.message_id)
 
 
 # ---------- фоновая работа ----------
@@ -294,19 +328,25 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int, interval: int) -> No
     if last is None:  # после перезапуска не набрасываемся сразу
         _last_auto[chat_id] = now
         return
-    if now - last < interval or _bunker_active(chat_id):
+    if now - last < interval or _bunker_active(chat_id) or chat_id in _pending:
+        return
+    if now - _last_bot_msg.get(chat_id, 0) < max(QUIET_AFTER_SPEAKING, interval):
         return
     if await db.count_messages_since(chat_id, int(last)) < _min_messages(interval):
         return
     _last_auto[chat_id] = now
     # Контекст — последние сообщения, отвечать можно только на новые (с прошлой проверки)
     rows = await db.recent_messages(chat_id, limit=30)
-    new_ids = {r[0] for r in rows if r[4] >= int(last)}
+    answered = _answered.get(chat_id, set())
+    since = max(int(last), int(_last_bot_msg.get(chat_id, 0)))
+    new_ids = {r[0] for r in rows if r[4] >= since and r[0] not in answered}
     if not new_ids:
         return
     names = {r[2] for r in rows}
     dossiers = {n: d for n, d in (await db.chat_dossiers(chat_id)).items() if n in names}
-    result = await ai.roast_auto(_as_dicts(rows), dossiers, new_ids)
+    result = await ai.roast_auto(_as_dicts(rows), dossiers, new_ids, await db.style_sample(chat_id))
+    if chat_id in _pending or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
+        return  # пока думали, бот уже успел ответить кому-то — молчим
     if result["text"]:
         reply_to = result["reply_to"] if result["reply_to"] in new_ids else None
         await _say(bot, chat_id, result["text"], reply_to=reply_to)
@@ -360,3 +400,72 @@ async def background(bot: Bot, db: Database) -> None:
             logger.exception("roast background tick failed")
         # Проверяем чаще, чем интервал, но не реже раза в минуту
         await asyncio.sleep(min(60, max(5, interval // 2)) if interval > 0 else 60)
+
+
+# ---------- импорт истории из выгрузки Telegram Desktop ----------
+
+IMPORT_LIMIT = 2000
+
+
+def _export_text(raw) -> str:
+    """В выгрузке text — строка или список кусочков (строки и {"type":..,"text":..})."""
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, list):
+        return "".join(p if isinstance(p, str) else str(p.get("text", "")) for p in raw)
+    return ""
+
+
+def parse_export(data: dict, limit: int = IMPORT_LIMIT) -> tuple[int, list[tuple]]:
+    """Возвращает (chat_id, [(msg_id, user_id, name, text, ts)]) — последние limit сообщений."""
+    raw_id = int(data.get("id", 0))
+    chat_type = str(data.get("type", ""))
+    chat_id = int(f"-100{raw_id}") if "supergroup" in chat_type or "channel" in chat_type else -raw_id
+    rows = []
+    for m in data.get("messages", []):
+        if m.get("type") != "message":
+            continue
+        from_id = str(m.get("from_id", ""))
+        if not from_id.startswith("user"):
+            continue
+        text = _export_text(m.get("text")).strip()
+        if not text or text.startswith("/"):
+            continue
+        try:
+            ts = int(m.get("date_unixtime") or 0)
+            rows.append((int(m["id"]), int(from_id[4:]), str(m.get("from") or "Аноним"), text[:1000], ts))
+        except (KeyError, ValueError):
+            continue
+    return chat_id, rows[-limit:]
+
+
+async def import_history(db: Database, data: dict, progress=None) -> tuple[int, int, int, int]:
+    """Загружает последние 2000 сообщений и сразу строит досье по ним.
+
+    Возвращает (chat_id, загружено сообщений, людей, досье построено).
+    """
+    chat_id, rows = parse_export(data)
+    optout = await db.optout_ids(chat_id)
+    rows = [r for r in rows if r[1] not in optout]
+    added = await db.import_messages(chat_id, rows)
+
+    by_user: dict[int, list[tuple]] = {}
+    for r in rows:
+        by_user.setdefault(r[1], []).append(r)
+    built = 0
+    if ai.available():
+        for i, (user_id, items) in enumerate(sorted(by_user.items(), key=lambda kv: -len(kv[1]))):
+            if len(items) < 5:
+                continue
+            name = items[-1][2]
+            if progress:
+                await progress(f"🧠 Составляю досье: {name} ({i + 1}/{len(by_user)})…")
+            old = await db.get_dossier(chat_id, user_id)
+            try:
+                text = await ai.update_dossier(name, old, [r[3] for r in items[-150:]])
+                if text:
+                    await db.set_dossier(chat_id, user_id, name, text)
+                    built += 1
+            except Exception as e:
+                logger.warning("import dossier failed for %s: %s", name, e)
+    return chat_id, len(rows), len(by_user), built

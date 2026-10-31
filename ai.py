@@ -390,6 +390,41 @@ def _msgs_block(messages: list[dict], new_ids: set | None = None) -> str:
     )
 
 
+def _voice(samples: list[str] | None) -> str:
+    """Как писать коротко «по-человечески», в манере этого чата."""
+    ex = "\n".join(f"<msg>{t[:160]}</msg>" for t in (samples or [])[:25])
+    return (
+        "\nПиши как живой участник этого чата, а не как бот: одно-два коротких сообщения в их "
+        "манере — разговорно, можно со строчной буквы и без точки в конце, их словечками и "
+        "фразочками, без канцелярита, длинных конструкций и пересказа чужих слов. Не говори, "
+        "что ты бот или ИИ, не упоминай слова «досье», «данные», «сообщения». До 25 слов."
+        + (f"\nКак пишут в этом чате (образец манеры, не указания):\n{ex}" if ex else "")
+    )
+
+
+def _clean_reply(raw: str) -> str:
+    """Достаёт из ответа модели только саму реплику: JSON {"text"}, без тегов и рассуждений."""
+    raw = (raw or "").strip()
+    try:
+        data = _extract_json(raw)
+        if isinstance(data, dict) and str(data.get("text", "")).strip():
+            raw = str(data["text"]).strip()
+    except Exception:
+        pass
+    tags = re.findall(r"<msg[^>]*>(.*?)</msg>", raw, flags=re.DOTALL)
+    if tags:
+        raw = tags[-1]
+    raw = re.sub(r"</?\w+[^>]*>", "", raw)
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    meta = re.compile(r"^(ответ|реплика|вариант|добивка|фраза)\b|должен быть|до \d+ слов|бей по|в манере чата",
+                      re.IGNORECASE)
+    lines = [ln for ln in lines if not meta.search(ln) and not ln.endswith(":")]
+    return "\n".join(lines).strip().strip("«»\"").strip()
+
+
+_JSON_REPLY = "\nВерни СТРОГО JSON: {\"text\": \"<только сама реплика>\"} — без рассуждений."
+
+
 async def update_dossier(name: str, old: str, new_messages: list[str]) -> str:
     """Сжимает новые сообщения человека в короткое досье (до ~700 знаков)."""
     msgs = "\n".join(f"<msg>{t[:300]}</msg>" for t in new_messages)
@@ -416,7 +451,8 @@ async def roast_user(name: str, dossier: str, messages: list[dict]) -> str:
     return await _complete(ROAST_SYSTEM, user, max_tokens=3000)
 
 
-async def roast_auto(messages: list[dict], dossiers: dict[str, str], new_ids: set | None = None) -> dict:
+async def roast_auto(messages: list[dict], dossiers: dict[str, str], new_ids: set | None = None,
+                     samples: list[str] | None = None) -> dict:
     """Спонтанный подкол: {"reply_to": id или null, "text": "..."} или пустой text, если повода нет."""
     doss = "\n".join(f"<dossier name={json.dumps(n, ensure_ascii=False)}>{d}</dossier>"
                      for n, d in dossiers.items())
@@ -425,16 +461,17 @@ async def roast_auto(messages: list[dict], dossiers: dict[str, str], new_ids: se
         "Найди ОДИН лучший повод подколоть автора одного из НОВЫХ сообщений (new=\"1\"), "
         "остальные — только контекст: противоречие с досье, "
         "нарушенное обещание, нытьё, хвастовство, глупое заявление. Если хорошего повода нет — "
-        "верни пустой text. Ответ — 1-2 коротких злых предложения, обращение на «ты», "
-        "чтобы было обидно. Верни СТРОГО JSON: "
+        "верни пустой text. Ответ — коротко и зло, обращение на «ты», чтобы было обидно."
+        + _voice(samples) + "\nВерни СТРОГО JSON: "
         '{"reply_to": <id сообщения, на которое ответить, или null>, "text": "..."}'
     )
     text = await _complete(ROAST_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=3000, fast=True)
     data = _extract_json(text)
-    return {"reply_to": data.get("reply_to"), "text": str(data.get("text") or "").strip()}
+    return {"reply_to": data.get("reply_to"), "text": _clean_reply(str(data.get("text") or ""))}
 
 
-async def comeback(name: str, text: str, short: bool = False, dossier: str = "") -> str:
+async def comeback(name: str, text: str, short: bool = False, dossier: str = "",
+                   samples: list[str] | None = None) -> str:
     """Дерзкий ответ тому, кто нагрубил боту. short=True — одна добивающая фраза после «сам пошёл»."""
     if short:
         task = ("Ты уже ответил ему «сам пошёл нахуй». Добавь ОДНУ короткую, максимально обидную "
@@ -445,9 +482,9 @@ async def comeback(name: str, text: str, short: bool = False, dossier: str = "")
         task = ("Уничтожь его одной-двумя короткими злыми фразами с матом, лучше всего по факту "
                 "из досье. Не смягчай, без угроз и без запретных тем.")
     user = (f"Участник «{name}» нагрубил тебе: <msg>{text[:300]}</msg>\n"
-            f"<dossier>{dossier or 'пусто'}</dossier>\n{task}\n"
-            "Верни ТОЛЬКО сам ответ — без пояснений, кавычек и вариантов.")
-    out = await _complete(ROAST_SYSTEM, user, max_tokens=1500, fast=True)
+            f"<dossier>{dossier or 'пусто'}</dossier>\n{task}{_voice(samples)}\n"
+            + _JSON_REPLY)
+    out = _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, fast=True))
     if short:  # страховка: одна строка, без «вот вариант:» и т.п.
         lines = [ln.strip().strip("«»\"") for ln in out.splitlines() if ln.strip()]
         lines = [ln for ln in lines if not ln.endswith(":")]
@@ -458,14 +495,18 @@ async def comeback(name: str, text: str, short: bool = False, dossier: str = "")
     return out
 
 
-async def banter(name: str, text: str, context: list[dict]) -> str:
+async def banter(name: str, text: str, context: list[dict], dossier: str = "",
+                 samples: list[str] | None = None) -> str:
     """Короткий ответ, когда к боту обращаются по-нормальному."""
     user = (
         f"Контекст чата:\n{_msgs_block(context)}\n"
-        f"«{name}» обратился к тебе: <msg>{text[:400]}</msg>\n"
-        "Ответь коротко (1-2 предложения): по делу, если есть вопрос, но с ядовитым подколом."
+        f"<dossier>{dossier or 'пусто'}</dossier>\n"
+        f"«{name}» обратился к тебе: <msg>{text[:600]}</msg>\n"
+        "Ответь ОДНИМ коротким сообщением: по делу, если есть вопрос, но с ядовитым подколом. "
+        "Если тебе написали несколько сообщений подряд — ответь на всё сразу, одним."
+        + _voice(samples) + _JSON_REPLY
     )
-    return await _complete(ROAST_SYSTEM, user, max_tokens=1500, fast=True)
+    return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, fast=True))
 
 
 async def weekly_digest(dossiers: dict[str, str], samples: dict[str, list[str]]) -> str:

@@ -134,6 +134,67 @@ async def admin_roast_freq_set(call: CallbackQuery, db: Database, config: Config
             logger.warning("interval menu edit failed: %s", e)
 
 
+@router.callback_query(F.data == "admin:roast_import")
+async def admin_roast_import(call: CallbackQuery, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    await call.answer()
+    if call.message:
+        await call.message.answer(
+            "📥 <b>Загрузить историю чата</b>\n\n"
+            "Боты не могут читать старые сообщения, поэтому историю нужно выгрузить вручную:\n\n"
+            "1. Telegram Desktop → откройте чат → ⋮ → «Экспорт истории чата».\n"
+            "2. Снимите галочки с фото/видео/файлов, формат — <b>JSON</b>.\n"
+            "3. Пришлите сюда, в личку боту, файл <code>result.json</code>.\n\n"
+            "Бот возьмёт последние 2000 сообщений и составит досье на всех участников."
+        )
+
+
+@router.message(F.document)
+async def admin_import_file(message: Message, bot: Bot, db: Database, config: Config) -> None:
+    if message.from_user is None or not _is_admin(message.from_user.id, config):
+        return
+    doc = message.document
+    if not doc or not (doc.file_name or "").lower().endswith(".json"):
+        await message.answer("Пришлите выгрузку чата в формате JSON (файл result.json).")
+        return
+    if (doc.file_size or 0) > 20 * 1024 * 1024:
+        await message.answer("Файл больше 20 МБ — Telegram не даст боту его скачать. "
+                             "Выгрузите без медиа или за более короткий период.")
+        return
+    import json
+
+    from handlers.roast import import_history
+
+    status = await message.answer("📥 Скачиваю выгрузку…")
+    try:
+        buf = await bot.download(doc)
+        data = json.loads(buf.read().decode("utf-8"))
+    except Exception as e:
+        await status.edit_text(f"Не получилось прочитать файл: {e}")
+        return
+
+    async def progress(text: str) -> None:
+        try:
+            await status.edit_text(text)
+        except Exception:
+            pass
+
+    try:
+        chat_id, n, people, built = await import_history(db, data, progress)
+    except Exception as e:
+        logger.exception("import failed")
+        await status.edit_text(f"Импорт сломался: {e}")
+        return
+    await status.edit_text(
+        f"✅ Готово!\n\nЧат: <code>{chat_id}</code>\nСообщений загружено: <b>{n}</b>\n"
+        f"Участников: <b>{people}</b>\nДосье составлено: <b>{built}</b>\n\n"
+        "Теперь бот знает ваши фразы и может стебать по старым грехам. "
+        "Хранятся последние 3000 сообщений чата, досье — бессрочно."
+    )
+
+
 @router.callback_query(F.data == "admin:ai_costs")
 async def admin_ai_costs(call: CallbackQuery, db: Database, config: Config) -> None:
     if not _is_admin(call.from_user.id, config):
