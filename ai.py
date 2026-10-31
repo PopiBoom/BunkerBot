@@ -820,15 +820,27 @@ async def promise_reminder(name: str, what: str, original: str, dossier: str = "
 
 
 async def roast_photo(image: bytes, mime: str, name: str, caption: str = "", is_father: bool = False,
-                      samples: list[str] | None = None) -> str:
+                      samples: list[str] | None = None, forwarded_from: str | None = None,
+                      count: int = 1, father_channel: bool = False) -> str:
+    what = f"альбом из {count} фото (ты видишь первое)" if count > 1 else "фото"
+    if father_channel:
+        head = f"«{name}» переслал(а) в чат {what} из канала бати {FATHER_NAME} — это батин пост"
+    elif forwarded_from:
+        head = (f"«{name}» переслал(а) в чат {what} из {forwarded_from}. Это ЧУЖОЙ пост: ни фото, ни "
+                f"подпись не сделал(а) {name} — не приписывай их автору пересылки. Комментируй "
+                "содержимое и сам факт, что такое притащили в чат")
+    else:
+        head = f"«{name}» скинул(а) в чат {what}"
     user = (
-        f"«{name}» скинул(а) в чат фото"
+        head
         + (f" с подписью: <msg>{caption[:300]}</msg>" if caption else "") + ".\n"
         "Прокомментируй фото коротко и токсично: высмей ситуацию, обстановку, еду, бардак, вещи, "
         "сам факт, что это выложили, подпись. СТРОГО НЕЛЬЗЯ шутить про внешность людей на фото "
         "(лицо, тело, вес, кожа, причёска) — если на фото человек, шути про ситуацию, а не про него. "
         "Если на фото непонятно что — так и съязви."
-        + _father_note(is_father) + _voice(samples) + _JSON_REPLY
+        + (_father_note(is_father) if not forwarded_from else
+           (f"\nПереслал это твой отец {FATHER_NAME} — к нему «бать», но пост не его." if is_father else ""))
+        + _voice(samples) + _JSON_REPLY
     )
     return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, fast=True, image=(image, mime)))
 
@@ -870,16 +882,22 @@ _CHANNEL_ANGLES = [
 
 
 async def channel_comment(channel: str, text: str, media: str = "", image: tuple[bytes, str] | None = None,
-                          samples: list[str] | None = None) -> str:
+                          samples: list[str] | None = None, repost_from: str | None = None) -> str:
     """Комментарий к посту из канала бати (канал автоматически пересылает посты в чат)."""
     ex = "\n".join(f"<msg>{t[:160]}</msg>" for t in (samples or [])[:20])
     recent = recent_bot_lines.get() or []
     said = "\n".join(f"<said>{t[:200]}</said>" for t in recent[-10:])
     angle = random.choice(_CHANNEL_ANGLES)
     readers = random.random() < 0.15  # к читателям — изредка, а не в каждом комментарии
+    if repost_from:
+        head = (f"В чат пришёл пост из канала твоего отца {FATHER_NAME} «{channel}», но это РЕПОСТ из "
+                f"{repost_from}: автор поста — не батя, батя его только переслал к себе. Не приписывай "
+                "бате текст и фото — комментируй содержимое и то, что батя такое репостит.\n")
+    else:
+        head = (f"В чат пришёл новый пост из канала «{channel}». Это канал твоего отца {FATHER_NAME} — "
+                "пост написал батя.\n")
     user = (
-        f"В чат пришёл новый пост из канала «{channel}». Это канал твоего отца {FATHER_NAME} — пост "
-        f"написал батя.\n"
+        head
         + (f"Текст поста: <msg>{text[:1500]}</msg>\n" if text else "")
         + (f"В посте: {media}.\n" if media else "")
         + "Прокомментируй пост первым, как сын-тролль: коротко, смешно и дерзко, по содержанию "

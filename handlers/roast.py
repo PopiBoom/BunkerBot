@@ -328,15 +328,66 @@ async def _say(bot: Bot, chat_id: int, text: str, reply_to: int | None = None) -
 # привязанного к чату канала считается постом бати всегда.
 CHANNEL_NAMES = [n.strip().lower() for n in os.getenv("BOT_CHANNEL_NAMES", "Memento Mori").split(",") if n.strip()]
 CHANNEL_USER_ID = -1          # так посты канала подписаны в памяти чата (не человек и не бот)
-_seen_albums: set[tuple[int, str]] = set()
+ALBUM_WAIT = 2.5              # сек: ждём, пока Telegram досыплет все фото альбома
+_albums: dict[tuple[int, str], dict] = {}
+
+
+def _is_father_channel_title(title: str | None) -> bool:
+    t = (title or "").lower()
+    return bool(t) and any(n in t for n in CHANNEL_NAMES)
+
+
+def _forward_source(message: Message) -> tuple[str, int | None] | None:
+    """Откуда переслано сообщение: (подпись источника, id канала/чата) или None, если не пересылка."""
+    fo = message.forward_origin
+    if fo is None:
+        return None
+    if fo.type == "channel":
+        return f"канала «{fo.chat.title or 'без названия'}»", fo.chat.id
+    if fo.type == "chat":
+        return f"чата «{fo.sender_chat.title or 'без названия'}»", fo.sender_chat.id
+    if fo.type == "user":
+        return f"сообщения от {fo.sender_user.first_name or 'кого-то'}", None
+    return f"сообщения от {getattr(fo, 'sender_user_name', None) or 'кого-то'}", None
+
+
+def _forwarded_from_father_channel(message: Message) -> bool:
+    fo = message.forward_origin
+    return bool(fo is not None and fo.type == "channel" and _is_father_channel_title(fo.chat.title))
+
+
+async def _album_leader(message: Message) -> tuple[bool, str, int]:
+    """Альбом приходит пачкой отдельных сообщений. Первое ждёт остальные и отвечает за всех.
+
+    Возвращает (это главное сообщение альбома, подпись альбома, сколько в нём фото/видео).
+    Не альбом — (True, своя подпись, 1).
+    """
+    if not message.media_group_id:
+        return True, message.caption or "", 1
+    key = (message.chat.id, message.media_group_id)
+    album = _albums.get(key)
+    if album is not None:  # не первое — только досыпаем подпись и считаем
+        album["count"] += 1
+        if message.caption and not album["caption"]:
+            album["caption"] = message.caption
+        return False, "", 0
+    _albums[key] = {"caption": message.caption or "", "count": 1}
+    await asyncio.sleep(ALBUM_WAIT)
+    album = _albums.pop(key, {"caption": message.caption or "", "count": 1})
+    return True, album["caption"], album["count"]
+
+
+def _media_kind(message: Message) -> str:
+    return ("фото" if message.photo else "видео" if message.video or message.animation else
+            "голосовое" if message.voice or message.video_note else "опрос" if message.poll else
+            "файл" if message.document else "")
 
 
 def _is_father_channel_post(message: Message) -> bool:
     sc = message.sender_chat
     if sc is None or sc.type != "channel":
         return False
-    title = (sc.title or "").lower()
-    return bool(message.is_automatic_forward) or any(n in title for n in CHANNEL_NAMES)
+    return bool(message.is_automatic_forward) or _is_father_channel_title(sc.title)
 
 
 @router.message(_is_father_channel_post)
@@ -344,20 +395,22 @@ async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
     chat_id = message.chat.id
     if not _db_ref:
         _db_ref.append(db)
-    if message.media_group_id:  # альбом приходит пачкой сообщений — комментируем один раз
-        key = (chat_id, message.media_group_id)
-        if key in _seen_albums:
-            return
-        _seen_albums.add(key)
-        if len(_seen_albums) > 300:
-            _seen_albums.clear()
+    leader, caption, count = await _album_leader(message)
+    if not leader:  # альбом — комментируем один раз, на первое сообщение
+        return
     channel = message.sender_chat.title or "канал бати"
-    text = message.text or message.caption or ""
-    media = ("фото" if message.photo else "видео" if message.video or message.animation else
-             "голосовое" if message.voice or message.video_note else "опрос" if message.poll else
-             "файл" if message.document else "")
+    text = message.text or caption or ""
+    media = _media_kind(message)
+    if count > 1:
+        media = f"альбом из {count} фото/видео"
+    # Репост из чужого канала: автор поста не батя, батя только переслал
+    src = _forward_source(message)
+    repost_from = None
+    if src and src[1] not in (None, message.sender_chat.id) and not _forwarded_from_father_channel(message):
+        repost_from = src[0]
     if text or media:
-        await db.add_chat_message(chat_id, message.message_id, CHANNEL_USER_ID, f"📢 {channel} (пост бати)",
+        who = f"📢 {channel} (репост бати из {repost_from})" if repost_from else f"📢 {channel} (пост бати)"
+        await db.add_chat_message(chat_id, message.message_id, CHANNEL_USER_ID, who,
                                   None, (f"[{media}] " if media else "") + text[:1000])
     if not await _enabled(db) or not ai.available() or _bunker_active(chat_id):
         return
@@ -372,7 +425,8 @@ async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
         await asyncio.sleep(random.uniform(3.0, 6.0))  # «прочитал» пост
         await bot.send_chat_action(chat_id, "typing")
         await _remember_lines(db, chat_id)
-        answer = await ai.channel_comment(channel, text, media, image, await db.style_sample(chat_id))
+        answer = await ai.channel_comment(channel, text, media, image, await db.style_sample(chat_id),
+                                          repost_from=repost_from)
     except Exception as e:
         logger.warning("channel comment failed: %s", e)
         return
@@ -504,9 +558,15 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     if not await _enabled(db):
         return
     optout = await db.is_optout(chat_id, user.id)
+    src = _forward_source(message)
     if not optout:
+        note = f"[переслано из {src[0]}] " if src else ""
         await db.add_chat_message(chat_id, message.message_id, user.id, _name(message),
-                                  user.username, message.text[:1000])
+                                  user.username, (note + message.text)[:1000])
+    if src:  # пересланный текст — чужие слова: не обещание, не грубость боту и не наезд на батю
+        if not _bunker_active(chat_id):
+            _spawn(_maybe_react(bot, db, message, False))
+        return
 
     # Обещание с датой? Запомним и в срок напомним (в фоне, ответ не задерживает)
     if not optout and _PROMISE_HINT.search(message.text):
@@ -806,9 +866,15 @@ async def on_group_photo(message: Message, bot: Bot, db: Database, config=None) 
         _db_ref.append(db)
     if not await _enabled(db) or await db.is_optout(chat_id, user.id):
         return
-    caption = message.caption or ""
+    leader, caption, count = await _album_leader(message)
+    if not leader:  # альбом: запоминаем и отвечаем один раз, на первое фото
+        return
+    # Переслано из чужого канала/чата — это не слова и не фото самого человека
+    src = None if _forwarded_from_father_channel(message) else _forward_source(message)
+    what = f"[альбом, {count} фото]" if count > 1 else "[фото]"
+    note = f"[переслано из {src[0]}] " if src else ""
     await db.add_chat_message(chat_id, message.message_id, user.id, _name(message), user.username,
-                              f"[фото] {caption}".strip()[:1000])
+                              f"{note}{what} {caption}".strip()[:1000])
     if not ai.available() or _bunker_active(chat_id):
         return
     reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user
@@ -826,7 +892,8 @@ async def on_group_photo(message: Message, bot: Bot, db: Database, config=None) 
         buf = await bot.download(photo)
         await _remember_lines(db, chat_id)
         draft = await ai.roast_photo(buf.read(), "image/jpeg", _name(message), caption, is_father,
-                                     await db.style_sample(chat_id))
+                                     await db.style_sample(chat_id), forwarded_from=src[0] if src else None,
+                                     count=count, father_channel=_forwarded_from_father_channel(message))
         answer = await ai.polish(draft, caption or "[фото]", _as_dicts(await db.recent_messages(chat_id, limit=10)),
                                  author=ai.FATHER_NAME if is_father else _name(message), about_photo=True)
     except Exception as e:
