@@ -23,7 +23,8 @@ from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message, ReplyParameters
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import Message, ReactionTypeEmoji, ReplyParameters
 
 import ai
 from database import Database
@@ -114,6 +115,7 @@ async def _maybe_defend(message: Message, bot: Bot, db: Database, config) -> boo
     names_father = bool(_father_pattern(_father_username).search(text))
     if not (reply_to_father or names_father):
         return False
+    _spawn(_react(bot, message.chat.id, message.message_id, "🖕", force=True))
     key = (message.chat.id, user.id)
     if time.time() - _last_defense.get(key, 0) < DEFEND_COOLDOWN:
         return True
@@ -192,6 +194,75 @@ QUIET_AFTER_SPEAKING = 20                  # сам не встревает, е�
 
 BOT_SELF = "🤖 ты (бот)"  # так собственные реплики бота подписаны в контексте для ИИ
 _db_ref: list = []         # база для записи своих реплик (заполняется при первом сообщении)
+
+
+# ---------- реакции ----------
+
+REACT_KEY = "roast_react_rate"
+REACT_OPTIONS = [(0.0, "выкл"), (0.05, "редко"), (0.15, "иногда"), (0.35, "часто")]
+DEFAULT_REACT = 0.15
+REACT_GAP = 4  # сек: не чаще одной реакции в чате за это время (кроме 🖕)
+_react_last: dict[int, float] = {}
+_react_bad: dict[int, set[str]] = {}  # реакции, запрещённые в этом чате
+_bg: set[asyncio.Task] = set()
+
+
+async def get_react_rate(db: Database) -> float:
+    try:
+        return float(await db.get_setting(REACT_KEY, str(DEFAULT_REACT)))
+    except ValueError:
+        return DEFAULT_REACT
+
+
+def react_label(rate: float) -> str:
+    return next((label for r, label in REACT_OPTIONS if abs(r - rate) < 1e-9), f"{int(rate * 100)}%")
+
+
+def _spawn(coro) -> None:
+    task = asyncio.create_task(coro)
+    _bg.add(task)
+    task.add_done_callback(_bg.discard)
+
+
+async def _react(bot: Bot, chat_id: int, msg_id: int, emoji: str, force: bool = False) -> bool:
+    if not emoji or emoji in _react_bad.get(chat_id, set()):
+        return False
+    if not force and time.time() - _react_last.get(chat_id, 0) < REACT_GAP:
+        return False
+    try:
+        await bot.set_message_reaction(chat_id, msg_id, reaction=[ReactionTypeEmoji(emoji=emoji)])
+        _react_last[chat_id] = time.time()
+        return True
+    except TelegramBadRequest as e:
+        if "REACTION_INVALID" in str(e) or "reaction" in str(e).lower():
+            _react_bad.setdefault(chat_id, set()).add(emoji)  # в этом чате такую нельзя
+        logger.debug("reaction %s failed: %s", emoji, e)
+    except Exception as e:
+        logger.debug("reaction failed: %s", e)
+    return False
+
+
+async def _maybe_react(bot: Bot, db: Database, message: Message, is_father: bool) -> None:
+    """Иногда ставит реакцию по смыслу (решает Haiku), бате — ❤️/🔥."""
+    rate = await get_react_rate(db)
+    if rate <= 0:
+        return
+    chat_id = message.chat.id
+    if is_father:
+        if random.random() < min(1.0, rate * 2):
+            await _react(bot, chat_id, message.message_id, random.choice(["❤", "🔥", "👍", "💯"]))
+        return
+    if random.random() >= rate or not ai.available():
+        return
+    if time.time() - _react_last.get(chat_id, 0) < REACT_GAP:
+        return
+    try:
+        emoji = await ai.pick_reaction(message.text or "", _name(message))
+    except Exception as e:
+        logger.debug("pick reaction failed: %s", e)
+        return
+    if emoji:
+        await _react(bot, chat_id, message.message_id, emoji)
 
 
 async def _remember_lines(db: Database, chat_id: int) -> None:
@@ -354,7 +425,10 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     by_name = bool(_BOT_NAME.search(text))
     addressed = reply_to_bot or mentioned or by_name or bool(_BOT_WORD.search(text))
     if not addressed:
+        _spawn(_maybe_react(bot, db, message, user.id == _father_id(config)))
         return
+    if _RUDE.search(text):
+        _spawn(_react(bot, chat_id, message.message_id, "🖕", force=True))
 
     rude = bool(_RUDE.search(text))
     # Простое упоминание слова «бот» без ответа и без грубости — отвечаем не всегда

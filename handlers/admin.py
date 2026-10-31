@@ -195,6 +195,55 @@ async def admin_import_file(message: Message, bot: Bot, db: Database, config: Co
     )
 
 
+def _react_text(label: str) -> str:
+    return (
+        "😈 <b>Как часто бот ставит реакции на сообщения</b>\n\n"
+        f"Сейчас: <b>{label}</b>\n\n"
+        "Редко ≈ 5% сообщений, иногда ≈ 15%, часто ≈ 35%. Реакцию по смыслу выбирает ИИ "
+        "(🤡 понты, 💩 бред, 🥱 нытьё, 🤣 смешно…). На грубость боту и наезды на батю — 🖕 всегда, "
+        "бате — ❤️/🔥 чаще остальных."
+    )
+
+
+@router.callback_query(F.data == "admin:react")
+async def admin_react(call: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    from handlers.roast import get_react_rate, react_label
+    from keyboards import react_rate_keyboard
+
+    rate = await get_react_rate(db)
+    await call.answer()
+    if call.message:
+        await call.message.answer(_react_text(react_label(rate)), reply_markup=react_rate_keyboard(rate))
+
+
+@router.callback_query(F.data.startswith("admin:react:"))
+async def admin_react_set(call: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    from handlers.roast import REACT_KEY, REACT_OPTIONS, react_label
+    from keyboards import react_rate_keyboard
+
+    try:
+        rate = float((call.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await call.answer()
+        return
+    if not any(abs(rate - r) < 1e-9 for r, _ in REACT_OPTIONS):
+        await call.answer()
+        return
+    await db.set_setting(REACT_KEY, str(rate))
+    await call.answer(f"Готово: {react_label(rate)}")
+    if call.message:
+        try:
+            await call.message.edit_text(_react_text(react_label(rate)), reply_markup=react_rate_keyboard(rate))
+        except Exception as e:
+            logger.warning("react menu edit failed: %s", e)
+
+
 @router.callback_query(F.data == "admin:ai_costs")
 async def admin_ai_costs(call: CallbackQuery, db: Database, config: Config) -> None:
     if not _is_admin(call.from_user.id, config):

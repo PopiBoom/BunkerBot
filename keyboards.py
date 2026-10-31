@@ -30,6 +30,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     builder.row(InlineKeyboardButton(text="💰 Расходы ИИ", callback_data="admin:ai_costs"))
     builder.row(InlineKeyboardButton(text="🔥 Стёб-бот: вкл/выкл", callback_data="admin:roast_toggle"))
     builder.row(InlineKeyboardButton(text="⏱ Как часто бот встревает", callback_data="admin:roast_freq"))
+    builder.row(InlineKeyboardButton(text="😈 Как часто ставит реакции", callback_data="admin:react"))
     builder.row(InlineKeyboardButton(text="📥 Загрузить историю чата", callback_data="admin:roast_import"))
     builder.row(
         InlineKeyboardButton(text="✏️ Текст приветствия", callback_data="admin:edit_welcome"),
@@ -62,5 +63,17 @@ def roast_interval_keyboard(current: int) -> InlineKeyboardMarkup:
         mark = "✅ " if sec == current else ""
         builder.button(text=f"{mark}{label}", callback_data=f"admin:roast_freq:{sec}")
     builder.adjust(3)
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:cancel"))
+    return builder.as_markup()
+
+
+def react_rate_keyboard(current: float) -> InlineKeyboardMarkup:
+    from handlers.roast import REACT_OPTIONS
+
+    builder = InlineKeyboardBuilder()
+    for rate, label in REACT_OPTIONS:
+        mark = "✅ " if abs(rate - current) < 1e-9 else ""
+        builder.button(text=f"{mark}{label}", callback_data=f"admin:react:{rate}")
+    builder.adjust(4)
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:cancel"))
     return builder.as_markup()
