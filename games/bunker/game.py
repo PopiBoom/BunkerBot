@@ -538,7 +538,7 @@ def _vote_kb(game: Game) -> InlineKeyboardMarkup:
 
 
 async def _refresh_vote(bot: Bot, game: Game) -> None:
-    if game.phase == "voting":
+    if game.phase == "voting" and game.stage in ("open", "speech", "revote"):
         await _edit(bot, game.chat_id, game.vote_msg_id, _vote_text(game), _vote_kb(game))
 
 
@@ -683,7 +683,7 @@ async def _bots_vote(bot: Bot, game: Game, threat: bool = False) -> None:
             if len(game.threat_votes) >= len(_alive(game)) and game.advance:
                 game.advance.set()
             continue
-        if game.revote != revote:
+        if game.revote != revote or game.stage == "closed":
             return
         targets = [u for u in (game.vote_targets or {o.user_id for o in _alive(game)}) if u != p.user_id]
         if not targets:
@@ -857,10 +857,10 @@ def _assign_cards(players: list[Player], cards: list) -> None:
                  if k in C.ATTR_MAP and v is not None and str(v).strip()}
         p.card = {**base, **extra, "name": p.name}
         p.card["bio"] = C.clean_bio(p.card.get("bio", ""))
-        others = [o.name for o in players if o is not p]
-        rel = p.card.get("relation", "")
-        if not any(o in rel for o in others):
-            p.card["relation"] = C.make_relation(others)
+        rel = str(p.card.get("relation", "")).strip()
+        if not rel or rel.startswith("ни с кем"):  # пусто — иногда придумаем связь сами
+            others = [o.name for o in players if o is not p]
+            p.card["relation"] = C.make_relation(others) if random.random() < 0.5 else random.choice(C.SOLO_RELATIONS)
 
 
 async def _run_game(bot: Bot, game: Game) -> None:
@@ -1011,7 +1011,7 @@ async def _reveal_round(bot: Bot, game: Game) -> None:
     if fact:
         text += f"🏚 <b>Новое о бункере:</b>\n<blockquote>{_e(fact)}</blockquote>\n\n"
     text += "Открываем характеристики по очереди 👇"
-    await _say(bot, game.chat_id, text)
+    await _say(bot, game.chat_id, text, delay=0)
     await _refresh_board(bot, game)
 
     for p in list(_alive(game)):
@@ -1033,7 +1033,7 @@ async def _reveal_round(bot: Bot, game: Game) -> None:
     comment = ai.available() and game.round_no % 2 == 1
     note_task = _ai_task(ai.narrate_round(game.catastrophe, game.round_no, game.round_reveals,
                                           _style(game))) if comment else None
-    await _say(bot, game.chat_id, _round_summary(game))
+    await _say(bot, game.chat_id, _round_summary(game), delay=0)
     note = await note_task if note_task else None
     if note and _is_active(game):
         await _say(bot, game.chat_id, _host(game, note))
@@ -1108,11 +1108,11 @@ async def _reveal_attr(bot: Bot, game: Game, p: Player, key: str, auto: bool,
     game.round_reveals.append({"name": p.name, "label": label, "emoji": emoji,
                                "value": str((p.card or {}).get(key, "—"))})
     text = _reveal_text(p, key, note=note if auto else "", prefix=prefix)
-    edited = False
     if count_turn and game.turn_msg_id and game.current_picker == p.user_id:
-        edited = await _edit(bot, game.chat_id, game.turn_msg_id, text)  # без кнопки
-    if not edited:
-        await _send(bot, game.chat_id, text)
+        # Сообщение о ходе закрываем (без кнопки и таймера), карта — отдельным сообщением
+        await _edit(bot, game.chat_id, game.turn_msg_id, f"✅ Ход {_mention(p)} сделан")
+        game.turn_msg_id = None
+    await _send(bot, game.chat_id, text)
     _schedule(bot, game, "board", lambda: _refresh_board(bot, game))
     await asyncio.sleep(REVEAL_DELAY)
 
@@ -1293,14 +1293,11 @@ def _threat_text(game: Game, closed: bool = False) -> str:
     lines = [f"⚠️ <b>УГРОЗА: {_e(game.threat.get('title', '').upper())}</b>", HR, "",
              f"<blockquote>{_e(game.threat.get('text', ''))}</blockquote>", ""]
     lines.append("🗳 Голосование закрыто." if closed else
-                 "Кого отправим разбираться? Рядом — шанс погибнуть по тому, что о нём известно:")
+                 "Кого отправим разбираться? Шанс выжить у каждого свой — ведущий держит его в тайне 🤫")
     lines.append("")
-    alive = sorted(_alive(game), key=lambda p: game.threat_chances.get(p.user_id, {}).get("chance", 50))
-    for p in alive:
-        ch = game.threat_chances.get(p.user_id, {})
-        why = f" <i>({_e(ch['why'])})</i>" if ch.get("why") else ""
-        votes = f" · 🗳 {_num(scores[p.user_id])}" if scores.get(p.user_id) else ""
-        lines.append(f"<b>{_e(p.name)}</b> — ☠️ {ch.get('chance', 50)}%{why}{votes}")
+    for p in _alive(game):
+        votes = f" — 🗳 {_num(scores[p.user_id])}" if scores.get(p.user_id) else ""
+        lines.append(f"<b>{_e(p.name)}</b>{votes}")
     if not closed:
         lines += ["", f"⏳ {THREAT_VOTE} сек. Голосуют только игроки."]
     return "\n".join(lines)
@@ -1319,7 +1316,7 @@ async def _threat_chances(game: Game) -> dict[int, dict]:
     res: dict = {}
     if ai.available():
         public = [{"name": p.name,
-                   "known": {C.ATTR_MAP[k][0]: (p.card or {}).get(k, "") for k in C.ATTR_KEYS if k in p.revealed}}
+                   "known": {C.ATTR_MAP[k][0]: (p.card or {}).get(k, "") for k in C.ATTR_KEYS}}
                   for p in alive]
         try:
             res = await ai.threat_chances(game.threat.get("text", ""), public)
@@ -1329,7 +1326,7 @@ async def _threat_chances(game: Game) -> dict[int, dict]:
     for p in alive:
         r = res.get(p.name)
         if not r:
-            known = " ".join(str((p.card or {}).get(k, "")) for k in p.revealed)
+            known = " ".join(str((p.card or {}).get(k, "")) for k in C.ATTR_KEYS)
             chance, why = C.fallback_chance(known)
             r = {"chance": chance, "why": why}
         out[p.user_id] = r
@@ -1367,11 +1364,16 @@ async def _threat(bot: Bot, game: Game) -> bool:
     died = random.randint(1, 100) <= chance
     await _edit(bot, game.chat_id, game.threat_msg_id, _threat_text(game, closed=True))
 
-    story_task = _ai_task(ai.threat_outcome(game.threat.get("text", ""), p.card or {}, chance, died,
+    if died:
+        known_card = dict(p.card or {})  # досье погибшего и так откроется целиком
+    else:  # выжившему не раскрываем скрытые карты
+        known_card = {k: v for k, v in (p.card or {}).items() if k in p.revealed or k == "name"}
+    story_task = _ai_task(ai.threat_outcome(game.threat.get("text", ""), known_card, chance, died,
                                             _style(game))) if ai.available() else None
+    logger.info("threat chat=%s %s chance=%s died=%s", game.chat_id, p.name, chance, died)
     await _say(bot, game.chat_id,
                f"🔦 Разбираться с угрозой идёт <b>{_e(p.name)}</b>{note}.\n\n"
-               f"🎲 Шанс погибнуть: <b>{chance}%</b>. Бросаем кости…")
+               f"🎲 Бросаем кости…")
     story = (await story_task if story_task else None) or ""
     voice = C.MODE_VOICE.get(game.mode, C.MODE_VOICE["classic"])
 
@@ -1491,16 +1493,32 @@ async def _voting(bot: Bot, game: Game) -> None:
 
         if not _is_active(game):
             return
+        game.stage = "closed"  # дальше голоса не принимаются и сообщение не «оживает»
         candidates, top = _pick_loser(game)
+        logger.info(
+            "vote chat=%s round=%s revote=%s votes=%s scores=%s immune=%s doubled=%s cursed=%s -> %s",
+            game.chat_id, game.round_no, attempt,
+            {game.players[v].name: game.players[t].name for v, t in game.votes.items()
+             if v in game.players and t in game.players},
+            {game.players[u].name: sc for u, sc in _scores(game).items()},
+            [game.players[u].name for u in game.immune], [game.players[u].name for u in game.doubled],
+            [game.players[u].name for u in game.cursed], [game.players[u].name for u in candidates],
+        )
         await _edit(bot, game.chat_id, game.vote_msg_id,
                     f"🗳 <b>Голосование · раунд {game.round_no} — закрыто</b>\n\n{_bars(game)}")
+        # Если больше всех набрал игрок с иммунитетом — прямо так и скажем
+        scores = _scores(game)
+        shielded = [u for u in game.immune if u in scores and scores[u] > top]
+        if shielded:
+            who = _names([_e(game.players[u].name) for u in shielded])
+            note = f" — у {who} больше голосов, но 🛡 иммунитет, поэтому выбывает следующий по голосам"
         if top <= 0:
             note = " (никто не проголосовал — решил жребий)"
             break
         if len(candidates) == 1:
             break
         if attempt == MAX_REVOTES:
-            note = " (снова ничья — решил жребий)"
+            note += " (снова ничья — решил жребий)"
             break
         names = _names([f"<b>{_e(game.players[u].name)}</b>" for u in candidates])
         await _send(bot, game.chat_id, f"⚖️ <b>Ничья!</b> У {names} поровну голосов.\n\n"
@@ -1581,6 +1599,9 @@ async def cb_vote(call: CallbackQuery) -> None:
         await call.answer("Этого игрока уже нет.", show_alert=True)
         return
 
+    if game.stage == "closed":
+        await call.answer("Голосование уже закрыто.", show_alert=True)
+        return
     if game.vote_targets and target not in game.vote_targets:
         await call.answer("Сейчас голосуем только между теми, у кого ничья.", show_alert=True)
         return
@@ -1662,7 +1683,7 @@ async def _finish(bot: Bot, game: Game) -> None:
         gif = await asyncio.to_thread(R.animate_hatch)
         await _retry(bot.send_animation, game.chat_id, BufferedInputFile(gif, filename="hatch.gif"),
                      caption=hatch_text)
-        await asyncio.sleep(5)
+        await asyncio.sleep(2)
     except Exception as e:
         logger.warning("hatch animation failed: %s", e)
         await _say(bot, game.chat_id, f"{HR}\n{hatch_text}", delay=3)
@@ -1679,7 +1700,7 @@ async def _finish(bot: Bot, game: Game) -> None:
         for i in range(0, len(media), 10):
             await _retry(bot.send_media_group, game.chat_id, media[i:i + 10])
         if media:
-            await asyncio.sleep(STEP_DELAY)
+            await asyncio.sleep(STEP_DELAY / 3)
     except Exception as e:
         logger.warning("survivor album failed: %s", e)
 
@@ -1700,7 +1721,7 @@ async def _finish(bot: Bot, game: Game) -> None:
         card = await asyncio.to_thread(
             R.render_postcard, game.title, [p.name for p in survivors], [p.name for p in exiled],
             bool(verdict["survived"]), game.serial, date.today().strftime("%d.%m.%Y"))
-        await _send_photo(bot, game.chat_id, card, "🖼 <b>Итоговая открытка партии</b> — можно переслать в канал")
+        await _send_photo(bot, game.chat_id, card, "🖼 <b>Итоговая открытка партии</b>")
         await asyncio.sleep(3)
     except Exception as e:
         logger.warning("postcard failed: %s", e)
