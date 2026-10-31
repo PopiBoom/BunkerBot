@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import logging
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
@@ -20,6 +22,9 @@ from keyboards import (
 )
 
 router = Router(name="admin")
+logger = logging.getLogger("admin")
+# Админка — только в личке, чтобы не светить панель и рассылку в группах.
+router.message.filter(F.chat.type == "private")
 
 
 class AdminStates(StatesGroup):
@@ -62,6 +67,307 @@ async def admin_stats(call: CallbackQuery, db: Database, config: Config) -> None
             f"👥 Запускали бота: <b>{total}</b>\n"
             f"🎁 Получили контент: <b>{rewarded}</b>"
         )
+
+
+@router.callback_query(F.data == "admin:roast_toggle")
+async def admin_roast_toggle(call: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    on = (await db.get_setting("roast_enabled", "1")) == "1"
+    await db.set_setting("roast_enabled", "0" if on else "1")
+    state = "выключен ⛔" if on else "включён 🔥"
+    await call.answer(f"Стёб-бот {state}", show_alert=True)
+    if call.message:
+        await call.message.answer(
+            f"🔥 Стёб-бот {state}\n\n"
+            "Когда включён: запоминает сообщения в группах (30 дней), ведёт досье, "
+            "иногда сам подкалывает, отвечает на обращения, /roast, /week. "
+            "Участники могут отказаться: /forget_me."
+        )
+
+
+@router.callback_query(F.data == "admin:roast_freq")
+async def admin_roast_freq(call: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    from handlers.roast import get_interval, interval_label
+    from keyboards import roast_interval_keyboard
+
+    current = await get_interval(db)
+    await call.answer()
+    if call.message:
+        await call.message.answer(_freq_text(interval_label(current)), reply_markup=roast_interval_keyboard(current))
+
+
+def _freq_text(label: str) -> str:
+    return (
+        f"⏱ <b>Как часто стёб-бот сам встревает в разговор</b>\n\n"
+        f"Сейчас: <b>{label}</b>\n\n"
+        "Бот встревает, только если с прошлого раза в чате появились новые сообщения: "
+        "чем чаще интервал, тем меньше их нужно. На ответы на грубость и обращения это не влияет."
+    )
+
+
+@router.callback_query(F.data.startswith("admin:roast_freq:"))
+async def admin_roast_freq_set(call: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    from handlers.roast import INTERVAL_KEY, INTERVALS, interval_label
+    from keyboards import roast_interval_keyboard
+
+    try:
+        sec = int((call.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await call.answer()
+        return
+    if sec not in {s for s, _, _ in INTERVALS}:
+        await call.answer()
+        return
+    await db.set_setting(INTERVAL_KEY, str(sec))
+    await call.answer(f"Готово: {interval_label(sec)}")
+    if call.message:
+        try:  # обновляем и текст «Сейчас: …», и галочку
+            await call.message.edit_text(_freq_text(interval_label(sec)), reply_markup=roast_interval_keyboard(sec))
+        except Exception as e:
+            logger.warning("interval menu edit failed: %s", e)
+
+
+@router.callback_query(F.data == "admin:roast_import")
+async def admin_roast_import(call: CallbackQuery, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    await call.answer()
+    if call.message:
+        await call.message.answer(
+            "📥 <b>Загрузить историю чата</b>\n\n"
+            "Боты не могут читать старые сообщения, поэтому историю нужно выгрузить вручную:\n\n"
+            "1. Telegram Desktop → откройте чат → ⋮ → «Экспорт истории чата».\n"
+            "2. Снимите галочки с фото/видео/файлов, формат — <b>JSON</b>.\n"
+            "3. Пришлите сюда, в личку боту, файл <code>result.json</code>.\n\n"
+            "Бот возьмёт последние 2000 сообщений и составит досье на всех участников."
+        )
+
+
+@router.message(F.document)
+async def admin_import_file(message: Message, bot: Bot, db: Database, config: Config) -> None:
+    if message.from_user is None or not _is_admin(message.from_user.id, config):
+        return
+    doc = message.document
+    if doc and (doc.file_name or "").lower().endswith(".db"):
+        await _restore_db(message, bot, db)
+        return
+    if not doc or not (doc.file_name or "").lower().endswith(".json"):
+        await message.answer("Пришлите выгрузку чата (result.json) или бэкап базы (*.db).")
+        return
+    if (doc.file_size or 0) > 20 * 1024 * 1024:
+        await message.answer("Файл больше 20 МБ — Telegram не даст боту его скачать. "
+                             "Выгрузите без медиа или за более короткий период.")
+        return
+    import json
+
+    from handlers.roast import import_history
+
+    status = await message.answer("📥 Скачиваю выгрузку…")
+    try:
+        buf = await bot.download(doc)
+        data = json.loads(buf.read().decode("utf-8"))
+    except Exception as e:
+        await status.edit_text(f"Не получилось прочитать файл: {e}")
+        return
+
+    async def progress(text: str) -> None:
+        try:
+            await status.edit_text(text)
+        except Exception:
+            pass
+
+    try:
+        chat_id, n, people, built = await import_history(db, data, progress)
+    except Exception as e:
+        logger.exception("import failed")
+        await status.edit_text(f"Импорт сломался: {e}")
+        return
+    await status.edit_text(
+        f"✅ Готово!\n\nЧат: <code>{chat_id}</code>\nСообщений загружено: <b>{n}</b>\n"
+        f"Участников: <b>{people}</b>\nДосье составлено: <b>{built}</b>\n\n"
+        "Теперь бот знает ваши фразы и может стебать по старым грехам. "
+        "Хранятся последние 3000 сообщений чата, досье — бессрочно."
+    )
+
+
+def _react_text(label: str) -> str:
+    return (
+        "😈 <b>Как часто бот ставит реакции на сообщения</b>\n\n"
+        f"Сейчас: <b>{label}</b>\n\n"
+        "Редко ≈ 5% сообщений, иногда ≈ 15%, часто ≈ 35%. Реакцию по смыслу выбирает ИИ "
+        "(🤡 понты, 💩 бред, 🥱 нытьё, 🤣 смешно…). На грубость боту и наезды на батю — 🖕 всегда, "
+        "бате — ❤️/🔥 чаще остальных."
+    )
+
+
+@router.callback_query(F.data == "admin:react")
+async def admin_react(call: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    from handlers.roast import get_react_rate, react_label
+    from keyboards import react_rate_keyboard
+
+    rate = await get_react_rate(db)
+    await call.answer()
+    if call.message:
+        await call.message.answer(_react_text(react_label(rate)), reply_markup=react_rate_keyboard(rate))
+
+
+@router.callback_query(F.data.startswith("admin:react:"))
+async def admin_react_set(call: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    from handlers.roast import REACT_KEY, REACT_OPTIONS, react_label
+    from keyboards import react_rate_keyboard
+
+    try:
+        rate = float((call.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await call.answer()
+        return
+    if not any(abs(rate - r) < 1e-9 for r, _ in REACT_OPTIONS):
+        await call.answer()
+        return
+    await db.set_setting(REACT_KEY, str(rate))
+    await call.answer(f"Готово: {react_label(rate)}")
+    if call.message:
+        try:
+            await call.message.edit_text(_react_text(react_label(rate)), reply_markup=react_rate_keyboard(rate))
+        except Exception as e:
+            logger.warning("react menu edit failed: %s", e)
+
+
+# --- Бэкап и восстановление базы (для переезда на сервер) ---
+
+_DB_TABLES = {"users", "settings", "chat_messages", "dossiers", "bunker_stats"}
+
+
+@router.message(Command("backup"))
+async def cmd_backup(message: Message, bot: Bot, db: Database, config: Config) -> None:
+    if message.from_user is None or not _is_admin(message.from_user.id, config):
+        await message.answer(texts.ADMIN_ONLY)
+        return
+    await _send_backup(message, bot, db)
+
+
+@router.callback_query(F.data == "admin:backup")
+async def admin_backup(call: CallbackQuery, bot: Bot, db: Database, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    await call.answer()
+    if call.message:
+        await _send_backup(call.message, bot, db)
+
+
+async def _send_backup(message: Message, bot: Bot, db: Database) -> None:
+    """Согласованная копия базы (через sqlite backup API) — файлом в личку."""
+    import sqlite3
+    import tempfile
+    import time as _t
+
+    from aiogram.types import FSInputFile
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
+    src = sqlite3.connect(db.path)
+    dst = sqlite3.connect(tmp)
+    with dst:
+        src.backup(dst)
+    src.close()
+    dst.close()
+    name = f"bunkerbot-backup-{_t.strftime('%Y%m%d-%H%M')}.db"
+    await bot.send_document(
+        message.chat.id, FSInputFile(tmp, filename=name),
+        caption="💾 Бэкап базы: досье, переписка, рейтинги, обещания, настройки.\n\n"
+                "Чтобы восстановить на другом сервере — просто пришлите этот файл боту в личку.",
+    )
+    os.remove(tmp)
+
+
+async def _restore_db(message: Message, bot: Bot, db: Database) -> None:
+    import shutil
+    import sqlite3
+    import tempfile
+    import time as _t
+
+    doc = message.document
+    if (doc.file_size or 0) > 20 * 1024 * 1024:
+        await message.answer("Файл больше 20 МБ — Telegram не даст боту его скачать.")
+        return
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
+    await bot.download(doc, destination=tmp)
+    try:
+        con = sqlite3.connect(tmp)
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        con.close()
+    except Exception as e:
+        await message.answer(f"Это не база бота: {e}")
+        os.remove(tmp)
+        return
+    if not _DB_TABLES <= tables:
+        await message.answer("Это не бэкап этого бота — не хватает таблиц: " + ", ".join(sorted(_DB_TABLES - tables)))
+        os.remove(tmp)
+        return
+    old = f"{db.path}.before-restore-{_t.strftime('%Y%m%d-%H%M%S')}"
+    if os.path.exists(db.path):
+        shutil.copy2(db.path, old)
+    shutil.move(tmp, db.path)
+    await db.init()  # досоздаст таблицы, если бэкап старее кода
+    await message.answer(
+        "✅ База восстановлена: досье, переписка, рейтинги, обещания и настройки на месте.\n"
+        f"Прежняя база сохранена рядом: <code>{os.path.basename(old)}</code>"
+    )
+
+
+@router.callback_query(F.data == "admin:ai_costs")
+async def admin_ai_costs(call: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    import ai
+
+    r = await db.ai_usage_report()
+
+    def money(x: float) -> str:
+        return f"${x:.2f}" if x >= 0.01 or x == 0 else f"${x:.4f}"
+
+    games_n = r["games"] or 0
+    avg = (r["total"][0] / games_n) if games_n else 0
+    lines = [
+        "💰 <b>Расходы на ИИ</b>",
+        "━━━━━━━━━━━━━━━",
+        "",
+        f"🎲 Последняя партия: <b>{money(r['last'][0])}</b> · запросов: {r['last'][1]}",
+        f"📅 Сегодня: <b>{money(r['today'][0])}</b>",
+        f"🗓 За 30 дней: <b>{money(r['month'][0])}</b>",
+        f"♾ За всё время: <b>{money(r['total'][0])}</b> · партий: {games_n} · в среднем {money(avg)}",
+    ]
+    if r["models"]:
+        lines += ["", "<b>По моделям:</b>"]
+        for model, cost, tin, tout, n in r["models"]:
+            lines.append(f"• {model}: {money(cost)} · {n} запр. · {tin // 1000}K вход / {tout // 1000}K выход")
+    lines += [
+        "",
+        f"⚙️ Сценарий и вердикт: <code>{ai.MODEL}</code>",
+        f"⚡️ Реплики ведущего: <code>{ai.FAST_MODEL}</code>",
+        "",
+        "<i>Оценка по ценам Anthropic, без налогов. Точный счёт и баланс — "
+        "platform.claude.com → Billing.</i>",
+    ]
+    await call.answer()
+    if call.message:
+        await call.message.answer("\n".join(lines))
 
 
 @router.callback_query(F.data == "admin:edit_welcome")

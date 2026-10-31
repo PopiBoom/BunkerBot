@@ -12,6 +12,8 @@ from keyboards import CHECK_CALLBACK, subscription_keyboard
 from subscription import missing_subscriptions
 
 router = Router(name="user")
+# Шлюз подписки работает только в личке — в группах /start не трогаем.
+router.message.filter(F.chat.type == "private")
 
 
 def _personalize(text: str, name: str) -> str:
