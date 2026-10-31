@@ -1177,9 +1177,7 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
         answer = await ai.polish(draft, caption or f"[{label}]",
                                  _as_dicts(await db.recent_messages(chat_id, limit=10)),
                                  author=author, about_photo=True, image=(img, mime), seen=descr)  # редактор видит то же
-        if answer and ai.retells(answer, descr):  # всё равно пересказал — переписываем
-            logger.info("%s reply retells the picture, rewriting: %s", label, answer)
-            answer = await ai.drop_retell(answer, descr, author)
+        # пересказ фото («X, Y и Z — …») редактор ловит и переписывает сам (retells/drop_retell внутри polish)
     except Exception as e:
         logger.warning("%s roast failed: %s", label, e)
         return
