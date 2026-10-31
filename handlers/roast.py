@@ -889,13 +889,14 @@ async def on_group_photo(message: Message, bot: Bot, db: Database, config=None) 
     photo = next((p for p in reversed(sizes) if p.width <= 1280), sizes[0])
     try:
         await bot.send_chat_action(chat_id, "typing")
-        buf = await bot.download(photo)
+        img = (await bot.download(photo)).read()
         await _remember_lines(db, chat_id)
-        draft = await ai.roast_photo(buf.read(), "image/jpeg", _name(message), caption, is_father,
+        draft = await ai.roast_photo(img, "image/jpeg", _name(message), caption, is_father,
                                      await db.style_sample(chat_id), forwarded_from=src[0] if src else None,
                                      count=count, father_channel=_forwarded_from_father_channel(message))
         answer = await ai.polish(draft, caption or "[фото]", _as_dicts(await db.recent_messages(chat_id, limit=10)),
-                                 author=ai.FATHER_NAME if is_father else _name(message), about_photo=True)
+                                 author=ai.FATHER_NAME if is_father else _name(message), about_photo=True,
+                                 image=(img, "image/jpeg"))  # редактор видит то же фото
     except Exception as e:
         logger.warning("photo roast failed: %s", e)
         return
