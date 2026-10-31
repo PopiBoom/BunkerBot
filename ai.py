@@ -508,6 +508,19 @@ async def comeback(name: str, text: str, short: bool = False, dossier: str = "",
     return out
 
 
+async def defend_father(insulter: str, text: str, dossier: str = "",
+                        samples: list[str] | None = None) -> str:
+    """Кто-то обозвал батю — бот заступается и уничтожает обидчика."""
+    user = (
+        f"Участник «{insulter}» обозвал твоего отца {FATHER_NAME}: <msg>{text[:300]}</msg>\n"
+        f"<dossier>{dossier or 'пусто'}</dossier>\n"
+        f"Заступись за батю: жёстко, с матом, поставь обидчика на место — лучше по факту из его "
+        f"досье. Без угроз и без запретных тем. Обращайся к «{insulter}» на «ты»."
+        + _voice(samples) + _JSON_REPLY
+    )
+    return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, fast=True))
+
+
 async def banter(name: str, text: str, context: list[dict], dossier: str = "",
                  samples: list[str] | None = None, is_father: bool = False) -> str:
     """Короткий ответ, когда к боту обращаются по-нормальному."""

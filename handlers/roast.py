@@ -67,6 +67,73 @@ _RUDE = re.compile(
 _SEND_OFF = re.compile(r"на\s*хуй|нахуй|\bнах\b|в\s*жоп|в\s*пизд", re.IGNORECASE)
 MIRRORS = ["Сам пошёл нахуй, {n}.", "Сам иди нахуй, {n} 🖕", "Только после тебя, {n}. Сам пошёл нахуй.",
            "{n}, сам пошёл нахуй — ты там уже как дома."]
+# Оскорбления в адрес человека (для «защиты бати»)
+_INSULT = re.compile(
+    r"\b(лох\w*|лошар\w*|дебил\w*|туп(ой|ая|ое|ые|ица|ицa|орыл\w*)|идиот\w*|мудак\w*|мудил\w*|чмо\w*|"
+    r"урод\w*|пидор\w*|пидр\w*|сук[аи]|шлюх\w*|долбо[её]б\w*|уеб\w*|у[её]бок\w*|дур[аы]|дурак\w*|"
+    r"клоун\w*|кретин\w*|дегенерат\w*|даун\w*|ублюд\w*|гнид\w*|мраз\w*|овц[аы]|скотин\w*|"
+    r"чушпан\w*|нищеб\w*|придур\w*|конченн?\w*|хуесос\w*|заткнись|завали)\b"
+    r"|на\s*хуй|нахуй|в\s*жоп|в\s*пизд",
+    re.IGNORECASE,
+)
+_last_defense: dict[tuple[int, int], float] = {}
+DEFEND_COOLDOWN = 20  # сек на одного обидчика
+FATHER_FALLBACK = ["{n}, на батю моего рот не разевай.", "{n}, ещё раз тронешь батю — прожарю так, что мама не узнает.",
+                   "{n}, ты кого тут обзываешь? Сам-то кто, напомнить?"]
+
+
+def _father_id(config) -> int:
+    return int(os.getenv("BOT_FATHER_ID", "0") or 0) or (config.admin_ids[0] if config and config.admin_ids else 0)
+
+
+def _father_pattern(username: str | None) -> re.Pattern:
+    names = [r"капуст\w*", r"kapust\w*", re.escape(ai.FATHER_NAME.lower())]
+    if username:
+        names.append("@?" + re.escape(username.lower()))
+    return re.compile(r"(?<!\w)(" + "|".join(names) + r")(?!\w)", re.IGNORECASE)
+
+
+_father_username: str | None = None
+
+
+async def _maybe_defend(message: Message, bot: Bot, db: Database, config) -> bool:
+    """Если кто-то обзывает батю — сразу заступаемся. True, если ответили."""
+    global _father_username
+    user = message.from_user
+    father = _father_id(config)
+    if not father or user is None:
+        return False
+    if user.id == father:
+        _father_username = user.username or _father_username  # запомним @ник бати
+        return False
+    text = message.text or ""
+    if not _INSULT.search(text):
+        return False
+    reply_to_father = bool(message.reply_to_message and message.reply_to_message.from_user
+                           and message.reply_to_message.from_user.id == father)
+    names_father = bool(_father_pattern(_father_username).search(text))
+    if not (reply_to_father or names_father):
+        return False
+    key = (message.chat.id, user.id)
+    if time.time() - _last_defense.get(key, 0) < DEFEND_COOLDOWN:
+        return True
+    _last_defense[key] = time.time()
+
+    await asyncio.sleep(random.uniform(1.0, 2.0))
+    name = _name(message)
+    answer = ""
+    if ai.available():
+        try:
+            answer = await ai.defend_father(name, text, await db.get_dossier(message.chat.id, user.id),
+                                            await db.style_sample(message.chat.id))
+        except Exception as e:
+            logger.warning("defend failed: %s", e)
+    if not answer:
+        answer = random.choice(FATHER_FALLBACK).format(n=name)
+    await _say(bot, message.chat.id, answer, reply_to=message.message_id)
+    return True
+
+
 _BOT_WORD = re.compile(r"\bбот(ик|яра|ина)?\b", re.IGNORECASE)
 
 _last_auto: dict[int, float] = {}
@@ -248,6 +315,10 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
         await db.add_chat_message(chat_id, message.message_id, user.id, _name(message),
                                   user.username, message.text[:1000])
 
+    # Защита бати: если кого-то обзывают — реагируем сразу, раньше всего остального
+    if await _maybe_defend(message, bot, db, config):
+        return
+
     # Обращаются ли к боту?
     text = message.text
     reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user
@@ -291,8 +362,7 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     rude = any(r for m, r in items if m.from_user and who and m.from_user.id == who.id)
     samples = await db.style_sample(chat_id)
     # «Отец» бота — первый админ из .env (или BOT_FATHER_ID)
-    father_id = int(os.getenv("BOT_FATHER_ID", "0") or 0) or (config.admin_ids[0] if config and config.admin_ids else 0)
-    is_father = bool(who and who.id == father_id)
+    is_father = bool(who and who.id == _father_id(config))
     dossier = await db.get_dossier(chat_id, who.id) if who else ""
 
     if rude and _SEND_OFF.search(text):
