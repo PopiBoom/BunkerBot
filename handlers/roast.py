@@ -453,6 +453,21 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
         _pending.pop(chat_id, None)
 
 
+_thread: dict[tuple[int, int], list[float]] = {}  # когда бот отвечал этому человеку
+THREAD_WINDOW = 180                                # перепалка — ответы за последние 3 минуты
+_EMPTY = re.compile(r"^\W*(да|нет|ага|угу|и\s*ч[её]|ч[её]|ну\s*и\s*\w+|знаю|ок|окей|пофиг|похуй|ладно|"
+                    r"мм+|хм+|ха(ха)*|ахах\w*|лол|кек|\+|\)+|не\s*буду|буду|пойду|делай|сам\s*такой)\W*$",
+                    re.IGNORECASE)
+COOL_REACTIONS = ["🗿", "🤡", "🥱", "🙈", "😴"]
+
+
+def _thread_load(chat_id: int, user_id: int) -> int:
+    now = time.time()
+    hist = [t for t in _thread.get((chat_id, user_id), []) if now - t < THREAD_WINDOW]
+    _thread[(chat_id, user_id)] = hist
+    return len(hist)
+
+
 async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Message, bool]],
                       config=None) -> None:
     last_msg, _ = items[-1]
@@ -468,6 +483,18 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     await _remember_lines(db, chat_id)
     # «Отец» бота — первый админ из .env (или BOT_FATHER_ID)
     is_father = bool(who and who.id == _father_id(config))
+
+    # Как человек: в затянувшейся перепалке отвечает всё реже, на пустое «да/и че» — реакцией
+    if who and not is_father:
+        n = _thread_load(chat_id, who.id)
+        empty = bool(_EMPTY.match(last_msg.text or ""))
+        chance = 1.0 if n < 2 else {2: 0.5, 3: 0.3}.get(n, 0.15)
+        if empty and n >= 1:
+            chance = min(chance, 0.3)
+        if random.random() > chance:
+            await _react(bot, chat_id, last_msg.message_id,
+                         "🖕" if rude else random.choice(COOL_REACTIONS), force=True)
+            return
     dossier = await db.get_dossier(chat_id, who.id) if who else ""
 
     if rude and _SEND_OFF.search(text):
@@ -485,6 +512,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
             except Exception as e:
                 logger.warning("comeback failed: %s", e)
         await _say(bot, chat_id, answer, reply_to=last_msg.message_id)
+        if who:
+            _thread.setdefault((chat_id, who.id), []).append(time.time())
         return
 
     answer = ""
@@ -504,6 +533,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
         answer = random.choice(COMEBACKS)
     if answer:
         await _say(bot, chat_id, answer, reply_to=last_msg.message_id)
+        if who:
+            _thread.setdefault((chat_id, who.id), []).append(time.time())
 
 
 # ---------- фоновая работа ----------
