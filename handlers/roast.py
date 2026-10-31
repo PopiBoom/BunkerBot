@@ -32,6 +32,7 @@ from aiogram.types import Message, MessageReactionUpdated, ReactionTypeEmoji, Re
 import ai
 import frames
 import links
+import rhymes
 from database import Database
 
 logger = logging.getLogger("roast")
@@ -719,6 +720,10 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     if await _maybe_defend(message, bot, db, config):
         return
 
+    # Рифма-отговорка: «и чё?» — «хуй через плечо», «ну» — «баранки гну»
+    if await _maybe_rhyme(message, bot, config):
+        return
+
     # Обращаются ли к боту?
     text = message.text
     reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user
@@ -754,6 +759,36 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
         await _reply_once(bot, db, chat_id, items, config)
     finally:
         _pending.pop(chat_id, None)
+
+
+RHYME_REPLY = 0.85      # на «да / и чё / а?» в ответ боту — почти всегда рифмой
+RHYME_FREE = 0.12       # на такое же в общем чате — изредка…
+RHYME_GAP = 15 * 60     # …и не чаще раза в 15 минут в чате
+_rhyme_last: dict[int, float] = {}
+
+
+async def _maybe_rhyme(message: Message, bot: Bot, config) -> bool:
+    """Рифмой на короткую реплику (без ИИ). True — ответили."""
+    text = message.text or ""
+    if not rhymes.matches(text):
+        return False
+    chat_id = message.chat.id
+    user = message.from_user
+    if user and user.id == _father_id(config) and random.random() >= ai.FATHER_RUDE_CHANCE:
+        return False  # бате — только в «грубый» раз, как и остальная грубость
+    reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user
+                        and message.reply_to_message.from_user.id == bot.id)
+    if reply_to_bot:
+        if random.random() > RHYME_REPLY:
+            return False
+    elif time.time() - _rhyme_last.get(chat_id, 0) < RHYME_GAP or random.random() > RHYME_FREE:
+        return False
+    answer = rhymes.rhyme_for(text, chat_id)
+    if not answer:
+        return False
+    _rhyme_last[chat_id] = time.time()
+    await _say_human(bot, chat_id, answer, reply_to=message.message_id)
+    return True
 
 
 _thread: dict[tuple[int, int], list[float]] = {}  # когда бот отвечал этому человеку
