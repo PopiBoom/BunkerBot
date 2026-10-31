@@ -278,7 +278,7 @@ def _lobby_text(game: Game) -> str:
         lines.append(f"• {_e(p.name)}{host}")
     lines.append("")
     lines.append("🎮 Жми «Вступить в игру» — откроется бот, запустится и добавит тебя.")
-    lines.append("Туда же, в ЛС, придёт секретная карточка. Ведущий жмёт «Начать».")
+    lines.append("Туда же, в ЛС, придёт секретная карточка. Ведущий тоже жмёт «Вступить», чтобы подключить ЛС, а потом «Начать».")
     return "\n".join(lines)
 
 
@@ -290,7 +290,7 @@ def _lobby_kb(game: Game) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     if game.bot_username:
         b.row(InlineKeyboardButton(text="🎮 Вступить в игру", url=_join_url(game)))
-    b.row(_btn("Войти без ЛС ⚡", "bk:join"), _btn("Выйти 🚪", "bk:leave"))
+    b.row(_btn("Выйти 🚪", "bk:leave"))
     b.row(_btn("Начать игру ▶️", "bk:start"))
     b.row(_btn("Отмена ❌", "bk:cancel"))
     return b.as_markup()
@@ -387,6 +387,8 @@ async def cmd_deeplink_join(message: Message, command: CommandObject) -> None:
         )
         return
     if user.id in game.players:
+        # Например, ведущий: он в игре с момента /bunker, а тут подключает личку.
+        game.players[user.id].dm_ok = True
         await message.answer("Ты уже в игре! Жди старта — карточка придёт сюда, в ЛС. 🧳")
         return
     if len(game.players) >= MAX_PLAYERS:
@@ -423,31 +425,6 @@ async def cmd_bunker_stop(message: Message) -> None:
 
 
 # ---------- лобби ----------
-
-
-@router.callback_query(F.data == "bk:join")
-async def cb_join(call: CallbackQuery) -> None:
-    game = games.get(call.message.chat.id) if call.message else None
-    if not game or game.phase != "lobby":
-        await call.answer("Сейчас нельзя войти.", show_alert=True)
-        return
-    uid = call.from_user.id
-    if uid in game.players:
-        await call.answer("Ты уже в игре.")
-        return
-    if len(game.players) >= MAX_PLAYERS:
-        await call.answer("Мест в лобби больше нет.", show_alert=True)
-        return
-    player = Player(
-        user_id=uid, name=_unique_name(game, call.from_user.first_name), username=call.from_user.username
-    )
-    game.players[uid] = player
-    await call.answer("Ты в игре! (без ЛС — карточка не придёт, ход откроется автоматически)")
-    try:
-        await _send(call.bot, game.chat_id, f"➕ <b>{_e(player.name)}</b> спускается в бункер!")
-    except Exception:
-        pass
-    await _refresh_lobby(call.bot, game)
 
 
 @router.callback_query(F.data == "bk:leave")
