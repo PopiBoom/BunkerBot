@@ -1,21 +1,61 @@
 """«Мозг» ведущего на базе Claude (Anthropic API).
 
-Генерирует сценарий «Бункера» (катастрофа, бункер, факты о нём, карточки),
-вступление, комментарий раунда, реакцию на оправдания, изгнания и финальный вердикт. Если ключа нет или запрос не удался —
-вызывающий код использует запасной генератор, так что игра не ломается.
+Две модели:
+  * AI_MODEL (по умолчанию Opus 5.5) — то, где важны качество и логика: генерация
+    партии, шансы на угрозе, финальный вердикт;
+  * AI_MODEL_FAST (по умолчанию Haiku 5.5, в ~40 раз дешевле) — короткие реплики
+    ведущего: комментарий раунда, речи, изгнание, исход угрозы.
+
+Каждый запрос учитывается: токены и примерная стоимость уходят в «приёмник»
+(его подключает bot.py — пишет в базу), с пометкой партии через contextvar.
+Если ключа нет или запрос не удался — вызывающий код использует запасной
+генератор, так что игра не ломается.
 """
 from __future__ import annotations
 
+import contextvars
 import json
+import logging
 import os
 import re
+from typing import Awaitable, Callable
 
 from anthropic import AsyncAnthropic
 
-# Модель можно поменять через переменную AI_MODEL (например, claude-haiku-5-5 — дешевле).
+logger = logging.getLogger("ai")
+
 MODEL = os.getenv("AI_MODEL", "claude-opus-5-5").strip() or "claude-opus-5-5"
+FAST_MODEL = os.getenv("AI_MODEL_FAST", "claude-haiku-5-5").strip() or "claude-haiku-5-5"
+
+# Цены, $ за 1M токенов (вход, выход). Для учёта расходов — примерно, без налогов.
+PRICES = {
+    "claude-fable-5-1": (10.0, 50.0),
+    "claude-opus-5-5": (4.0, 20.0),
+    "claude-opus-5": (5.0, 25.0),
+    "claude-opus-4-8": (5.0, 25.0),
+    "claude-sonnet-5-5": (2.0, 10.0),
+    "claude-sonnet-5": (2.0, 10.0),
+    "claude-haiku-5-5": (0.10, 0.50),
+}
+
+# Метка текущей партии: ставится в задаче партии и наследуется её подзадачами.
+current_game: contextvars.ContextVar[str | None] = contextvars.ContextVar("ai_game", default=None)
+
+UsageSink = Callable[[str | None, str, int, int, float], Awaitable[None]]
+_usage_sink: UsageSink | None = None
 
 _client: AsyncAnthropic | None = None
+
+
+def set_usage_sink(sink: UsageSink | None) -> None:
+    """Куда сохранять расход: sink(game_key, model, input_tokens, output_tokens, cost_usd)."""
+    global _usage_sink
+    _usage_sink = sink
+
+
+def price(model: str, input_tokens: int, output_tokens: int) -> float:
+    pin, pout = PRICES.get(model, PRICES.get(MODEL, (4.0, 20.0)))
+    return (input_tokens * pin + output_tokens * pout) / 1_000_000
 
 
 class AIUnavailable(RuntimeError):
@@ -52,27 +92,45 @@ def _extract_json(text: str) -> dict:
 _FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
 
 
-async def _complete(system: str, user: str, max_tokens: int = 4000) -> str:
+async def _record(model: str, usage) -> None:
+    if usage is None:
+        return
+    tin = int(getattr(usage, "input_tokens", 0) or 0)
+    tin += int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    tin += int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    tout = int(getattr(usage, "output_tokens", 0) or 0)
+    cost = price(model, tin, tout)
+    logger.info("AI %s: in=%s out=%s ≈ $%.4f", model, tin, tout, cost)
+    if _usage_sink:
+        try:
+            await _usage_sink(current_game.get(), model, tin, tout, cost)
+        except Exception as e:
+            logger.warning("usage sink failed: %s", e)
+
+
+async def _complete(system: str, user: str, max_tokens: int = 4000, fast: bool = False) -> str:
     """Один запрос к Claude, возвращает текст ответа.
 
-    max_tokens берём с запасом: у текущих моделей размышление включено и тратит
-    тот же лимит. Длину ответа задаём в самом промпте.
+    fast=True — дешёвая модель для коротких реплик. max_tokens берём с запасом:
+    размышление модели тратит тот же лимит; длину ответа задаём в промпте.
     """
     client = _get_client()
+    model = FAST_MODEL if fast else MODEL
     kwargs = dict(
-        model=MODEL,
+        model=model,
         max_tokens=max_tokens,
         system=system,
         output_config={"effort": "low"},
         messages=[{"role": "user", "content": user}],
     )
-    if MODEL in _FALLBACK_MODELS:
+    if model in _FALLBACK_MODELS:
         # При отказе API само переотправит запрос подходящей модели.
         resp = await client.beta.messages.create(
             betas=["server-side-fallback-2026-07-01"], fallbacks="default", **kwargs
         )
     else:
         resp = await client.messages.create(**kwargs)
+    await _record(getattr(resp, "model", None) or model, resp.usage)
     if resp.stop_reason == "refusal":
         raise AIUnavailable("модель отказалась отвечать")
     return "".join(b.text for b in resp.content if b.type == "text").strip()
@@ -161,7 +219,7 @@ async def narrate_intro(catastrophe: str, bunker: str, style: str = "") -> str:
         "Скажи вступительное слово как ведущий (2-3 предложения): задай настроение, "
         "подколи игроков, объясни что сейчас будут раскрывать карты и голосовать."
     )
-    return await _complete(_host(style), user, max_tokens=2000)
+    return await _complete(_host(style), user, max_tokens=2000, fast=True)
 
 
 async def narrate_round(catastrophe: str, round_no: int, reveals: list[dict], style: str = "") -> str:
@@ -172,7 +230,7 @@ async def narrate_round(catastrophe: str, round_no: int, reveals: list[dict], st
         "Прокомментируй раунд одним абзацем (2-3 предложения, до 60 слов): подколи 2-3 самых "
         "смешных или подозрительных игроков по именам, намекни, кого стоит выгнать."
     )
-    return await _complete(_host(style), user, max_tokens=2500)
+    return await _complete(_host(style), user, max_tokens=2500, fast=True)
 
 
 async def narrate_speeches(catastrophe: str, speeches: dict[str, str], style: str = "") -> str:
@@ -187,7 +245,7 @@ async def narrate_speeches(catastrophe: str, speeches: dict[str, str], style: st
         f"{quoted}\n"
         "Оцени речи одним коротким абзацем (2-3 предложения, до 50 слов): чья речь убедительнее и смешнее."
     )
-    return await _complete(_host(style), user, max_tokens=2000)
+    return await _complete(_host(style), user, max_tokens=2000, fast=True)
 
 
 async def narrate_elimination(catastrophe: str, card: dict, round_no: int, style: str = "") -> str:
@@ -197,7 +255,7 @@ async def narrate_elimination(catastrophe: str, card: dict, round_no: int, style
         f"{json.dumps(card, ensure_ascii=False)}\n"
         "Опиши коротко и с чёрным юмором (2-3 предложения, до 60 слов), как он уходит от бункера."
     )
-    return await _complete(_host(style), user, max_tokens=2000)
+    return await _complete(_host(style), user, max_tokens=2000, fast=True)
 
 
 async def final_verdict(
@@ -259,4 +317,4 @@ async def threat_outcome(threat: str, card: dict, chance: int, died: bool, style
         "Опиши, как всё прошло (2-3 предложения, до 60 слов), с чёрным юмором, "
         "опираясь на его карточку."
     )
-    return await _complete(_host(style), user, max_tokens=2000)
+    return await _complete(_host(style), user, max_tokens=2000, fast=True)

@@ -66,6 +66,46 @@ async def admin_stats(call: CallbackQuery, db: Database, config: Config) -> None
         )
 
 
+@router.callback_query(F.data == "admin:ai_costs")
+async def admin_ai_costs(call: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    import ai
+
+    r = await db.ai_usage_report()
+
+    def money(x: float) -> str:
+        return f"${x:.2f}" if x >= 0.01 or x == 0 else f"${x:.4f}"
+
+    games_n = r["games"] or 0
+    avg = (r["total"][0] / games_n) if games_n else 0
+    lines = [
+        "💰 <b>Расходы на ИИ</b>",
+        "━━━━━━━━━━━━━━━",
+        "",
+        f"🎲 Последняя партия: <b>{money(r['last'][0])}</b> · запросов: {r['last'][1]}",
+        f"📅 Сегодня: <b>{money(r['today'][0])}</b>",
+        f"🗓 За 30 дней: <b>{money(r['month'][0])}</b>",
+        f"♾ За всё время: <b>{money(r['total'][0])}</b> · партий: {games_n} · в среднем {money(avg)}",
+    ]
+    if r["models"]:
+        lines += ["", "<b>По моделям:</b>"]
+        for model, cost, tin, tout, n in r["models"]:
+            lines.append(f"• {model}: {money(cost)} · {n} запр. · {tin // 1000}K вход / {tout // 1000}K выход")
+    lines += [
+        "",
+        f"⚙️ Сценарий и вердикт: <code>{ai.MODEL}</code>",
+        f"⚡️ Реплики ведущего: <code>{ai.FAST_MODEL}</code>",
+        "",
+        "<i>Оценка по ценам Anthropic, без налогов. Точный счёт и баланс — "
+        "platform.claude.com → Billing.</i>",
+    ]
+    await call.answer()
+    if call.message:
+        await call.message.answer("\n".join(lines))
+
+
 @router.callback_query(F.data == "admin:edit_welcome")
 async def admin_edit_welcome(call: CallbackQuery, state: FSMContext, config: Config) -> None:
     if not _is_admin(call.from_user.id, config):

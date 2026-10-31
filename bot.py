@@ -61,6 +61,8 @@ async def main() -> None:
     )
     db = Database(config.db_path)
     await db.init()
+    import ai
+    ai.set_usage_sink(db.add_ai_usage)  # учёт токенов и стоимости запросов к ИИ
 
     dp = Dispatcher(storage=MemoryStorage())
     # Прокидываем зависимости в обработчики (aiogram подставит по имени параметра)

@@ -43,7 +43,61 @@ class Database:
                 )
                 """
             )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ai_usage (
+                    ts            INTEGER NOT NULL,
+                    game_key      TEXT,
+                    model         TEXT NOT NULL,
+                    input_tokens  INTEGER NOT NULL,
+                    output_tokens INTEGER NOT NULL,
+                    cost          REAL NOT NULL
+                )
+                """
+            )
             await db.commit()
+
+    # --- расходы на ИИ ---
+
+    async def add_ai_usage(self, game_key: str | None, model: str, input_tokens: int,
+                           output_tokens: int, cost: float) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO ai_usage (ts, game_key, model, input_tokens, output_tokens, cost) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (int(time.time()), game_key, model, input_tokens, output_tokens, cost),
+            )
+            await db.commit()
+
+    async def ai_usage_report(self) -> dict:
+        """Сводка расходов: последняя партия, сегодня, 30 дней, всё время, по моделям."""
+        now = int(time.time())
+        day = now - now % 86400
+        async with aiosqlite.connect(self.path) as db:
+            async def one(sql: str, args: tuple = ()) -> tuple:
+                cur = await db.execute(sql, args)
+                return await cur.fetchone() or (0, 0)
+
+            report = {
+                "today": await one("SELECT COALESCE(SUM(cost),0), COUNT(*) FROM ai_usage WHERE ts >= ?", (day,)),
+                "month": await one("SELECT COALESCE(SUM(cost),0), COUNT(*) FROM ai_usage WHERE ts >= ?",
+                                   (now - 30 * 86400,)),
+                "total": await one("SELECT COALESCE(SUM(cost),0), COUNT(*) FROM ai_usage"),
+                "games": (await one("SELECT COUNT(DISTINCT game_key) FROM ai_usage WHERE game_key IS NOT NULL"))[0],
+            }
+            cur = await db.execute(
+                "SELECT game_key FROM ai_usage WHERE game_key IS NOT NULL ORDER BY ts DESC LIMIT 1"
+            )
+            row = await cur.fetchone()
+            report["last"] = await one(
+                "SELECT COALESCE(SUM(cost),0), COUNT(*) FROM ai_usage WHERE game_key = ?", (row[0],)
+            ) if row else (0, 0)
+            cur = await db.execute(
+                "SELECT model, SUM(cost), SUM(input_tokens), SUM(output_tokens), COUNT(*) "
+                "FROM ai_usage GROUP BY model ORDER BY SUM(cost) DESC"
+            )
+            report["models"] = list(await cur.fetchall())
+            return report
 
     # --- статистика Бункера ---
 

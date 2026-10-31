@@ -18,6 +18,7 @@ import html
 import logging
 import os
 import random
+import time
 from dataclasses import dataclass, field
 
 from aiogram import Bot, F, Router
@@ -774,6 +775,8 @@ def _assign_cards(players: list[Player], cards: list) -> None:
 
 
 async def _run_game(bot: Bot, game: Game) -> None:
+    # Метка партии для учёта расходов на ИИ (наследуется всеми подзадачами партии)
+    ai.current_game.set(f"{game.chat_id}:{int(time.time())}")
     players = list(game.players.values())
     names = [p.name for p in players]
     status = await _send(bot, game.chat_id, "🎙 Ведущий готовит сценарий… (до минуты)")
@@ -831,8 +834,6 @@ async def _run_game(bot: Bot, game: Game) -> None:
     except Exception:
         pass
 
-    intro_task = _ai_task(ai.narrate_intro(game.catastrophe, game.bunker, _style(game))) \
-        if ai.available() else None
     # Катастрофа и бункер — только картинками, одним альбомом
     try:
         cover = await asyncio.to_thread(R.render_cover, game.title, game.catastrophe,
@@ -850,9 +851,6 @@ async def _run_game(bot: Bot, game: Game) -> None:
                    f"☢️ <b>КАТАСТРОФА</b>\n{_quote(game.catastrophe)}\n\n"
                    f"🏚 <b>БУНКЕР</b>\n{_quote(game.bunker)}")
 
-    intro = await intro_task if intro_task else None
-    if intro:
-        await _say(bot, game.chat_id, _host(game, intro))
 
     roster = ", ".join(_e(p.name) for p in players)
     await _say(
@@ -951,9 +949,11 @@ async def _reveal_round(bot: Bot, game: Game) -> None:
 
     if not _is_active(game) or not game.round_reveals:
         return
-    # Пока все читают итоги раунда, ведущий уже пишет комментарий
+    # Ведущий комментирует через раунд (1-й, 3-й, …) — экономим запросы к ИИ.
+    # Пока все читают итоги раунда, комментарий уже пишется.
+    comment = ai.available() and game.round_no % 2 == 1
     note_task = _ai_task(ai.narrate_round(game.catastrophe, game.round_no, game.round_reveals,
-                                          _style(game))) if ai.available() else None
+                                          _style(game))) if comment else None
     await _say(bot, game.chat_id, _round_summary(game))
     note = await note_task if note_task else None
     if note and _is_active(game):
@@ -1416,7 +1416,8 @@ async def _end_speech(bot: Bot, game: Game) -> None:
     rest = VOTE_TIMEOUT - SPEECH_AT - SPEECH_LEN
     tail = f"⏳ {rest} сек до итога — последний шанс переголосовать!"
     speeches = {game.players[u].name: " ".join(t)[:600] for u, t in game.speakers.items() if t}
-    if speeches and ai.available():
+    # Ведущий оценивает речи, только если высказались оба обвиняемых
+    if speeches and len(speeches) >= 2 and ai.available():
         try:
             note = await ai.narrate_speeches(game.catastrophe, speeches, _style(game))
             if note:
