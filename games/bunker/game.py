@@ -3,11 +3,11 @@
 Поток партии (вся партия — одна фоновая задача `_run_game`, кнопки лишь будят её):
   /bunker → лобби (вход только через ЛС бота, выбор режима ведущего) → старт →
   ИИ генерирует катастрофу, бункер, факты о бункере и карточки → каждому в ЛС
-  приходит карточка-картинка, карта действия и тайная цель → закреплённое «табло» →
+  приходит карточка-картинка и карта действия → закреплённое «табло» →
   раунды: новый факт о бункере, игроки по очереди открывают характеристику (таймер
   в сообщении), одна реплика ведущего на раунд → голосование (полоски, голоса
   зрителей, последнее слово двух лидеров) → изгнание с картинкой «ОТКАЗАНО» →
-  финал: эпилог, вердикт «выжила ли колония», тайные цели, альбом выживших, рейтинг.
+  финал: эпилог, вердикт «выжила ли колония», альбом выживших, рейтинг.
 
 Состояние игр хранится в памяти процесса (по одному на чат).
 """
@@ -77,7 +77,6 @@ class Player:
     pick_msg_id: int | None = None
     action: str | None = None
     action_used: bool = False
-    goal: dict | None = None
     serial: int = 0
     out_round: int | None = None
     died: bool = False  # погиб на угрозе, а не изгнан голосованием
@@ -269,17 +268,7 @@ async def _render(p: Player, game: Game, **kwargs) -> bytes:
 
 
 async def _send_exile_card(bot: Bot, game: Game, p: Player, stamp: str, caption: str) -> None:
-    """Досье выбывшего: анимация с печатью, при сбое — картинка, при сбое — текст."""
-    try:
-        def make() -> bytes:
-            img = R.render_card_image(p.name, p.card or {}, p.serial, revealed=set(p.revealed))
-            return R.animate_stamp(img, stamp)
-        gif = await asyncio.to_thread(make)
-        await _retry(bot.send_animation, game.chat_id, BufferedInputFile(gif, filename="stamp.gif"),
-                     caption=caption[:MAX_CAPTION])
-        return
-    except Exception as e:
-        logger.warning("exile animation failed: %s", e)
+    """Досье выбывшего: картинка с печатью, при сбое — текст."""
     try:
         png = await _render(p, game, stamp=stamp, revealed=set(p.revealed))
         await _send_photo(bot, game.chat_id, png, caption)
@@ -365,7 +354,7 @@ def _lobby_text(game: Game) -> str:
         "",
         "🎮 Жми «Вступить в игру» — откроется бот, нажми Start, и ты в игре.",
         "",
-        "📬 В ЛС придут карточка, карта действия и тайная цель.",
+        "📬 В ЛС придут карточка и карта действия.",
         "",
         "👑 Ведущий тоже жмёт «Вступить», потом «Начать».",
     ]
@@ -475,8 +464,6 @@ def _card_caption(game: Game, p: Player) -> str:
         emoji, title, desc, when, _ = C.ACTIONS[p.action]
         when_txt = "только во время голосования" if when == "vote" else "в любой момент раунда"
         parts.append(f"\n🃏 <b>Карта действия: {emoji} {title}</b>\n{_e(desc)} <i>(одноразовая, {when_txt})</i>")
-    if p.goal:
-        parts.append(f"\n🎯 <b>Тайная цель:</b> {_e(p.goal['text'])}")
     return "\n".join(parts)
 
 
@@ -621,8 +608,7 @@ async def cmd_deeplink_join(message: Message, command: CommandObject) -> None:
                     username=user.username, dm_ok=True)
     game.players[user.id] = player
     await message.answer("✅ Ты в игре «Бункер»!\n"
-                         "Когда ведущий начнёт — сюда придут твоя карточка, карта действия "
-                         "и тайная цель, а в свой ход ты будешь выбирать здесь, что открыть.")
+                         "Когда ведущий начнёт — сюда придут твоя карточка и карта действия, а в свой ход ты будешь выбирать здесь, что открыть.")
     try:
         await _send(message.bot, chat_id, f"➕ <b>{_e(player.name)}</b> спускается в бункер!")
     except Exception:
@@ -816,7 +802,6 @@ async def _run_game(bot: Bot, game: Game) -> None:
     for p, action in zip(players, C.deal_actions(len(players))):
         p.action = action
         others = [(o.user_id, o.name) for o in players if o.user_id != p.user_id]
-        p.goal = C.make_goal(p.user_id, others)
         p.serial = random.randint(1, 9999)
 
     game.spots = max(1, len(players) // 2)
@@ -828,7 +813,7 @@ async def _run_game(bot: Bot, game: Game) -> None:
     no_dm = []
     for p in players:
         try:
-            png = await _render(p, game, action=p.action, goal=(p.goal or {}).get("text"))
+            png = await _render(p, game, action=p.action)
             kb = InlineKeyboardBuilder()
             act = _action_btn(game, p)
             if act:
@@ -872,7 +857,7 @@ async def _run_game(bot: Bot, game: Game) -> None:
         f"👥 <b>Игроков: {len(players)}</b>\n{roster}\n\n"
         f"🎟 Мест в бункере: <b>{game.spots}</b>\n"
         f"{HR}\n\n"
-        f"📬 У каждого в ЛС: карточка, 🃏 одноразовая карта действия и 🎯 тайная цель.\n\n"
+        f"📬 У каждого в ЛС: карточка и 🃏 одноразовая карта действия.\n\n"
         f"🔦 <b>Раунд:</b> новый факт о бункере → по очереди открываем по одной "
         f"характеристике (на ход {TURN_TIMEOUT} сек) → голосование.\n\n"
         f"🎤 Двое лидеров голосования получают последнее слово.\n\n"
@@ -1534,7 +1519,7 @@ async def _tally(bot: Bot, game: Game) -> None:
                 f"🗳 <b>Голосование · раунд {game.round_no} — закрыто</b>\n\n{bars}")
     await _say(bot, game.chat_id,
                f"{HR}\n🧮 <b>ИТОГ РАУНДА {game.round_no}</b>\n{HR}\n\n{bars}\n\n"
-               f"🚪 Из бункера не пускают <b>{_e(loser.name)}</b>{note}.")
+               f"🚪 В бункер не пускают <b>{_e(loser.name)}</b>{note}.")
 
     story = (await story_task if story_task else None) or ""
     voice = C.MODE_VOICE.get(game.mode, C.MODE_VOICE["classic"])
@@ -1575,7 +1560,7 @@ async def _finish(bot: Bot, game: Game) -> None:
     try:
         media = []
         for i, p in enumerate(survivors):
-            png = await _render(p, game, stamp="in", goal=(p.goal or {}).get("text"))
+            png = await _render(p, game, stamp="in")
             media.append(InputMediaPhoto(
                 media=BufferedInputFile(png, filename=f"{p.serial}.png"),
                 caption="🏚 Пропуска выживших" if i == 0 else None,
@@ -1609,15 +1594,9 @@ async def _finish(bot: Bot, game: Game) -> None:
     except Exception as e:
         logger.warning("postcard failed: %s", e)
 
-    alive_ids = {p.user_id for p in survivors}
-    results = []
-    goal_lines = [f"🎯 <b>ТАЙНЫЕ ЦЕЛИ</b>\n{HR}"]
-    for p in game.players.values():
-        done = C.goal_done(p.goal or {}, p.alive, alive_ids)
-        goal_lines.append(f"{'✅' if done else '❌'} <b>{_e(p.name)}</b>\n{_e((p.goal or {}).get('text', '—'))}")
-        results.append({"user_id": p.user_id, "name": p.name, "survived": p.alive,
-                        "first_out": p.user_id == game.first_out, "goal_done": done})
-    await _say(bot, game.chat_id, "\n\n".join(goal_lines), delay=3)
+    results = [{"user_id": p.user_id, "name": p.name, "survived": p.alive,
+                "first_out": p.user_id == game.first_out, "goal_done": False}
+               for p in game.players.values()]
 
     if game.db:
         try:
