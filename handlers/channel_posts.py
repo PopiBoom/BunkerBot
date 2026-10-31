@@ -70,7 +70,11 @@ async def _remember_post(db: Database, msg_id: int, text: str) -> None:
 
 
 async def _style_examples(db: Database) -> list[str]:
-    """Посты самого бати из памяти чата — образец стиля канала."""
+    """Посты самого бати из памяти чата — образец стиля канала (без постов самого бота)."""
+    try:
+        mine = {t[:60] for t in json.loads(await db.get_setting(POSTS_KEY, "[]"))}
+    except ValueError:
+        mine = set()
     out = []
     for chat_id in await db.active_chats(int(time.time()) - 30 * 86400):
         for _mid, uid, _name, text, _ts in await db.recent_messages(chat_id, limit=300):
@@ -78,7 +82,7 @@ async def _style_examples(db: Database) -> list[str]:
                 t = str(text)
                 if t.startswith("["):
                     t = t.split("]", 1)[-1]
-                if len(t.strip()) > 15:
+                if len(t.strip()) > 15 and t.strip()[:60] not in mine:
                     out.append(t.strip()[:300])
     return out[-12:]
 

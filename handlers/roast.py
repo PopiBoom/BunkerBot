@@ -491,6 +491,16 @@ async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
     repost_from = None
     if src and src[1] not in (None, message.sender_chat.id) and not _forwarded_from_father_channel(message):
         repost_from = src[0]
+    fo = message.forward_origin
+    if fo is not None and fo.type == "channel" and getattr(fo, "message_id", None):
+        from handlers.channel_posts import own_posts
+        if fo.message_id in await own_posts(db):
+            # Это пост самого бота: запоминаем как его реплику (не как пост бати — иначе он потом
+            # берёт себя же за образец «как пишет батя») и не комментирует сам себя
+            if text:
+                await db.add_chat_message(chat_id, message.message_id, 0, BOT_SELF, None,
+                                          f"[мой пост в канале] {text}"[:1000])
+            return
     if text or media:
         who = f"📢 {channel} (репост бати из {repost_from})" if repost_from else f"📢 {channel} (пост бати)"
         await db.add_chat_message(chat_id, message.message_id, CHANNEL_USER_ID, who,
@@ -499,11 +509,6 @@ async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
         return
     if not text and not media:
         return
-    fo = message.forward_origin
-    if fo is not None and fo.type == "channel" and getattr(fo, "message_id", None):
-        from handlers.channel_posts import own_posts
-        if fo.message_id in await own_posts(db):  # это пост самого бота — сам себя не комментирует
-            return
     image = None
     try:
         if message.photo:
