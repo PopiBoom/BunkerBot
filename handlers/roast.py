@@ -75,10 +75,22 @@ _INSULT = re.compile(
     r"\b(лох\w*|лошар\w*|дебил\w*|туп(ой|ая|ое|ые|ица|ицa|орыл\w*)|идиот\w*|мудак\w*|мудил\w*|чмо\w*|"
     r"урод\w*|пидор\w*|пидр\w*|сук[аи]|шлюх\w*|долбо[её]б\w*|уеб\w*|у[её]бок\w*|дур[аы]|дурак\w*|"
     r"клоун\w*|кретин\w*|дегенерат\w*|даун\w*|ублюд\w*|гнид\w*|мраз\w*|овц[аы]|скотин\w*|"
-    r"чушпан\w*|нищеб\w*|придур\w*|конченн?\w*|хуесос\w*|заткнись|завали)\b"
-    r"|на\s*хуй|нахуй|в\s*жоп|в\s*пизд",
+    r"чушпан\w*|нищеб\w*|придур\w*|конченн?\w*|хуесос\w*|заткнись|завали|"
+    r"пидар\w*|педик\w*|педр\w*|петух\w*|петушар\w*|еблан\w*|ебанат\w*|гандон\w*|гондон\w*|гей|"
+    r"говн\w*|хуйл\w*|хуепл[её]т\w*|соси|сос[её]т|ебал\w*|выеб\w*|ебу|отсос\w*|аутист\w*|крыс[аы]|"
+    r"терпил\w*|опущ\w*|чушк\w*|додик\w*|дрищ\w*|лузер\w*|неудачник\w*|бомж\w*|быдл\w*|"
+    r"gay|fag\w*|loser|idiot|stupid|dumb)\b"
+    r"|на\s*хуй|нахуй|в\s*жоп|в\s*пизд|в\s*рот",
     re.IGNORECASE,
 )
+# «Твой батя …» — когда говорят боту, речь о его отце
+_FATHER_REF = re.compile(
+    r"\b(тво(й|его|ему|им|ем)|у\s+тебя)\s+(бат\w*|от[её]?ц\w*|пап\w*|создател\w*|хозя\w*)"
+    r"|\b(бат\w*|от[её]?ц\w*|пап\w*|создател\w*|хозя\w*)\s+(бота|пиздюк\w*)",
+    re.IGNORECASE,
+)
+# Части фразы: «капустка красавчик, а петя лох» — оскорбление не про батю
+_CLAUSES = re.compile(r"[,.!?;\n]+|\s+(?:а|но|зато|однако|хотя)\s+", re.IGNORECASE)
 _last_defense: dict[tuple[int, int], float] = {}
 DEFEND_COOLDOWN = 20  # сек на одного обидчика
 FATHER_FALLBACK = ["{n}, на батю моего рот не разевай.", "{n}, ещё раз тронешь батю — прожарю так, что мама не узнает.",
@@ -90,13 +102,13 @@ def _father_id(config) -> int:
 
 
 def _father_pattern(username: str | None) -> re.Pattern:
-    names = [r"капуст\w*", r"kapust\w*", re.escape(ai.FATHER_NAME.lower())]
+    names = [r"капуст\w*", r"kapust\w*", r"капуш\w*", r"кап", re.escape(ai.FATHER_NAME.lower())]
     if username:
         names.append("@?" + re.escape(username.lower()))
     return re.compile(r"(?<!\w)(" + "|".join(names) + r")(?!\w)", re.IGNORECASE)
 
 
-_father_username: str | None = None
+_father_username: str | None = None  # @ник бати; "" — искали, но не нашли
 
 
 async def _maybe_defend(message: Message, bot: Bot, db: Database, config) -> bool:
@@ -112,11 +124,28 @@ async def _maybe_defend(message: Message, bot: Bot, db: Database, config) -> boo
     text = message.text or ""
     if not _INSULT.search(text):
         return False
+    if _father_username is None:  # после перезапуска вспоминаем @ник бати по памяти чата
+        _father_username = await db.last_username(message.chat.id, father) or ""
     reply_to_father = bool(message.reply_to_message and message.reply_to_message.from_user
                            and message.reply_to_message.from_user.id == father)
-    names_father = bool(_father_pattern(_father_username).search(text))
-    if not (reply_to_father or names_father):
+    to_bot = bool(message.reply_to_message and message.reply_to_message.from_user
+                  and message.reply_to_message.from_user.id == bot.id) or bool(_BOT_NAME.search(text))
+    who = _father_pattern(_father_username or None)
+
+    def about_father(part: str) -> bool:
+        return bool(who.search(part) or (to_bot and _FATHER_REF.search(part)))
+
+    if not (reply_to_father or about_father(text)):
         return False
+    # Оскорбление и батя в одной части фразы — точно про него. Если в разных («капустка
+    # красавчик, а петя лох») — уточняем у ИИ, чтобы не заступаться зря.
+    sure = reply_to_father or any(about_father(part) and _INSULT.search(part) for part in _CLAUSES.split(text))
+    if not sure and ai.available():
+        try:
+            if not await ai.is_father_insult(text):
+                return False
+        except Exception as e:
+            logger.debug("father insult check failed: %s", e)
     _spawn(_react(bot, message.chat.id, message.message_id, "🖕", force=True))
     key = (message.chat.id, user.id)
     if time.time() - _last_defense.get(key, 0) < DEFEND_COOLDOWN:
@@ -132,7 +161,8 @@ async def _maybe_defend(message: Message, bot: Bot, db: Database, config) -> boo
             answer = await ai.defend_father(name, text, await db.get_dossier(message.chat.id, user.id),
                                             await db.style_sample(message.chat.id))
             ctx = _as_dicts(await db.recent_messages(message.chat.id, limit=8))
-            answer = await ai.polish(answer, text, ctx)
+            # author — обидчик: редактор должен оставить ответ ему, а не бате
+            answer = await ai.polish(answer, text, ctx, author=name)
         except Exception as e:
             logger.warning("defend failed: %s", e)
     if not answer:
