@@ -5,8 +5,8 @@
   ИИ генерирует катастрофу, бункер, факты о бункере и карточки → каждому в ЛС
   приходит карточка-картинка и карта действия → закреплённое «табло» →
   раунды: новый факт о бункере, игроки по очереди открывают характеристику (таймер
-  в сообщении), одна реплика ведущего на раунд → голосование (полоски, голоса
-  зрителей, последнее слово двух лидеров) → изгнание с картинкой «ОТКАЗАНО» →
+  в сообщении), одна реплика ведущего на раунд → голосование (полоски,
+  последнее слово двух лидеров, при ничьей — переголосование) → изгнание с картинкой «ОТКАЗАНО» →
   финал: эпилог, вердикт «выжила ли колония», альбом выживших, рейтинг.
 
 Состояние игр хранится в памяти процесса (по одному на чат).
@@ -47,10 +47,10 @@ router = Router(name="bunker")
 MIN_PLAYERS = 2
 MAX_PLAYERS = 16
 TURN_TIMEOUT = 60         # сек на ход каждого игрока
-VOTE_TIMEOUT = 90         # сек на всё голосование
+REVOTE_TIMEOUT = 30       # сек на переголосование при ничьей (закрывается раньше, если все проголосовали)
+MAX_REVOTES = 2           # сколько раз переголосовываем, потом — жребий
 SPEECH_AT = 45            # через сколько сек после начала голосования — последнее слово
 SPEECH_LEN = 30           # сек на оправдания
-SPECTATOR_WEIGHT = 0.5    # вес голоса зрителя
 LOBBY_TIMEOUT = 15 * 60   # сек: брошенное лобби закрывается само
 MAX_TEXT = 3800           # запас до лимита Telegram в 4096 символов
 MAX_CAPTION = 1000        # лимит подписи к фото — 1024
@@ -101,7 +101,8 @@ class Game:
     round_reveals: list[dict] = field(default_factory=list)
     # голосование
     votes: dict[int, int] = field(default_factory=dict)            # игрок -> цель
-    spectator_votes: dict[int, int] = field(default_factory=dict)  # зритель -> цель
+    vote_targets: set[int] = field(default_factory=set)  # за кого можно голосовать (при ничьей — только равные)
+    revote: int = 0                                        # номер переголосования (0 — основное)
     immune: set[int] = field(default_factory=set)
     doubled: set[int] = field(default_factory=set)
     cursed: set[int] = field(default_factory=set)
@@ -469,14 +470,12 @@ def _card_caption(game: Game, p: Player) -> str:
 
 
 def _scores(game: Game) -> dict[int, float]:
-    """Сколько «весит» голосование против каждого живого игрока (с учётом карт)."""
-    scores = {p.user_id: 0.0 for p in _alive(game)}
+    """Сколько голосов против каждого кандидата (с учётом карт действий)."""
+    targets = game.vote_targets or {p.user_id for p in _alive(game)}
+    scores = {p.user_id: 0.0 for p in _alive(game) if p.user_id in targets}
     for voter, target in game.votes.items():
         if target in scores and voter not in game.cursed:
             scores[target] += 2.0 if voter in game.doubled else 1.0
-    for voter, target in game.spectator_votes.items():
-        if target in scores:
-            scores[target] += SPECTATOR_WEIGHT
     return scores
 
 
@@ -496,14 +495,14 @@ def _bars(game: Game) -> str:
 
 def _vote_text(game: Game) -> str:
     alive = _alive(game)
-    lines = [
-        f"🗳 <b>ГОЛОСОВАНИЕ · раунд {game.round_no}</b>", HR, "",
-        f"👥 В живых: {len(alive)} · 🎟 мест: {game.spots}",
-        f"✋ Проголосовали: {len(game.votes)}/{len(alive)} · 👀 зрителей: {len(game.spectator_votes)}",
-        "",
-        _bars(game),
-        "",
-    ]
+    if game.revote:
+        names = " или ".join(f"<b>{_e(game.players[u].name)}</b>" for u in game.vote_targets)
+        lines = [f"⚖️ <b>ПЕРЕГОЛОСОВАНИЕ · раунд {game.round_no}</b>", HR, "",
+                 f"Ничья! Выбираем только между: {names}", ""]
+    else:
+        lines = [f"🗳 <b>ГОЛОСОВАНИЕ · раунд {game.round_no}</b>", HR, "",
+                 f"👥 В живых: {len(alive)} · 🎟 мест: {game.spots}", ""]
+    lines += [f"✋ Проголосовали: {len(game.votes)}/{len(alive)}", "", _bars(game), ""]
     effects = []
     if game.immune:
         effects.append("🛡 иммунитет: " + ", ".join(_e(game.players[u].name) for u in game.immune))
@@ -513,8 +512,7 @@ def _vote_text(game: Game) -> str:
         effects.append("🧿 голос не считается: " + ", ".join(_e(game.players[u].name) for u in game.cursed))
     if effects:
         lines += effects + [""]
-    lines.append("❓ Кого <b>НЕ</b> пускать в бункер? Голос можно менять.")
-    lines.append(f"👀 Голос зрителя = {_num(SPECTATOR_WEIGHT)}.")
+    lines.append("❓ Кого <b>НЕ</b> пускать в бункер? Голосуют только игроки, голос можно менять.")
     link = _msg_link(game, game.board_msg_id)
     if link:
         lines += ["", f'📌 <a href="{link}">Табло с открытыми картами</a>']
@@ -524,7 +522,8 @@ def _vote_text(game: Game) -> str:
 def _vote_kb(game: Game) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for p in _alive(game):
-        b.button(text=f"🚫 {p.name}", callback_data=f"bk:vote:{p.user_id}")
+        if not game.vote_targets or p.user_id in game.vote_targets:
+            b.button(text=f"🚫 {p.name}", callback_data=f"bk:vote:{p.user_id}")
     b.adjust(2)
     b.row(_btn("Подвести итог 🧮 (ведущий)", "bk:tally"))
     return b.as_markup()
@@ -852,18 +851,6 @@ async def _run_game(bot: Bot, game: Game) -> None:
                    f"🏚 <b>БУНКЕР</b>\n{_quote(game.bunker)}")
 
 
-    roster = ", ".join(_e(p.name) for p in players)
-    await _say(
-        bot, game.chat_id,
-        f"👥 <b>Игроков: {len(players)}</b>\n{roster}\n\n"
-        f"🎟 Мест в бункере: <b>{game.spots}</b>\n"
-        f"{HR}\n\n"
-        f"📬 У каждого в ЛС: карточка и 🃏 одноразовая карта действия.\n\n"
-        f"🔦 <b>Раунд:</b> новый факт о бункере → по очереди открываем по одной "
-        f"характеристике (на ход {TURN_TIMEOUT} сек) → голосование.\n\n"
-        f"🎤 Двое лидеров голосования получают последнее слово.\n\n"
-        f"👀 Зрители тоже голосуют — их голос весит {_num(SPECTATOR_WEIGHT)}.",
-    )
     if no_dm:
         who = ", ".join(_mention(p) for p in no_dm)
         await _say(bot, game.chat_id,
@@ -1200,8 +1187,7 @@ def _threat_scores(game: Game) -> dict[int, float]:
     scores = {p.user_id: 0.0 for p in _alive(game)}
     for voter, target in game.threat_votes.items():
         if target in scores:
-            player = game.players.get(voter)
-            scores[target] += 1.0 if player and player.alive else SPECTATOR_WEIGHT
+            scores[target] += 1.0
     return scores
 
 
@@ -1219,7 +1205,7 @@ def _threat_text(game: Game, closed: bool = False) -> str:
         votes = f" · 🗳 {_num(scores[p.user_id])}" if scores.get(p.user_id) else ""
         lines.append(f"<b>{_e(p.name)}</b> — ☠️ {ch.get('chance', 50)}%{why}{votes}")
     if not closed:
-        lines += ["", f"⏳ {THREAT_VOTE} сек. Голосуют все, голос зрителя = {_num(SPECTATOR_WEIGHT)}."]
+        lines += ["", f"⏳ {THREAT_VOTE} сек. Голосуют только игроки."]
     return "\n".join(lines)
 
 
@@ -1328,45 +1314,41 @@ async def cb_threat_vote(call: CallbackQuery) -> None:
     if target not in game.players or not game.players[target].alive:
         await call.answer("Этого игрока уже нет.", show_alert=True)
         return
+    voter = game.players.get(call.from_user.id)
+    if voter is None or not voter.alive:
+        await call.answer("Голосуют только игроки, которые ещё в игре.", show_alert=True)
+        return
     game.threat_votes[call.from_user.id] = target
     await call.answer(f"Отправляем: {game.players[target].name}")
     _schedule(call.bot, game, "threat",
               lambda: _edit(call.bot, game.chat_id, game.threat_msg_id, _threat_text(game), _threat_kb(game))
               if game.phase == "threat" else asyncio.sleep(0))
-    voted = sum(1 for v in game.threat_votes if v in game.players and game.players[v].alive)
-    if voted >= len(_alive(game)) and game.advance:
+    if len(game.threat_votes) >= len(_alive(game)) and game.advance:
         game.advance.set()
 
 
 # ---------- голосование ----------
 
 
+def _pick_loser(game: Game) -> tuple[list[int], float]:
+    """Кандидаты с наибольшим числом голосов (иммунные не в счёт) и это число."""
+    scores = _scores(game)
+    pool = {u: sc for u, sc in scores.items() if u not in game.immune} or dict(scores)
+    top = max(pool.values(), default=0)
+    if top <= 0:
+        return list(pool), 0
+    return [u for u, sc in pool.items() if sc == top], top
+
+
 async def _voting(bot: Bot, game: Game) -> None:
     game.phase = "voting"
     game.current_picker = None
-    game.votes, game.spectator_votes = {}, {}
     game.immune, game.doubled, game.cursed = set(), set(), set()
     game.speakers = {}
-    game.force_tally = False
-    game.stage = "open"
-    game.advance = asyncio.Event()
     if game.hero and game.hero in game.players and game.players[game.hero].alive:
         game.immune.add(game.hero)  # награда за устранённую угрозу
     game.hero = None
-
-    msg = await _say(bot, game.chat_id, _vote_text(game), delay=0, reply_markup=_vote_kb(game))
-    game.vote_msg_id = msg.message_id
-
-    # Напоминание тем, у кого есть карта «для голосования»
-    for p in _alive(game):
-        if p.dm_ok and not p.action_used and p.action in C.ACTIONS and C.ACTIONS[p.action][3] == "vote":
-            kb = InlineKeyboardBuilder()
-            kb.row(_action_btn(game, p))
-            try:
-                await _send(bot, p.user_id, "🗳 Голосование открыто — самое время для карты действия!",
-                            reply_markup=kb.as_markup())
-            except Exception:
-                pass
+    game.vote_targets = {p.user_id for p in _alive(game)}
 
     async def wait(sec: float) -> bool:
         """Ждём sec секунд или «толчка». True — пора подводить итог."""
@@ -1377,19 +1359,55 @@ async def _voting(bot: Bot, game: Game) -> None:
             pass
         return game.force_tally or not _is_active(game)
 
-    if not await wait(SPEECH_AT):
-        await _start_speech(bot, game)
-        if game.stage == "speech" and not await wait(SPEECH_LEN):
-            await _end_speech(bot, game)
-        game.stage = "after"
-        if not game.force_tally and _is_active(game):
-            if len(game.votes) >= len(_alive(game)):
-                pass  # все уже проголосовали — подводим итог сразу
-            else:
-                await wait(VOTE_TIMEOUT - SPEECH_AT - SPEECH_LEN)
+    note = ""
+    for attempt in range(MAX_REVOTES + 1):
+        game.revote = attempt
+        game.votes = {}
+        game.force_tally = False
+        game.stage = "open" if attempt == 0 else "revote"
+        game.advance = asyncio.Event()
+        msg = await _say(bot, game.chat_id, _vote_text(game), delay=0, reply_markup=_vote_kb(game))
+        game.vote_msg_id = msg.message_id
+
+        if attempt == 0:
+            # Напоминание тем, у кого есть карта «для голосования»
+            for p in _alive(game):
+                if p.dm_ok and not p.action_used and p.action in C.ACTIONS and C.ACTIONS[p.action][3] == "vote":
+                    kb = InlineKeyboardBuilder()
+                    kb.row(_action_btn(game, p))
+                    try:
+                        await _send(bot, p.user_id, "🗳 Голосование открыто — самое время для карты действия!",
+                                    reply_markup=kb.as_markup())
+                    except Exception:
+                        pass
+            # Голосуем до «последнего слова» (или пока все не проголосуют), после речей — сразу итог
+            if not await wait(SPEECH_AT):
+                await _start_speech(bot, game)
+                if game.stage == "speech" and not await wait(SPEECH_LEN):
+                    await _end_speech(bot, game)
+        else:
+            await wait(REVOTE_TIMEOUT)  # закрывается сразу, как только все проголосовали
+
+        if not _is_active(game):
+            return
+        candidates, top = _pick_loser(game)
+        await _edit(bot, game.chat_id, game.vote_msg_id,
+                    f"🗳 <b>Голосование · раунд {game.round_no} — закрыто</b>\n\n{_bars(game)}")
+        if top <= 0:
+            note = " (никто не проголосовал — решил жребий)"
+            break
+        if len(candidates) == 1:
+            break
+        if attempt == MAX_REVOTES:
+            note = " (снова ничья — решил жребий)"
+            break
+        names = " и ".join(f"<b>{_e(game.players[u].name)}</b>" for u in candidates)
+        await _send(bot, game.chat_id, f"⚖️ <b>Ничья!</b> У {names} поровну голосов.\n\n"
+                                       f"Переголосование — только между ними 👇")
+        game.vote_targets = set(candidates)
 
     if _is_active(game):
-        await _tally(bot, game)
+        await _tally(bot, game, game.players[random.choice(candidates)], note)
 
 
 async def _start_speech(bot: Bot, game: Game) -> None:
@@ -1408,26 +1426,24 @@ async def _start_speech(bot: Bot, game: Game) -> None:
                 f"🎤 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n{HR}\n\n"
                 + (f"<i>{note.strip()}</i>\n\n" if note else "")
                 + f"{who} — у вас <b>{SPEECH_LEN} сек</b>.\n\n"
-                f"Напишите в чат, почему вас нельзя оставлять за дверью!")
+                f"Напишите в чат, почему вас нельзя оставлять за дверью! "
+                f"Остальные ещё могут переголосовать — потом сразу итог.")
 
 
 async def _end_speech(bot: Bot, game: Game) -> None:
     game.stage = "after"
-    rest = VOTE_TIMEOUT - SPEECH_AT - SPEECH_LEN
-    tail = f"⏳ {rest} сек до итога — последний шанс переголосовать!"
     speeches = {game.players[u].name: " ".join(t)[:600] for u, t in game.speakers.items() if t}
     # Ведущий оценивает речи, только если высказались оба обвиняемых
-    if speeches and len(speeches) >= 2 and ai.available():
+    if len(speeches) >= 2 and ai.available():
         try:
             note = await ai.narrate_speeches(game.catastrophe, speeches, _style(game))
             if note:
-                await _send(bot, game.chat_id, f"{_host(game, note)}\n\n{tail}")
+                await _say(bot, game.chat_id, _host(game, note), delay=REVEAL_DELAY)
                 return
         except Exception as e:
             logger.warning("AI speech note failed: %s", e)
     if not speeches:
-        tail = "🤐 Обвиняемые промолчали.\n\n" + tail
-    await _send(bot, game.chat_id, tail)
+        await _send(bot, game.chat_id, "🤐 Обвиняемые промолчали. Подводим итог…")
 
 
 def _is_speech(message: Message) -> bool:
@@ -1461,18 +1477,20 @@ async def cb_vote(call: CallbackQuery) -> None:
         await call.answer("Этого игрока уже нет.", show_alert=True)
         return
 
+    if game.vote_targets and target not in game.vote_targets:
+        await call.answer("Сейчас голосуем только между теми, у кого ничья.", show_alert=True)
+        return
     voter = call.from_user.id
     player = game.players.get(voter)
-    if player is not None and player.alive:
-        game.votes[voter] = target
-        await call.answer(f"Голос за: {game.players[target].name}")
-    else:
-        game.spectator_votes[voter] = target
-        await call.answer(f"Голос зрителя ({_num(SPECTATOR_WEIGHT)}) за: {game.players[target].name}")
+    if player is None or not player.alive:
+        await call.answer("Голосуют только игроки, которые ещё в игре.", show_alert=True)
+        return
+    game.votes[voter] = target
+    await call.answer(f"Голос за: {game.players[target].name}")
     _schedule(call.bot, game, "vote", lambda: _refresh_vote(call.bot, game))
 
-    if game.stage in ("open", "after") and len(game.votes) >= len(_alive(game)) and game.advance:
-        game.advance.set()  # все проголосовали — переходим к следующей стадии
+    if game.stage in ("open", "revote") and len(game.votes) >= len(_alive(game)) and game.advance:
+        game.advance.set()  # все проголосовали — к речам (или к итогу переголосования)
 
 
 @router.callback_query(F.data == "bk:tally")
@@ -1484,7 +1502,7 @@ async def cb_tally(call: CallbackQuery) -> None:
     if call.from_user.id != game.host_id:
         await call.answer("Подвести итог может только ведущий.", show_alert=True)
         return
-    if not game.votes and not game.spectator_votes:
+    if not game.votes:
         await call.answer("Ещё никто не проголосовал.", show_alert=True)
         return
     await call.answer("Подводим итог!")
@@ -1493,25 +1511,12 @@ async def cb_tally(call: CallbackQuery) -> None:
         game.advance.set()
 
 
-async def _tally(bot: Bot, game: Game) -> None:
+async def _tally(bot: Bot, game: Game, loser: Player, note: str = "") -> None:
     if not _is_active(game) or game.phase != "voting":
         return
     game.phase = "counting"
     game.stage = ""
     bars = _bars(game)
-
-    scores = _scores(game)
-    pool = {u: s for u, s in scores.items() if u not in game.immune}
-    if not pool:  # у всех иммунитет — жребий среди всех
-        pool = dict(scores)
-    top = max(pool.values(), default=0)
-    if top > 0:
-        candidates = [u for u, s in pool.items() if s == top]
-        note = " (жребий среди равных)" if len(candidates) > 1 else ""
-    else:
-        candidates = list(pool)
-        note = " (никто не проголосовал — решил жребий)"
-    loser = game.players[random.choice(candidates)]
     loser.alive = False
     loser.out_round = game.round_no
     if game.first_out is None:
@@ -1519,8 +1524,6 @@ async def _tally(bot: Bot, game: Game) -> None:
 
     story_task = _ai_task(ai.narrate_elimination(game.catastrophe, loser.card or {}, game.round_no,
                                                  _style(game))) if ai.available() else None
-    await _edit(bot, game.chat_id, game.vote_msg_id,
-                f"🗳 <b>Голосование · раунд {game.round_no} — закрыто</b>\n\n{bars}")
     await _say(bot, game.chat_id,
                f"{HR}\n🧮 <b>ИТОГ РАУНДА {game.round_no}</b>\n{HR}\n\n{bars}\n\n"
                f"🚪 В бункер не пускают <b>{_e(loser.name)}</b>{note}.")
