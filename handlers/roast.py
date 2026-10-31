@@ -27,9 +27,10 @@ from datetime import datetime, timedelta, timezone
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Message, ReactionTypeEmoji, ReplyParameters
+from aiogram.types import Message, MessageReactionUpdated, ReactionTypeEmoji, ReplyParameters
 
 import ai
+import links
 from database import Database
 
 logger = logging.getLogger("roast")
@@ -168,7 +169,7 @@ async def _maybe_defend(message: Message, bot: Bot, db: Database, config) -> boo
             logger.warning("defend failed: %s", e)
     if not answer:
         answer = random.choice(FATHER_FALLBACK).format(n=name)
-    await _say(bot, message.chat.id, answer, reply_to=message.message_id)
+    await _say_human(bot, message.chat.id, answer, reply_to=message.message_id)
     return True
 
 
@@ -177,6 +178,7 @@ _BOT_NAME = re.compile(r"(?<!\w)пиздю(к|ч|ш)\w*", re.IGNORECASE)
 _BOT_WORD = re.compile(r"\bбот(ик|яра|ина)?\b", re.IGNORECASE)
 
 _last_auto: dict[int, float] = {}
+_link_notes: dict[tuple[int, int], str] = {}  # (чат, сообщение) -> «[ссылка: что там]»
 _last_roast: dict[int, float] = {}
 _last_week_cmd: dict[int, float] = {}
 
@@ -221,7 +223,7 @@ def _bunker_active(chat_id: int) -> bool:
 _last_bot_msg: dict[int, float] = {}       # когда бот последний раз писал в чат
 _answered: dict[int, set[int]] = {}        # на какие сообщения уже ответил
 _pending: dict[int, dict] = {}             # ответ, который бот «печатает» прямо сейчас
-REPLY_DELAY = (2.0, 4.0)                   # «читает» пару секунд, собирая все обращения
+REPLY_DELAY = (1.5, 3.0)                   # «читает» пару секунд, собирая все обращения (потом ещё «печатает»)
 QUIET_AFTER_SPEAKING = 20                  # сам не встревает, если только что что-то сказал
 
 
@@ -299,9 +301,77 @@ async def _maybe_react(bot: Bot, db: Database, message: Message, is_father: bool
 
 
 async def _remember_lines(db: Database, chat_id: int) -> None:
-    """Подсовываем ИИ последние реплики бота, чтобы он не повторял одни и те же слова."""
+    """Перед ответом подсовываем ИИ: последние реплики бота (не повторяться), пол участников
+    (писать в правильном роде) и какие шутки чату зашли или нет (по реакциям)."""
     rows = await db.recent_messages(chat_id, limit=10, user_id=0)
     ai.recent_bot_lines.set([r[3] for r in rows])
+    await _ensure_genders(db, chat_id)
+    genders = {}
+    for _uid, name, m, f in await db.gender_counts(chat_id):
+        g = ai.gender_of(m, f)
+        if g and name:
+            genders[name] = g
+    ai.chat_genders.set(genders)
+    ai.liked_lines.set(await db.scored_lines(chat_id, True))
+    ai.disliked_lines.set(await db.scored_lines(chat_id, False))
+
+
+_gender_ready: set[int] = set()
+
+
+async def _ensure_genders(db: Database, chat_id: int) -> None:
+    """Один раз на чат: если пол ещё ни разу не считали — пересчитать по всей сохранённой истории."""
+    if chat_id in _gender_ready:
+        return
+    _gender_ready.add(chat_id)
+    if await db.has_genders(chat_id):
+        return
+    counts: dict[int, list[int]] = {}
+    for uid, text in await db.user_texts(chat_id):
+        if str(text).startswith("["):
+            continue
+        m, f = ai.gender_hits(text)
+        if m or f:
+            c = counts.setdefault(uid, [0, 0])
+            c[0] += m
+            c[1] += f
+    for uid, (m, f) in counts.items():
+        await db.add_gender_hits(chat_id, uid, m, f, replace=True)
+
+
+TYPE_SPEED = 18          # символов в секунду — «печатает» столько, сколько человек
+SPLIT_CHANCE = 0.35     # иногда разбивает ответ на два сообщения: подкол, потом добивка
+
+
+async def _typing(bot: Bot, chat_id: int, text: str, lo: float, hi: float) -> None:
+    try:
+        await bot.send_chat_action(chat_id, "typing")
+    except Exception:
+        pass
+    await asyncio.sleep(max(lo, min(hi, len(text) / TYPE_SPEED)))
+
+
+async def _say_human(bot: Bot, chat_id: int, text: str, reply_to: int | None = None) -> None:
+    """Ответ «как человек»: «печатает…» по длине текста, иногда двумя сообщениями подряд."""
+    text = (text or "").strip()
+    parts = re.split(r"(?<=[.!?…])\s+", text)
+    if len(parts) >= 2 and len(text) > 50 and random.random() < SPLIT_CHANCE:
+        half = len(text) / 2
+        acc, first = 0, []
+        for p in parts:  # первая часть — примерно половина, но хотя бы одно предложение
+            if first and acc + len(p) > half:
+                break
+            first.append(p)
+            acc += len(p) + 1
+        one, two = " ".join(first), " ".join(parts[len(first):])
+        if two:
+            await _typing(bot, chat_id, one, 1.0, 3.5)
+            await _say(bot, chat_id, one, reply_to=reply_to)
+            await _typing(bot, chat_id, two, 1.2, 3.0)
+            await _say(bot, chat_id, two)
+            return
+    await _typing(bot, chat_id, text, 1.0, 4.5)
+    await _say(bot, chat_id, text, reply_to=reply_to)
 
 
 async def _say(bot: Bot, chat_id: int, text: str, reply_to: int | None = None) -> None:
@@ -402,6 +472,10 @@ async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
         return
     channel = message.sender_chat.title or "канал бати"
     text = message.text or caption or ""
+    url = links.first_url(text, message.entities or message.caption_entities)
+    if url and ai.available():
+        link = await links.link_info(url)
+        text = f"{text} {link}".strip() if link else text
     media = _media_kind(message)
     if count > 1:
         media = f"альбом из {count} фото/видео"
@@ -440,7 +514,35 @@ async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
         logger.warning("channel comment failed: %s", e)
         return
     if answer:
-        await _say(bot, chat_id, answer, reply_to=message.message_id)
+        await _say_human(bot, chat_id, answer, reply_to=message.message_id)
+
+
+# ---------- реакции на шутки бота: чему чат ставит 🔥, а чему 👎 ----------
+
+REACT_GOOD = {"🔥", "🤣", "😂", "👍", "💯", "❤", "❤️", "❤‍🔥", "👏", "🏆", "😁", "🤩", "😎", "⚡", "🍾", "🎉",
+              "🤯", "😈", "🫡", "😍", "🥰", "💪", "👌", "😆"}
+REACT_BAD = {"👎", "🤡", "💩", "🥱", "😴", "🤮", "🙈", "😐", "🗿", "🤷", "🤦", "🤦‍♂", "🤦‍♀", "🙄", "😒", "🤨"}
+
+
+def _react_score(reactions) -> int:
+    score = 0
+    for r in reactions or []:
+        emoji = getattr(r, "emoji", None)
+        if emoji in REACT_GOOD:
+            score += 1
+        elif emoji in REACT_BAD:
+            score -= 1
+    return score
+
+
+@router.message_reaction()
+async def on_bot_line_reaction(event: MessageReactionUpdated, db: Database) -> None:
+    """Реакция на сообщение бота — плюс или минус шутке. Потом бот лучшие берёт за образец."""
+    if event.user is not None and event.user.is_bot:
+        return
+    delta = _react_score(event.new_reaction) - _react_score(event.old_reaction)
+    if delta and await db.score_bot_line(event.chat.id, event.message_id, delta):
+        logger.info("шутка бота %s/%s: %+d", event.chat.id, event.message_id, delta)
 
 
 # ---------- команды ----------
@@ -504,6 +606,7 @@ async def cmd_roast(message: Message, command: CommandObject, bot: Bot, db: Data
         await message.reply(f"Про {html.escape(target_name or 'него')} я пока мало знаю. Пусть поболтает — потом поговорим.")
         return
     _last_roast[chat_id] = now
+    await _remember_lines(db, chat_id)
     quote = await _old_quote(db, chat_id, target_id)
     try:
         await bot.send_chat_action(chat_id, "typing")
@@ -569,10 +672,24 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
         return
     optout = await db.is_optout(chat_id, user.id)
     src = _forward_source(message)
+    # Ссылка? Достаём, что там (название видео/страницы), — чтобы стебать по сути, а не по адресу
+    link = ""
+    url = links.first_url(message.text, message.entities)
+    if url and ai.available():
+        link = await links.link_info(url)
+        if link:
+            _link_notes[(chat_id, message.message_id)] = link
+            if len(_link_notes) > 300:
+                _link_notes.clear()
     if not optout:
         note = f"[переслано из {src[0]}] " if src else ""
         await db.add_chat_message(chat_id, message.message_id, user.id, _name(message),
-                                  user.username, (note + message.text)[:1000])
+                                  user.username, (note + message.text + (f" {link}" if link else ""))[:1000])
+        if not src:  # «я пошёл / я пошла» — запоминаем пол по его же словам
+            m, f = ai.gender_hits(message.text)
+            if m or f:
+                await _ensure_genders(db, chat_id)
+                await db.add_gender_hits(chat_id, user.id, m, f)
     if src:  # пересланный текст — чужие слова: не обещание, не грубость боту и не наезд на батю
         if not _bunker_active(chat_id):
             _spawn(_maybe_react(bot, db, message, False))
@@ -664,7 +781,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     last_msg, _ = items[-1]
     who = last_msg.from_user
     name = _name(last_msg)
-    texts = [m.text or "" for m, _ in items if m.from_user and who and m.from_user.id == who.id]
+    texts = [(m.text or "") + (f" {_link_notes[(chat_id, m.message_id)]}" if (chat_id, m.message_id) in _link_notes else "")
+             for m, _ in items if m.from_user and who and m.from_user.id == who.id]
     text = "\n".join(texts) or (last_msg.text or "")
     rt = last_msg.reply_to_message
     if rt and rt.from_user and rt.from_user.id == bot.id and rt.text:
@@ -703,7 +821,7 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
                         answer = full
             except Exception as e:
                 logger.warning("comeback failed: %s", e)
-        await _say(bot, chat_id, answer, reply_to=last_msg.message_id)
+        await _say_human(bot, chat_id, answer, reply_to=last_msg.message_id)
         if who:
             _thread.setdefault((chat_id, who.id), []).append(time.time())
         return
@@ -726,7 +844,7 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     if not answer and rude:
         answer = random.choice(COMEBACKS)
     if answer:
-        await _say(bot, chat_id, answer, reply_to=last_msg.message_id)
+        await _say_human(bot, chat_id, answer, reply_to=last_msg.message_id)
         if who:
             _thread.setdefault((chat_id, who.id), []).append(time.time())
         if random.random() < STICKER_AFTER:
@@ -943,31 +1061,62 @@ async def on_group_photo(message: Message, bot: Bot, db: Database, config=None) 
     user = message.from_user
     if user is None or user.is_bot or not message.photo:
         return
-    chat_id = message.chat.id
     if not _db_ref:
         _db_ref.append(db)
-    if not await _enabled(db) or await db.is_optout(chat_id, user.id):
+    if not await _enabled(db) or await db.is_optout(message.chat.id, user.id):
         return
     leader, caption, count = await _album_leader(message)
     if not leader:  # альбом: запоминаем и отвечаем один раз, на первое фото
         return
-    # Переслано из чужого канала/чата — это не слова и не фото самого человека
-    src = None if _forwarded_from_father_channel(message) else _forward_source(message)
-    note = f"[переслано из {src[0]}] " if src else ""
     # берём не самый большой размер — модели хватит, а качать быстрее
     sizes = sorted(message.photo, key=lambda p: p.width)
     photo = next((p for p in reversed(sizes) if p.width <= 1280), sizes[0])
-    # Смотрим КАЖДОЕ фото: короткое описание идёт в память чата, чтобы бот знал, что на нём,
+    label = f"альбом, {count} фото" if count > 1 else "фото"
+    await _visual(message, bot, db, config, photo, label, "фото", caption, count)
+
+
+@router.message(F.video_note | F.video)
+async def on_group_video(message: Message, bot: Bot, db: Database, config=None) -> None:
+    """Кружки и видео: бот смотрит первый кадр (превью) — как фото."""
+    user = message.from_user
+    if user is None or user.is_bot:
+        return
+    if not _db_ref:
+        _db_ref.append(db)
+    if not await _enabled(db) or await db.is_optout(message.chat.id, user.id):
+        return
+    leader, caption, count = await _album_leader(message)
+    if not leader:
+        return
+    media = message.video_note or message.video
+    thumb = getattr(media, "thumbnail", None)
+    if message.video_note:
+        label, kind = "кружок", "кружок (видеосообщение; ты видишь только первый кадр)"
+    else:
+        label, kind = "видео", "видео (ты видишь только первый кадр)"
+    await _visual(message, bot, db, config, thumb, label, kind, caption, count)
+
+
+async def _visual(message: Message, bot: Bot, db: Database, config, src_file, label: str, kind: str,
+                  caption: str, count: int) -> None:
+    """Общее для фото, кружков и видео: рассмотреть, запомнить, иногда прокомментировать."""
+    user = message.from_user
+    chat_id = message.chat.id
+    # Переслано из чужого канала/чата — это не слова и не фото самого человека
+    src = None if _forwarded_from_father_channel(message) else _forward_source(message)
+    note = f"[переслано из {src[0]}] " if src else ""
+    # Смотрим КАЖДОЕ: короткое описание идёт в память чата, чтобы бот знал, что там,
     # даже если сейчас комментировать не будет (потом — в подколах, прожарках, ответах)
-    img, descr = None, ""
-    if ai.available():
+    img, mime, descr = None, "image/jpeg", ""
+    if ai.available() and src_file is not None:
         try:
-            img = (await bot.download(photo)).read()
+            img = (await bot.download(src_file)).read()
+            mime = ai.image_mime(img) or "image/jpeg"
             descr = await ai.describe_photo(img)
         except Exception as e:
-            logger.warning("photo describe failed: %s", e)
-    what = f"альбом, {count} фото" if count > 1 else "фото"
-    what = f"[{what}: {descr}]" if descr else f"[{what}]"
+            logger.warning("%s describe failed: %s", label, e)
+            img = None
+    what = f"[{label}: {descr}]" if descr else f"[{label}]"
     await db.add_chat_message(chat_id, message.message_id, user.id, _name(message), user.username,
                               f"{note}{what} {caption}".strip()[:1000])
     if img is None or _bunker_active(chat_id):
@@ -982,22 +1131,22 @@ async def on_group_photo(message: Message, bot: Bot, db: Database, config=None) 
     try:
         await bot.send_chat_action(chat_id, "typing")
         await _remember_lines(db, chat_id)
-        draft = await ai.roast_photo(img, "image/jpeg", _name(message), caption, is_father,
+        draft = await ai.roast_photo(img, mime, _name(message), caption, is_father,
                                      await db.style_sample(chat_id), forwarded_from=src[0] if src else None,
                                      count=count, father_channel=_forwarded_from_father_channel(message),
-                                     seen=descr)
+                                     seen=descr, media_kind=kind)
         author = ai.FATHER_NAME if is_father else _name(message)
-        answer = await ai.polish(draft, caption or "[фото]", _as_dicts(await db.recent_messages(chat_id, limit=10)),
-                                 author=author, about_photo=True,
-                                 image=(img, "image/jpeg"), seen=descr)  # редактор видит то же фото
-        if answer and ai.retells(answer, descr):  # всё равно пересказал фото — переписываем
-            logger.info("photo reply retells the photo, rewriting: %s", answer)
+        answer = await ai.polish(draft, caption or f"[{label}]",
+                                 _as_dicts(await db.recent_messages(chat_id, limit=10)),
+                                 author=author, about_photo=True, image=(img, mime), seen=descr)  # редактор видит то же
+        if answer and ai.retells(answer, descr):  # всё равно пересказал — переписываем
+            logger.info("%s reply retells the picture, rewriting: %s", label, answer)
             answer = await ai.drop_retell(answer, descr, author)
     except Exception as e:
-        logger.warning("photo roast failed: %s", e)
+        logger.warning("%s roast failed: %s", label, e)
         return
     if answer:
-        await _say(bot, chat_id, answer, reply_to=message.message_id)
+        await _say_human(bot, chat_id, answer, reply_to=message.message_id)
 
 
 # ---------- «Клоун дня» ----------
@@ -1074,7 +1223,7 @@ def _replyable(text: str) -> bool:
     if not t.startswith("["):
         return not _trivial(t)
     head = t.split("]", 1)[0]
-    return (t.startswith("[фото: ") or t.startswith("[альбом, ")) and ": " in head
+    return t.startswith(("[фото: ", "[альбом, ", "[кружок: ", "[видео: ")) and ": " in head
 
 
 async def _auto_roast(bot: Bot, db: Database, chat_id: int, interval: int) -> None:
@@ -1113,7 +1262,7 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int, interval: int) -> No
         if chat_id in _pending or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
             return
         if text:
-            await _say(bot, chat_id, text, reply_to=reply_to)
+            await _say_human(bot, chat_id, text, reply_to=reply_to)
 
 
 async def _heavy(bot: Bot, db: Database) -> None:

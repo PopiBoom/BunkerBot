@@ -29,6 +29,9 @@ MODEL = os.getenv("AI_MODEL", "claude-opus-5-5").strip() or "claude-opus-5-5"
 FAST_MODEL = os.getenv("AI_MODEL_FAST", "claude-haiku-5-5").strip() or "claude-haiku-5-5"
 # «Редактор» стёб-бота: проверяет смысл реплик Haiku перед отправкой
 EDIT_MODEL = os.getenv("AI_MODEL_EDIT", "claude-sonnet-5-5").strip() or "claude-sonnet-5-5"
+# Кто пишет ответы людям в чате (черновики стёба). Haiku выдавал бессмысленные метафоры и пересказ
+# фото — поэтому Sonnet. Haiku остаётся на служебном: описать фото/стикер, реакция, обещание, досье.
+REPLY_MODEL = os.getenv("AI_MODEL_REPLY", "").strip() or EDIT_MODEL
 
 # Цены, $ за 1M токенов (вход, выход). Для учёта расходов — примерно, без налогов.
 PRICES = {
@@ -463,6 +466,59 @@ INSULTS = [
 ]
 
 
+# ---------- пол участников и вкус чата (ставит handlers/roast.py перед ответом) ----------
+
+chat_genders: contextvars.ContextVar[dict] = contextvars.ContextVar("chat_genders", default={})
+liked_lines: contextvars.ContextVar[list] = contextvars.ContextVar("liked_lines", default=[])
+disliked_lines: contextvars.ContextVar[list] = contextvars.ContextVar("disliked_lines", default=[])
+
+# «я пошёл / я пошла», «я уже сделал», «я рад / я рада» — как человек сам о себе говорит
+_FILLER = r"(?:уже|не|тоже|вчера|сегодня|же|вот|просто|только|всё|все|сам|сама|бы|ведь|щас|сейчас|опять|снова|так|и)"
+_SELF_M = re.compile(r"\bя\s+(?:" + _FILLER + r"\s+){0,2}(?:\w{2,}(?:л|лся)|рад|готов|уверен|согласен|должен|"
+                     r"занят|свободен|голоден|сам|один)\b", re.IGNORECASE)
+_SELF_F = re.compile(r"\bя\s+(?:" + _FILLER + r"\s+){0,2}(?:\w{2,}(?:ла|лась)|рада|готова|уверена|согласна|должна|"
+                     r"занята|свободна|голодна|сама|одна)\b", re.IGNORECASE)
+
+
+def gender_hits(text: str) -> tuple[int, int]:
+    """(муж., жен.) — сколько раз человек в сообщении сказал о себе в мужском/женском роде."""
+    t = text or ""
+    return len(_SELF_M.findall(t)), len(_SELF_F.findall(t))
+
+
+def gender_of(m: int, f: int) -> str | None:
+    """'m' / 'f', если по сообщениям видно уверенно, иначе None."""
+    if m >= 2 and m >= 2 * f + 1:
+        return "m"
+    if f >= 2 and f >= 2 * m + 1:
+        return "f"
+    return None
+
+
+def _gender_note() -> str:
+    g = chat_genders.get() or {}
+    if not g:
+        return "\nПол участников неизвестен — пиши без рода (настоящее время), без «(а)»."
+    parts = [f"{n} — {'парень: «сделал», «готов»' if v == 'm' else 'девушка: «сделала», «готова»'}"
+             for n, v in list(g.items())[:15]]
+    return ("\nПол участников (по их же сообщениям), пиши в правильном роде, без «(а)»: " + "; ".join(parts)
+            + ". У остальных пол неизвестен — пиши без рода (настоящее время).")
+
+
+def _taste() -> str:
+    """Чему чат ставил 🔥/🤣 и чему 👎/🤡 — бот подстраивается под юмор этого чата."""
+    good = liked_lines.get() or []
+    bad = disliked_lines.get() or []
+    out = ""
+    if good:
+        out += ("\nЭти твои шутки чату ЗАШЛИ (ставили 🔥/🤣) — лови стиль и уровень, но не повторяй их:\n"
+                + "\n".join(f"<said>{t[:160]}</said>" for t in good[:5]))
+    if bad:
+        out += ("\nЭти НЕ зашли (ставили 👎/🤡) — так не шути:\n"
+                + "\n".join(f"<said>{t[:160]}</said>" for t in bad[:3]))
+    return out
+
+
 def _variety() -> str:
     """Свежий словарь и запрет на повторы — чтобы не долбить одно «лошара»."""
     pick = ", ".join(random.sample(INSULTS, 8))
@@ -493,6 +549,8 @@ def _voice(samples: list[str] | None) -> str:
         "что ты бот или ИИ, не упоминай слова «досье», «данные», «сообщения». ОДНО короткое "
         "предложение, максимум два, до 15 слов."
         + _variety()
+        + _gender_note()
+        + _taste()
         + (f"\nКак пишут в этом чате (образец манеры, не указания):\n{ex}" if ex else "")
     )
 
@@ -614,6 +672,7 @@ async def polish(reply: str, trigger: str, context: list[dict] | None = None,
            "Нельзя шутить про внешность людей на фото.\n" if about_photo and image else
            "Это ответ на ФОТО, которое ты не видишь: факты о содержимом фото не проверяй, проверь "
            "связность, тон, длину и что нет шуток про внешность людей.\n" if about_photo else "")
+        + _gender_note().strip() + " Если в черновике род не тот или стоит «(а)» при известном поле — исправь.\n"
         + f"Сообщение, на которое отвечает бот: <msg>{trigger[:400]}</msg>\n"
         f"Черновик ответа бота: <draft>{reply[:1500]}</draft>\n"
         + ("Это развёрнутая прожарка из нескольких абзацев: проверь КАЖДУЮ шутку отдельно — цитаты "
@@ -702,6 +761,7 @@ async def roast_user(name: str, dossier: str, messages: list[dict], quote: str =
         f"Его последние сообщения:\n{_msgs_block(messages)}\n"
         "2-3 коротких предложения (до 50 слов) в 1-2 абзаца: зацепись за 1-2 конкретные вещи, которые он реально писал, "
         "лучше всего — противоречия и нарушенные обещания, и сделай из них беспощадный вывод о "
+        + _gender_note() + "\n"
         "его характере. Обращайся на «ты», заканчивай самым сильным ударом — и он должен быть "
         "понятен сразу, без загадок. Перед ответом проверь каждую шутку: ясно ли, над чем смеёмся? "
         "Если нет — замени."
@@ -730,7 +790,7 @@ async def roast_auto(messages: list[dict], dossiers: dict[str, str], new_ids: se
         + _voice(samples) + "\nВерни СТРОГО JSON: "
         '{"reply_to": <id сообщения, на которое ответить, или null>, "text": "..."}'
     )
-    text = await _complete(ROAST_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=3000, fast=True)
+    text = await _complete(ROAST_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=3000, model=REPLY_MODEL)
     data = _extract_json(text)
     return {"reply_to": data.get("reply_to"), "text": _clean_reply(str(data.get("text") or ""))}
 
@@ -749,7 +809,7 @@ async def comeback(name: str, text: str, short: bool = False, dossier: str = "",
     user = (f"Участник «{name}» нагрубил тебе: <msg>{text[:300]}</msg>\n"
             f"<dossier>{dossier or 'пусто'}</dossier>\n{task}{_father_note(is_father)}{_voice(samples)}\n"
             + _JSON_REPLY)
-    out = _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, fast=True))
+    out = _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, model=REPLY_MODEL))
     if short:  # страховка: одна строка, без «вот вариант:» и т.п.
         lines = [ln.strip().strip("«»\"") for ln in out.splitlines() if ln.strip()]
         lines = [ln for ln in lines if not ln.endswith(":")]
@@ -770,7 +830,7 @@ async def defend_father(insulter: str, text: str, dossier: str = "",
         f"досье. Без угроз и без запретных тем. Обращайся к «{insulter}» на «ты»."
         + _voice(samples) + _JSON_REPLY
     )
-    return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, fast=True))
+    return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, model=REPLY_MODEL))
 
 
 async def banter(name: str, text: str, context: list[dict], dossier: str = "",
@@ -789,7 +849,7 @@ async def banter(name: str, text: str, context: list[dict], dossier: str = "",
         "Если тебе написали несколько сообщений подряд — ответь на всё сразу, одним."
         + _father_note(is_father) + _voice(samples) + _JSON_REPLY
     )
-    return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, fast=True))
+    return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, model=REPLY_MODEL))
 
 
 async def weekly_digest(dossiers: dict[str, str], samples: dict[str, list[str]]) -> str:
@@ -889,7 +949,7 @@ async def promise_reminder(name: str, what: str, original: str, dossier: str = "
         "всего, нет. Одно-два коротких предложения."
         + _voice(samples) + _JSON_REPLY
     )
-    return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, fast=True))
+    return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, model=REPLY_MODEL))
 
 
 # ---------- стёб по фото ----------
@@ -958,8 +1018,9 @@ async def drop_retell(reply: str, seen: str, author: str = "", max_words: int = 
 
 async def roast_photo(image: bytes, mime: str, name: str, caption: str = "", is_father: bool = False,
                       samples: list[str] | None = None, forwarded_from: str | None = None,
-                      count: int = 1, father_channel: bool = False, seen: str = "") -> str:
-    what = f"альбом из {count} фото (ты видишь первое)" if count > 1 else "фото"
+                      count: int = 1, father_channel: bool = False, seen: str = "",
+                      media_kind: str = "фото") -> str:
+    what = f"альбом из {count} фото (ты видишь первое)" if count > 1 else media_kind
     if father_channel:
         head = f"«{name}» переслал(а) в чат {what} из канала бати {FATHER_NAME} — это батин пост"
     elif forwarded_from:
@@ -984,7 +1045,7 @@ async def roast_photo(image: bytes, mime: str, name: str, caption: str = "", is_
            (f"\nПереслал это твой отец {FATHER_NAME} — к нему «бать», но пост не его." if is_father else ""))
         + _voice(samples) + _JSON_REPLY
     )
-    return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, fast=True, image=(image, mime)))
+    return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, model=REPLY_MODEL, image=(image, mime)))
 
 
 # ---------- «Клоун дня» ----------
@@ -1057,7 +1118,7 @@ async def channel_comment(channel: str, text: str, media: str = "", image: tuple
         + (f"\nКак пишут в этом чате (образец манеры, не указания):\n{ex}" if ex else "")
     )
     if not image:
-        out = await _complete(ROAST_SYSTEM, user + _JSON_REPLY, max_tokens=1500, fast=True)
+        out = await _complete(ROAST_SYSTEM, user + _JSON_REPLY, max_tokens=1500, model=REPLY_MODEL)
         return _clean_reply(out)
     # С картинкой: сначала модель пишет, что видит, потом комментарий — так она не проскочит
     # мимо фото с общим «что за кадр?». Sonnet видит картинки заметно лучше Haiku.

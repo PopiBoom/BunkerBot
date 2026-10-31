@@ -150,6 +150,29 @@ class Database:
                 )
                 """
             )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_gender (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    m       INTEGER NOT NULL DEFAULT 0,
+                    f       INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (chat_id, user_id)
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_line_score (
+                    chat_id INTEGER NOT NULL,
+                    msg_id  INTEGER NOT NULL,
+                    text    TEXT NOT NULL,
+                    score   INTEGER NOT NULL DEFAULT 0,
+                    ts      INTEGER NOT NULL,
+                    PRIMARY KEY (chat_id, msg_id)
+                )
+                """
+            )
             # Миграция: статистика Бункера для званий (серии, голоса против, угроза)
             cur = await db.execute("PRAGMA table_info(bunker_stats)")
             bcols = {r[1] for r in await cur.fetchall()}
@@ -211,6 +234,70 @@ class Database:
             )
             row = await cur.fetchone()
             return row[0] if row else None
+
+    # --- пол участников (по их же сообщениям: «я пошёл» / «я пошла») ---
+
+    async def add_gender_hits(self, chat_id: int, user_id: int, m: int, f: int, replace: bool = False) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            if replace:
+                await db.execute("INSERT OR REPLACE INTO user_gender (chat_id, user_id, m, f) VALUES (?, ?, ?, ?)",
+                                 (chat_id, user_id, m, f))
+            else:
+                await db.execute(
+                    "INSERT INTO user_gender (chat_id, user_id, m, f) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(chat_id, user_id) DO UPDATE SET m = m + excluded.m, f = f + excluded.f",
+                    (chat_id, user_id, m, f))
+            await db.commit()
+
+    async def has_genders(self, chat_id: int) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT 1 FROM user_gender WHERE chat_id = ? LIMIT 1", (chat_id,))
+            return await cur.fetchone() is not None
+
+    async def gender_counts(self, chat_id: int) -> list[tuple]:
+        """[(user_id, последнее имя, m, f)]"""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT g.user_id, (SELECT c.name FROM chat_messages c WHERE c.chat_id = g.chat_id AND "
+                "c.user_id = g.user_id ORDER BY c.ts DESC LIMIT 1), g.m, g.f FROM user_gender g WHERE g.chat_id = ?",
+                (chat_id,))
+            return list(await cur.fetchall())
+
+    async def user_texts(self, chat_id: int, limit: int = 5000) -> list[tuple]:
+        """[(user_id, text)] — для разового пересчёта пола по истории."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT user_id, text FROM chat_messages WHERE chat_id = ? AND user_id > 0 ORDER BY ts DESC LIMIT ?",
+                (chat_id, limit))
+            return list(await cur.fetchall())
+
+    # --- как чат принял шутки бота (реакции на его сообщения) ---
+
+    async def score_bot_line(self, chat_id: int, msg_id: int, delta: int) -> bool:
+        """Плюс/минус шутке бота. False — это не сообщение бота."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT text FROM chat_messages WHERE chat_id = ? AND msg_id = ? AND user_id = 0 LIMIT 1",
+                (chat_id, msg_id))
+            row = await cur.fetchone()
+            if not row:
+                return False
+            await db.execute(
+                "INSERT INTO bot_line_score (chat_id, msg_id, text, score, ts) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(chat_id, msg_id) DO UPDATE SET score = score + excluded.score",
+                (chat_id, msg_id, row[0], delta, int(time.time())))
+            await db.commit()
+            return True
+
+    async def scored_lines(self, chat_id: int, good: bool, limit: int = 5) -> list[str]:
+        """Шутки бота, которые чату зашли (good) или не зашли — за последние 60 дней."""
+        since = int(time.time()) - 60 * 86400
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT text FROM bot_line_score WHERE chat_id = ? AND ts >= ? AND "
+                + ("score >= 2 ORDER BY score DESC, ts DESC" if good else "score <= -1 ORDER BY score ASC, ts DESC")
+                + " LIMIT ?", (chat_id, since, limit))
+            return [r[0] for r in await cur.fetchall()]
 
     # --- цитатник («золотой фонд») ---
 

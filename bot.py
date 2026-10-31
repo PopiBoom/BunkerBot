@@ -90,7 +90,8 @@ async def main() -> None:
         asyncio.create_task(auto_backup_loop(bot, db, config)),  # ночной бэкап базы бате в личку
     ]
     try:
-        await dp.start_polling(bot)
+        # message_reaction Telegram по умолчанию не присылает — просим все типы, что ловят обработчики
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         for task in background:
             task.cancel()

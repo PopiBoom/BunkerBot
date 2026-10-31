@@ -77,7 +77,7 @@ def _collect(rows: list[tuple]) -> dict:
         s["user_hours"][uid][dt.hour] += 1
         if dt.hour < 6:
             s["night"][uid] += 1
-        if text.startswith("[фото") or text.startswith("[альбом"):
+        if text.startswith(("[фото", "[альбом", "[кружок", "[видео")):
             s["photo"][uid] += 1
             continue
         if text.startswith("[стикер") or text.startswith("[гифка"):
