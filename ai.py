@@ -165,7 +165,8 @@ SETUP_SYSTEM = (
 )
 
 
-async def generate_setup(player_names: list[str], examples: dict | None = None) -> dict:
+async def generate_setup(player_names: list[str], examples: dict | None = None,
+                         theme: str = "") -> dict:
     """Возвращает dict: catastrophe, bunker, bunker_secrets, cards (по игроку на имя)."""
     names_json = json.dumps(player_names, ensure_ascii=False)
     user = (
@@ -175,8 +176,8 @@ async def generate_setup(player_names: list[str], examples: dict | None = None) 
         '  "title": "название катастрофы, 2-4 слова, для обложки",\n'
         '  "threat": {"title": "2-4 слова", "text": "1-2 предложения: ЧП посреди игры в бункере, '
         'устранять которое должен пойти один человек, рискуя жизнью"},\n'
-        '  "catastrophe": "2-3 предложения: мрачная катастрофа в духе реальных угроз '
-        '(пандемия, война, климат, авария), с одной нелепой, но возможной деталью",\n'
+        f'  "catastrophe": "2-3 предложения: катастрофа на тему «{theme or "ядерная война"}», '
+        'описанная всерьёз, как в новостях, с одной нелепой бытовой деталью",\n'
         '  "bunker": "2-3 предложения: реалистичный бункер — площадь, запасы, срок, '
         'неудобные условия",\n'
         '  "bunker_secrets": ["8 коротких реалистичных фактов о бункере, которые откроются '
@@ -204,6 +205,8 @@ async def generate_setup(player_names: list[str], examples: dict | None = None) 
         "с бесполезным и вредным, чтобы было о чём спорить; связывать карточки игроков друг "
         "с другом не обязательно. Лёгкое 18+ допустимо, но без пошлятины и чернухи."
     )
+    user += (f"\nТема катастрофы задана: «{theme}». Не уходи от неё, не пиши про грибок, "
+             "плесень или интернет, если это не тема.") if theme else ""
     if examples:
         user += (
             "\nПримеры нужного стиля по полям (НЕ копируй, придумай свои, не хуже):\n"

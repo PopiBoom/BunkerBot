@@ -869,17 +869,22 @@ async def _run_game(bot: Bot, game: Game) -> None:
     players = list(game.players.values())
     names = [p.name for p in players]
     status = await _send(bot, game.chat_id, "🎙 Ведущий готовит сценарий… (до минуты)")
+    # Тема катастрофы — случайная, но не как в прошлой партии этого чата
+    last = await game.db.get_setting(f"bunker_last_cat:{game.chat_id}", "") if game.db else ""
+    cat = C.pick_catastrophe(last)
+    if game.db:
+        await game.db.set_setting(f"bunker_last_cat:{game.chat_id}", cat[0])
 
     try:
-        setup = (await ai.generate_setup(names, C.style_examples()) if ai.available()
-                 else C.fallback_setup(names))
+        setup = (await ai.generate_setup(names, C.style_examples(), cat[0]) if ai.available()
+                 else C.fallback_setup(names, cat))
     except Exception as e:
         logger.warning("AI setup failed: %s", e)
-        setup = C.fallback_setup(names)
+        setup = C.fallback_setup(names, cat)
 
-    game.catastrophe = str(setup.get("catastrophe", "")).strip() or C.FALLBACK_CATASTROPHE
+    game.catastrophe = str(setup.get("catastrophe", "")).strip() or cat[2]
     game.bunker = str(setup.get("bunker", "")).strip() or C.FALLBACK_BUNKER
-    game.title = str(setup.get("title", "")).strip()[:60] or "Конец света"
+    game.title = str(setup.get("title", "")).strip()[:60] or cat[1]
     threat = setup.get("threat")
     if not (isinstance(threat, dict) and threat.get("title") and threat.get("text")):
         threat = random.choice(C.FALLBACK_THREATS)
