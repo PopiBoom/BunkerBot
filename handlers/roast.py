@@ -126,6 +126,8 @@ async def _maybe_defend(message: Message, bot: Bot, db: Database, config) -> boo
         try:
             answer = await ai.defend_father(name, text, await db.get_dossier(message.chat.id, user.id),
                                             await db.style_sample(message.chat.id))
+            ctx = _as_dicts(await db.recent_messages(message.chat.id, limit=8))
+            answer = await ai.polish(answer, text, ctx)
         except Exception as e:
             logger.warning("defend failed: %s", e)
     if not answer:
@@ -371,8 +373,11 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
         if ai.available():
             try:
                 jab = await ai.comeback(name, text, short=True, dossier=dossier, samples=samples, is_father=is_father)
-                if jab:
-                    answer = f"{answer}\n{jab}"
+                if jab:  # редактор проверяет ответ целиком, как одно сообщение
+                    full = await ai.polish(f"{answer} {jab}", text,
+                                           _as_dicts(await db.recent_messages(chat_id, limit=8)), max_words=20)
+                    if full:
+                        answer = full
             except Exception as e:
                 logger.warning("comeback failed: %s", e)
         await _say(bot, chat_id, answer, reply_to=last_msg.message_id)
@@ -386,6 +391,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
             else:
                 ctx = await db.recent_messages(chat_id, limit=15)
                 answer = await ai.banter(name, text, _as_dicts(ctx), dossier=dossier, samples=samples, is_father=is_father)
+            if answer:  # редактор: связно ли, к месту ли, коротко ли
+                answer = await ai.polish(answer, text, _as_dicts(await db.recent_messages(chat_id, limit=8)))
         except Exception as e:
             logger.warning("bot reply failed: %s", e)
     if not answer and rude:
@@ -424,7 +431,12 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int, interval: int) -> No
         return  # пока думали, бот уже успел ответить кому-то — молчим
     if result["text"]:
         reply_to = result["reply_to"] if result["reply_to"] in new_ids else None
-        await _say(bot, chat_id, result["text"], reply_to=reply_to)
+        trigger = next((r[3] for r in rows if r[0] == reply_to), rows[-1][3])
+        text = await ai.polish(result["text"], trigger, _as_dicts(rows))
+        if chat_id in _pending or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
+            return
+        if text:
+            await _say(bot, chat_id, text, reply_to=reply_to)
 
 
 async def _heavy(bot: Bot, db: Database) -> None:
