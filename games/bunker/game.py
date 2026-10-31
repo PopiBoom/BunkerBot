@@ -767,6 +767,7 @@ def _assign_cards(players: list[Player], cards: list) -> None:
         extra = {k: str(v).strip() for k, v in (card or {}).items()
                  if k in C.ATTR_MAP and v is not None and str(v).strip()}
         p.card = {**base, **extra, "name": p.name}
+        p.card["bio"] = C.clean_bio(p.card.get("bio", ""))
         others = [o.name for o in players if o is not p]
         rel = p.card.get("relation", "")
         if not any(o in rel for o in others):
