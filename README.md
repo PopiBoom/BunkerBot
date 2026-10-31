@@ -101,6 +101,7 @@ python bot.py
 | `AI_MODEL_EDIT`    | редактор реплик стёб-бота (claude-sonnet-5-5)                      |
 | `AI_MODEL_REPLY`   | кто пишет ответы людям в чате (по умолчанию = `AI_MODEL_EDIT`)     |
 | `BOT_CHANNEL_NAMES`| названия каналов бати, посты которых бот комментирует (Memento Mori) |
+| `BOT_CHANNEL_ID`   | id канала для постов бота (по умолчанию — канал, привязанный к чату) |
 | `BOT_FATHER_NAME` / `BOT_FATHER_ID` | имя и ID «бати» (по умолчанию kapustka и первый из `ADMIN_IDS`) |
 | `BUNKER_DELAY`     | пауза между сюжетными сообщениями игры в секундах (по умолчанию 20) |
 | `DB_PATH`          | путь к базе (по умолчанию bot.db)                                 |

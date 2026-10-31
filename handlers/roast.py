@@ -499,6 +499,11 @@ async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
         return
     if not text and not media:
         return
+    fo = message.forward_origin
+    if fo is not None and fo.type == "channel" and getattr(fo, "message_id", None):
+        from handlers.channel_posts import own_posts
+        if fo.message_id in await own_posts(db):  # это пост самого бота — сам себя не комментирует
+            return
     image = None
     try:
         if message.photo:
@@ -1417,6 +1422,12 @@ async def background(bot: Bot, db: Database) -> None:
                             await _auto_roast(bot, db, chat_id, interval)
                         except Exception as e:
                             logger.warning("auto roast failed in %s: %s", chat_id, e)
+                # Посты бота в канал (пока тестовый режим из /admin)
+                try:
+                    from handlers import channel_posts
+                    await channel_posts.tick(bot, db)
+                except Exception as e:
+                    logger.warning("channel posts tick failed: %s", e)
                 # Опросы «Кто из нас…»: закрыть просроченные; тишина в чате — «вопрос дня»
                 try:
                     from handlers import fun

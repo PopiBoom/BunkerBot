@@ -87,6 +87,35 @@ async def admin_roast_toggle(call: CallbackQuery, db: Database, config: Config) 
         )
 
 
+@router.callback_query(F.data == "admin:chan_posts")
+async def admin_chan_posts(call: CallbackQuery, bot: Bot, db: Database, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    from handlers import channel_posts as CP
+
+    if (await db.get_setting(CP.MODE_KEY, "off")) == "test":
+        await CP.stop(db)
+        await call.answer("Посты в канал выключены ⛔", show_alert=True)
+        return
+    chan = await CP.channel_id(bot, db)
+    if chan is None:
+        await call.answer("Не нашёл канал: привяжи его к чату (Канал → Обсуждение) "
+                          "или впиши BOT_CHANNEL_ID в .env.", show_alert=True)
+        return
+    await CP.start_test(db, call.from_user.id)
+    await call.answer("Тест включён 📢", show_alert=True)
+    if call.message:
+        await call.message.answer(
+            f"📢 <b>Тест постов в канал включён</b>\n\n"
+            f"Бот пишет в канал от себя каждые {CP.TEST_EVERY // 60} мин, через {CP.TEST_FOR // 60} мин "
+            "выключится сам и напишет тебе. Выключить раньше — та же кнопка.\n\n"
+            "Нужно, чтобы бот был админом канала с правом «Публикация сообщений». В постах — его мысли "
+            "в духе канала, без имён и переписки из чата (канал видят подписчики). Свои посты он в чате "
+            "не комментирует. Каждый пост ≈ $0.007."
+        )
+
+
 @router.callback_query(F.data == "admin:quiet_kick")
 async def admin_quiet_kick(call: CallbackQuery, db: Database, config: Config) -> None:
     if not _is_admin(call.from_user.id, config):
