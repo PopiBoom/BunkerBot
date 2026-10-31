@@ -128,30 +128,55 @@ class Database:
                     set_name  TEXT,
                     uses      INTEGER NOT NULL DEFAULT 1,
                     last_ts   INTEGER NOT NULL,
+                    descr     TEXT,
+                    kind      TEXT NOT NULL DEFAULT 'sticker',
                     PRIMARY KEY (chat_id, unique_id)
                 )
                 """
             )
+            # Миграция: в старых базах у stickers нет описания и вида (стикер / гифка)
+            cur = await db.execute("PRAGMA table_info(stickers)")
+            cols = {r[1] for r in await cur.fetchall()}
+            if "descr" not in cols:
+                await db.execute("ALTER TABLE stickers ADD COLUMN descr TEXT")
+            if "kind" not in cols:
+                await db.execute("ALTER TABLE stickers ADD COLUMN kind TEXT NOT NULL DEFAULT 'sticker'")
             await db.commit()
 
     # --- стикеры чата (бот запоминает и кидает по ситуации) ---
 
     async def add_sticker(self, chat_id: int, unique_id: str, file_id: str, emoji: str | None,
-                          set_name: str | None) -> None:
+                          set_name: str | None, kind: str = "sticker") -> str | None:
+        """Запоминает стикер или гифку. Возвращает уже известное описание (или None — ещё не смотрели)."""
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "INSERT INTO stickers (chat_id, unique_id, file_id, emoji, set_name, uses, last_ts) "
-                "VALUES (?, ?, ?, ?, ?, 1, ?) ON CONFLICT(chat_id, unique_id) DO UPDATE SET "
+                "INSERT INTO stickers (chat_id, unique_id, file_id, emoji, set_name, uses, last_ts, kind) "
+                "VALUES (?, ?, ?, ?, ?, 1, ?, ?) ON CONFLICT(chat_id, unique_id) DO UPDATE SET "
                 "file_id = excluded.file_id, uses = uses + 1, last_ts = excluded.last_ts",
-                (chat_id, unique_id, file_id, emoji, set_name, int(time.time())),
+                (chat_id, unique_id, file_id, emoji, set_name, int(time.time()), kind),
             )
             await db.commit()
+            # описание одно на файл: если этот стикер уже описывали (хоть в другом чате) — берём его
+            cur = await db.execute(
+                "SELECT descr FROM stickers WHERE unique_id = ? AND descr IS NOT NULL LIMIT 1", (unique_id,)
+            )
+            row = await cur.fetchone()
+            if row:
+                await db.execute("UPDATE stickers SET descr = ? WHERE unique_id = ? AND descr IS NULL",
+                                 (row[0], unique_id))
+                await db.commit()
+            return row[0] if row else None
 
-    async def chat_stickers(self, chat_id: int, limit: int = 30) -> list[tuple]:
-        """[(file_id, emoji, set_name, uses)] — самые ходовые стикеры чата."""
+    async def set_sticker_descr(self, unique_id: str, descr: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("UPDATE stickers SET descr = ? WHERE unique_id = ?", (descr, unique_id))
+            await db.commit()
+
+    async def chat_stickers(self, chat_id: int, limit: int = 40) -> list[tuple]:
+        """[(file_id, emoji, set_name, uses, descr, kind)] — самые ходовые стикеры и гифки чата."""
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
-                "SELECT file_id, emoji, set_name, uses FROM stickers WHERE chat_id = ? "
+                "SELECT file_id, emoji, set_name, uses, descr, kind FROM stickers WHERE chat_id = ? "
                 "ORDER BY uses DESC, last_ts DESC LIMIT ?", (chat_id, limit),
             )
             return list(await cur.fetchall())

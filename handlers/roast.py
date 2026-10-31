@@ -8,7 +8,8 @@
   * иногда сам подкалывает кого-то, когда в чате оживлённо;
   * отвечает, если к нему обращаются, и огрызается, если его посылают;
   * /forget_me — удалить всё о себе и не попадать под стёб, /remember_me — вернуться;
-  * комментирует посты канала бати (Memento Mori), запоминает стикеры чата и кидает их к месту;
+  * комментирует посты канала бати (Memento Mori), запоминает стикеры и гифки чата (каждый один
+    раз описывает по картинке) и кидает их к месту;
   * пока в чате идёт «Бункер» — молчит (только запоминает).
 Включается/выключается в /admin (настройка roast_enabled).
 """
@@ -705,50 +706,91 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
             await _send_sticker(bot, db, chat_id, f"{text}\nОтвет бота: {answer}")
 
 
-# ---------- стикеры ----------
+# ---------- стикеры и гифки ----------
 
 STICKER_AFTER = 0.2     # иногда после ответа бот докидывает стикер
 STICKER_INSTEAD = 0.5   # когда лень отвечать словами: доля случаев, где хватит реакции, а не стикера
 STICKER_REPLY = 0.7     # на стикер в ответ боту — стикером
 STICKER_RANDOM = 0.04   # на чужой стикер — иногда своим
-MIN_STICKERS = 3        # пока чат не накидал хотя бы столько разных — стикерами не отвечаем
+MIN_STICKERS = 3        # пока чат не накидал хотя бы столько разных стикеров/гифок — не отвечаем ими
 _sticker_last: dict[int, float] = {}
 STICKER_GAP = 20        # сек между стикерами бота в одном чате
 
 
+_describing: set[str] = set()  # какие файлы уже пробовали описать в этом запуске
+
+
+async def _sticker_descr(bot: Bot, db: Database, unique_id: str, known: str | None, image_src,
+                         kind: str, emoji: str = "") -> str:
+    """Описание стикера/гифки: из базы, а если его нет — Haiku смотрит на картинку один раз."""
+    if known or not ai.available() or image_src is None or unique_id in _describing:
+        return known or ""
+    _describing.add(unique_id)
+    try:
+        data = (await bot.download(image_src)).read()
+        descr = await ai.describe_sticker(data, kind, emoji)
+    except Exception as e:
+        logger.debug("describe %s failed: %s", kind, e)
+        return ""
+    if descr:
+        await db.set_sticker_descr(unique_id, descr)
+        logger.info("%s описан: %s", kind, descr)
+    return descr
+
+
 async def _send_sticker(bot: Bot, db: Database, chat_id: int, situation: str,
                         reply_to: int | None = None) -> bool:
-    """Кидает подходящий по смыслу стикер из тех, что кидали в этом чате. True — кинул."""
+    """Кидает подходящий по смыслу стикер или гифку из тех, что кидали в этом чате. True — кинул."""
     if not ai.available() or _bunker_active(chat_id):
         return False
     if time.time() - _sticker_last.get(chat_id, 0) < STICKER_GAP:
         return False
-    rows = await db.chat_stickers(chat_id)
+    rows = await db.chat_stickers(chat_id)  # (file_id, emoji, set_name, uses, descr, kind)
     if len(rows) < MIN_STICKERS:
         return False
     try:
-        n = await ai.pick_sticker(situation, [(r[1], r[2]) for r in rows])
+        n = await ai.pick_sticker(situation, [("гифка" if r[5] == "gif" else "стикер", r[4] or "", r[1] or "",
+                                               r[2] or "") for r in rows])
     except Exception as e:
         logger.debug("pick sticker failed: %s", e)
         return False
     if not n:
         return False
+    file_id, emoji, _set, _uses, descr, kind = rows[n - 1]
     kwargs = {}
     if reply_to:
         kwargs["reply_parameters"] = ReplyParameters(message_id=reply_to, allow_sending_without_reply=True)
     try:
-        await bot.send_sticker(chat_id, rows[n - 1][0], **kwargs)
+        if kind == "gif":
+            await bot.send_animation(chat_id, file_id, **kwargs)
+        else:
+            await bot.send_sticker(chat_id, file_id, **kwargs)
     except Exception as e:
         logger.debug("send sticker failed: %s", e)
         return False
     _sticker_last[chat_id] = time.time()
     _last_bot_msg[chat_id] = time.time()
     if _db_ref:
+        label = "гифка" if kind == "gif" else "стикер"
         try:
-            await _db_ref[0].add_chat_message(chat_id, 0, 0, BOT_SELF, None, f"[стикер {rows[n - 1][1] or ''}]")
+            await _db_ref[0].add_chat_message(chat_id, 0, 0, BOT_SELF, None,
+                                              f"[{label}: {descr or emoji or '?'}]")
         except Exception:
             pass
     return True
+
+
+async def _maybe_answer_sticker(bot: Bot, db: Database, message: Message) -> None:
+    """На стикер/гифку в ответ боту — чаще всего стикером, на чужие — изредка."""
+    if _bunker_active(message.chat.id):
+        return
+    reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user
+                        and message.reply_to_message.from_user.id == bot.id)
+    if random.random() < (STICKER_REPLY if reply_to_bot else STICKER_RANDOM):
+        ctx = _as_dicts(await db.recent_messages(message.chat.id, limit=6))
+        situation = "\n".join(f"{m['name']}: {m['text']}" for m in ctx)
+        await asyncio.sleep(random.uniform(1.0, 3.0))
+        await _send_sticker(bot, db, message.chat.id, situation, reply_to=message.message_id)
 
 
 @router.message(F.sticker)
@@ -761,19 +803,31 @@ async def on_group_sticker(message: Message, bot: Bot, db: Database) -> None:
         _db_ref.append(db)
     if not await _enabled(db) or await db.is_optout(chat_id, user.id):
         return
-    await db.add_sticker(chat_id, st.file_unique_id, st.file_id, st.emoji, st.set_name)
+    known = await db.add_sticker(chat_id, st.file_unique_id, st.file_id, st.emoji, st.set_name, "sticker")
+    # обычный стикер — смотрим сам файл (webp); анимированный и видео — их превью
+    src = st.thumbnail if (st.is_animated or st.is_video) else st
+    descr = await _sticker_descr(bot, db, st.file_unique_id, known, src, "стикер", st.emoji or "")
     await db.add_chat_message(chat_id, message.message_id, user.id, _name(message), user.username,
-                              f"[стикер {st.emoji or ''}]".strip())
-    if _bunker_active(chat_id):
-        return
-    reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user
-                        and message.reply_to_message.from_user.id == bot.id)
-    if random.random() < (STICKER_REPLY if reply_to_bot else STICKER_RANDOM):
-        ctx = _as_dicts(await db.recent_messages(chat_id, limit=6))
-        situation = "\n".join(f"{m['name']}: {m['text']}" for m in ctx)
-        await asyncio.sleep(random.uniform(1.0, 3.0))
-        await _send_sticker(bot, db, chat_id, situation, reply_to=message.message_id)
+                              f"[стикер: {descr or st.emoji or '?'}]")
+    await _maybe_answer_sticker(bot, db, message)
 
+
+@router.message(F.animation)
+async def on_group_gif(message: Message, bot: Bot, db: Database) -> None:
+    user, gif = message.from_user, message.animation
+    if user is None or user.is_bot or gif is None:
+        return
+    chat_id = message.chat.id
+    if not _db_ref:
+        _db_ref.append(db)
+    if not await _enabled(db) or await db.is_optout(chat_id, user.id):
+        return
+    known = await db.add_sticker(chat_id, gif.file_unique_id, gif.file_id, None, None, "gif")
+    descr = await _sticker_descr(bot, db, gif.file_unique_id, known, gif.thumbnail, "гифка")
+    caption = f" {message.caption}" if message.caption else ""
+    await db.add_chat_message(chat_id, message.message_id, user.id, _name(message), user.username,
+                              f"[гифка: {descr or '?'}]{caption}"[:1000])
+    await _maybe_answer_sticker(bot, db, message)
 
 # ---------- ловушка на обещания ----------
 
