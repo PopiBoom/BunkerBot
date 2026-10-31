@@ -16,10 +16,11 @@ from aiogram.types import (
     BotCommandScopeChat,
 )
 
+from commands import ADMIN_SECTION, GROUP_SECTIONS, PRIVATE_SECTIONS, menu
 from config import load_config
 from database import Database
 from games import bunker_router
-from handlers import admin_router, roast_router, user_router
+from handlers import admin_router, help_router, quotes_router, roast_router, stats_router, user_router
 from handlers.admin import auto_backup_loop
 from handlers.roast import background as roast_background
 
@@ -31,27 +32,13 @@ logger = logging.getLogger("bot")
 
 
 async def set_commands(bot: Bot, config) -> None:
-    """Меню команд, которое Telegram показывает при вводе «/»."""
-    private = [
-        BotCommand(command="start", description="Проверить подписку и получить доступ"),
-        BotCommand(command="top", description="Рейтинг выживших в Бункере"),
-    ]
-    group = [
-        BotCommand(command="bunker", description="Начать «Бункер» (можно: /bunker злой, добрый, кринж)"),
-        BotCommand(command="bunker_stop", description="Остановить игру (только ведущий)"),
-        BotCommand(command="bunker_bots", description="Добавить в лобби тестовых ботов (временно)"),
-        BotCommand(command="top", description="Рейтинг выживших"),
-        BotCommand(command="roast", description="Прожарить (ответом на сообщение или @ник)"),
-        BotCommand(command="week", description="Итоги недели чата"),
-        BotCommand(command="promises", description="Чьи обещания бот проверит"),
-        BotCommand(command="clowns", description="Таблица позора: клоуны дня"),
-        BotCommand(command="forget_me", description="Забыть меня и не стебать"),
-        BotCommand(command="remember_me", description="Снова запоминать меня"),
-    ]
-    admin = private + [
-        BotCommand(command="admin", description="Панель администратора"),
-        BotCommand(command="backup", description="Бэкап базы файлом"),
-    ]
+    """Меню команд, которое Telegram показывает при вводе «/» — по разделам (см. commands.py)."""
+    def cmds(sections) -> list[BotCommand]:
+        return [BotCommand(command=c, description=d) for c, d in menu(sections)]
+
+    private = cmds(PRIVATE_SECTIONS)
+    admin = cmds(PRIVATE_SECTIONS[:-1] + [ADMIN_SECTION] + PRIVATE_SECTIONS[-1:])
+    group = cmds(GROUP_SECTIONS)
     try:
         await bot.set_my_commands(private, scope=BotCommandScopeAllPrivateChats())
         await bot.set_my_commands(group, scope=BotCommandScopeAllGroupChats())
@@ -85,6 +72,9 @@ async def main() -> None:
     dp.include_router(admin_router)
     dp.include_router(bunker_router)
     dp.include_router(user_router)
+    dp.include_router(help_router)
+    dp.include_router(quotes_router)
+    dp.include_router(stats_router)
     # Стёб-бот последним: ловит все остальные сообщения групп
     dp.include_router(roast_router)
 

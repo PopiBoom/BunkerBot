@@ -134,6 +134,22 @@ class Database:
                 )
                 """
             )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS quotes (
+                    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id  INTEGER NOT NULL,
+                    msg_id   INTEGER NOT NULL,
+                    user_id  INTEGER NOT NULL,
+                    name     TEXT,
+                    text     TEXT NOT NULL,
+                    ts       INTEGER NOT NULL,
+                    added_by INTEGER,
+                    added_ts INTEGER NOT NULL,
+                    UNIQUE (chat_id, msg_id)
+                )
+                """
+            )
             # Миграция: в старых базах у stickers нет описания и вида (стикер / гифка)
             cur = await db.execute("PRAGMA table_info(stickers)")
             cols = {r[1] for r in await cur.fetchall()}
@@ -189,6 +205,76 @@ class Database:
             )
             row = await cur.fetchone()
             return row[0] if row else None
+
+    # --- цитатник («золотой фонд») ---
+
+    async def add_quote(self, chat_id: int, msg_id: int, user_id: int, name: str, text: str, ts: int,
+                        added_by: int | None) -> int | None:
+        """Номер цитаты в фонде чата или None, если это сообщение там уже есть."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "INSERT OR IGNORE INTO quotes (chat_id, msg_id, user_id, name, text, ts, added_by, added_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (chat_id, msg_id, user_id, name, text, ts, added_by, int(time.time())),
+            )
+            await db.commit()
+            if cur.rowcount == 0:
+                return None
+            cur = await db.execute("SELECT COUNT(*) FROM quotes WHERE chat_id = ?", (chat_id,))
+            return int((await cur.fetchone())[0])
+
+    async def random_quote(self, chat_id: int, user_id: int | None = None,
+                           older_than: int | None = None) -> tuple | None:
+        """(номер в фонде, user_id, name, text, ts) — случайная цитата чата (или человека)."""
+        sql = ("SELECT (SELECT COUNT(*) FROM quotes q2 WHERE q2.chat_id = q.chat_id AND q2.id <= q.id), "
+               "q.user_id, q.name, q.text, q.ts FROM quotes q WHERE q.chat_id = ?")
+        args: list = [chat_id]
+        if user_id is not None:
+            sql += " AND q.user_id = ?"
+            args.append(user_id)
+        if older_than is not None:
+            sql += " AND q.ts < ?"
+            args.append(older_than)
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(sql + " ORDER BY RANDOM() LIMIT 1", args)
+            return await cur.fetchone()
+
+    async def quote_counts(self, chat_id: int) -> dict[int, int]:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT user_id, COUNT(*) FROM quotes WHERE chat_id = ? GROUP BY user_id",
+                                   (chat_id,))
+            return {int(r[0]): int(r[1]) for r in await cur.fetchall()}
+
+    # --- статистика чата (без ИИ) ---
+
+    async def stats_messages(self, chat_id: int, since: int) -> list[tuple]:
+        """[(user_id, name, text, ts)] живых участников с момента since."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT user_id, name, text, ts FROM chat_messages WHERE chat_id = ? AND ts >= ? AND user_id > 0",
+                (chat_id, since),
+            )
+            return list(await cur.fetchall())
+
+    async def last_seen(self, chat_id: int) -> list[tuple]:
+        """[(user_id, name, последнее сообщение ts)] — все, кого бот помнит в чате."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT user_id, MAX(name), MAX(ts) FROM chat_messages WHERE chat_id = ? AND user_id > 0 "
+                "GROUP BY user_id", (chat_id,),
+            )
+            return list(await cur.fetchall())
+
+    async def oldest_message_ts(self, chat_id: int) -> int | None:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT MIN(ts) FROM chat_messages WHERE chat_id = ? AND user_id > 0", (chat_id,))
+            row = await cur.fetchone()
+            return int(row[0]) if row and row[0] else None
+
+    async def bunker_stats_of(self, user_id: int) -> tuple | None:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT games, survived, first_out FROM bunker_stats WHERE user_id = ?", (user_id,))
+            return await cur.fetchone()
 
     # --- обещания (ловушка на обещания) ---
 
@@ -420,6 +506,7 @@ class Database:
         async with aiosqlite.connect(self.path) as db:
             await db.execute("DELETE FROM chat_messages WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
             await db.execute("DELETE FROM dossiers WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+            await db.execute("DELETE FROM quotes WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
             await db.execute("INSERT OR IGNORE INTO roast_optout (chat_id, user_id) VALUES (?, ?)",
                              (chat_id, user_id))
             await db.commit()

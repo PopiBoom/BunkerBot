@@ -503,9 +503,10 @@ async def cmd_roast(message: Message, command: CommandObject, bot: Bot, db: Data
         await message.reply(f"Про {html.escape(target_name or 'него')} я пока мало знаю. Пусть поболтает — потом поговорим.")
         return
     _last_roast[chat_id] = now
+    quote = await _old_quote(db, chat_id, target_id)
     try:
         await bot.send_chat_action(chat_id, "typing")
-        text = await ai.roast_user(target_name or "Аноним", dossier, _as_dicts(rows))
+        text = await ai.roast_user(target_name or "Аноним", dossier, _as_dicts(rows), quote=quote)
     except Exception as e:
         logger.warning("roast failed: %s", e)
         await message.reply("Что-то я сегодня не в форме. Попробуй позже.")
@@ -633,6 +634,20 @@ _EMPTY = re.compile(r"^\W*(да|нет|ага|угу|и\s*ч[её]|ч[её]|ну
 COOL_REACTIONS = ["🗿", "🤡", "🥱", "🙈", "😴"]
 
 
+QUOTE_RECALL = 0.3  # как часто в обычном ответе подсовывать ИИ старую цитату человека
+
+
+async def _old_quote(db: Database, chat_id: int, user_id: int | None) -> str:
+    """Старая (старше 3 дней) цитата человека из золотого фонда — чтобы бот мог её припомнить."""
+    if user_id is None:
+        return ""
+    row = await db.random_quote(chat_id, user_id, older_than=int(time.time()) - 3 * 86400)
+    if not row:
+        return ""
+    when = datetime.fromtimestamp(row[4], MSK).strftime("%d.%m")
+    return f"«{row[3][:300]}» ({when})"
+
+
 def _thread_load(chat_id: int, user_id: int) -> int:
     now = time.time()
     hist = [t for t in _thread.get((chat_id, user_id), []) if now - t < THREAD_WINDOW]
@@ -696,7 +711,9 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
                 answer = await ai.comeback(name, text, dossier=dossier, samples=samples, is_father=is_father)
             else:
                 ctx = await db.recent_messages(chat_id, limit=25)
-                answer = await ai.banter(name, text, _as_dicts(ctx), dossier=dossier, samples=samples, is_father=is_father)
+                quote = await _old_quote(db, chat_id, who.id) if who and random.random() < QUOTE_RECALL else ""
+                answer = await ai.banter(name, text, _as_dicts(ctx), dossier=dossier, samples=samples,
+                                         is_father=is_father, quote=quote)
             if answer:  # редактор: связно ли, к месту ли, коротко ли
                 answer = await ai.polish(answer, text, _as_dicts(await db.recent_messages(chat_id, limit=20)),
                                          author=ai.FATHER_NAME if is_father else name)
@@ -1110,6 +1127,17 @@ async def _heavy(bot: Bot, db: Database) -> None:
                 await _clown_of_day(bot, db, chat_id)
             except Exception as e:
                 logger.warning("clown of day failed in %s: %s", chat_id, e)
+        # фразы дня в золотой фонд — тоже раз в сутки, вечером (молча, видно через /quote)
+        for chat_id in await db.active_chats(int(time.time()) - 86400):
+            key = f"quotes_pick:{chat_id}"
+            if await db.get_setting(key, "") == today or _bunker_active(chat_id):
+                continue
+            await db.set_setting(key, today)
+            try:
+                from handlers.quotes import daily_pick
+                await daily_pick(db, chat_id)
+            except Exception as e:
+                logger.warning("daily quotes failed in %s: %s", chat_id, e)
     if now_msk.weekday() == 6 and now_msk.hour >= 20:  # итоги недели — воскресенье после 20:00 МСК
         for chat_id in await db.active_chats(int(time.time()) - 7 * 86400):
             key = f"roast_week:{chat_id}"
