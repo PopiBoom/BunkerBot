@@ -2,4 +2,5 @@ aiogram>=3.13,<4.0
 aiosqlite>=0.20
 python-dotenv>=1.0
 anthropic>=2.3,<3  # нужны output_config (effort) и fallbacks
+pillow>=10  # карточки-картинки
 aiohttp_socks>=0.8  # нужен только если используешь BOT_PROXY

@@ -31,7 +31,47 @@ class Database:
                 )
                 """
             )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bunker_stats (
+                    user_id     INTEGER PRIMARY KEY,
+                    name        TEXT NOT NULL,
+                    games       INTEGER NOT NULL DEFAULT 0,
+                    survived    INTEGER NOT NULL DEFAULT 0,
+                    first_out   INTEGER NOT NULL DEFAULT 0,
+                    goals_done  INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
             await db.commit()
+
+    # --- статистика Бункера ---
+
+    async def record_bunker_game(self, results: list[dict]) -> None:
+        """results: [{user_id, name, survived: bool, first_out: bool, goal_done: bool}]"""
+        async with aiosqlite.connect(self.path) as db:
+            for r in results:
+                await db.execute(
+                    "INSERT INTO bunker_stats (user_id, name, games, survived, first_out, goals_done) "
+                    "VALUES (?, ?, 1, ?, ?, ?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET name = excluded.name, "
+                    "games = games + 1, survived = survived + excluded.survived, "
+                    "first_out = first_out + excluded.first_out, "
+                    "goals_done = goals_done + excluded.goals_done",
+                    (r["user_id"], r["name"], int(r["survived"]), int(r["first_out"]),
+                     int(r["goal_done"])),
+                )
+            await db.commit()
+
+    async def bunker_top(self, limit: int = 10) -> list[tuple]:
+        """(name, games, survived, first_out, goals_done), лучшие по выживаниям."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT name, games, survived, first_out, goals_done FROM bunker_stats "
+                "ORDER BY survived DESC, goals_done DESC, games ASC LIMIT ?",
+                (limit,),
+            )
+            return list(await cur.fetchall())
 
     # --- пользователи ---
 
