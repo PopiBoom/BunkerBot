@@ -2,7 +2,7 @@
 
   * /poll — ИИ придумывает вопрос по досье и переписке («Кто из нас первым сольётся с зала?»),
     варианты — самые активные участники за неделю, опрос открытый (видно, кто за кого).
-    Через POLL_HOURS бот закрывает его и прожаривает «победителя» в связке с вопросом.
+    Через POLL_MINUTES бот закрывает его и прожаривает «победителя» в связке с вопросом.
   * Тишина в чате QUIET_HOURS днём — бот кидает провокационный вопрос по темам чата
     (иногда вместо него — опрос). Не чаще раза в сутки, только в живом чате, не во время Бункера.
 Фоновую часть (закрыть опросы, вопрос дня) вызывает фоновая задача стёб-бота (roast.background).
@@ -29,8 +29,8 @@ router = Router(name="fun")
 router.message.filter(F.chat.type.in_({"group", "supergroup"}))
 
 MSK = timezone(timedelta(hours=3))
-POLL_HOURS = 2            # сколько висит опрос до итогов
-POLL_COOLDOWN = 30 * 60   # /poll не чаще раза в полчаса в чате
+POLL_MINUTES = 15         # сколько висит опрос до итогов
+POLL_COOLDOWN = POLL_MINUTES * 60  # новый /poll — не раньше, чем подведены итоги прошлого
 POLL_MIN, POLL_MAX = 3, 10
 QUIET_HOURS = 3           # столько часов тишины — и бот подкидывает вопрос
 DAY_FROM, DAY_TO = 12, 23  # МСК: только днём и вечером, ночью не будим
@@ -90,7 +90,7 @@ async def launch_poll(bot: Bot, db: Database, chat_id: int, auto: bool = False) 
     msg = await bot.send_poll(chat_id, question, options=names, is_anonymous=False)
     R._last_bot_msg[chat_id] = time.time()
     await db.add_poll(chat_id, msg.message_id, question, [[u, n] for u, n in members],
-                      int(time.time()) + POLL_HOURS * 3600)
+                      int(time.time()) + POLL_MINUTES * 60)
     await _remember_question(db, chat_id, question)
     logger.info("опрос в %s%s: %s", chat_id, " (сам)" if auto else "", question)
     return None
