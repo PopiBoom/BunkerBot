@@ -530,7 +530,8 @@ def _vote_text(game: Game) -> str:
     lines += [f"✋ Проголосовали: {len(game.votes)}/{len(alive)}", "", _bars(game), ""]
     effects = []
     if game.immune:
-        effects.append("🛡 иммунитет: " + ", ".join(_e(game.players[u].name) for u in game.immune))
+        effects.append("🛡 иммунитет (против них голосовать нельзя): "
+                       + ", ".join(_e(game.players[u].name) for u in game.immune))
     if game.doubled:
         effects.append("✌️ двойной голос: " + ", ".join(_e(game.players[u].name) for u in game.doubled))
     if game.cursed:
@@ -547,6 +548,8 @@ def _vote_text(game: Game) -> str:
 def _vote_kb(game: Game) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for p in _alive(game):
+        if p.user_id in game.immune:  # за иммунного голосовать нельзя — кнопки нет
+            continue
         if not game.vote_targets or p.user_id in game.vote_targets:
             b.button(text=f"🚫 {p.name}", callback_data=f"bk:vote:{p.user_id}")
     b.adjust(2)
@@ -748,7 +751,8 @@ async def _bots_vote(bot: Bot, game: Game, threat: bool = False) -> None:
             continue
         if game.revote != revote or game.stage == "closed":
             return
-        targets = [u for u in (game.vote_targets or {o.user_id for o in _alive(game)}) if u != p.user_id]
+        targets = [u for u in (game.vote_targets or {o.user_id for o in _alive(game)})
+                   if u != p.user_id and u not in game.immune]
         if not targets:
             continue
         game.votes[p.user_id] = random.choice(targets)
@@ -1357,7 +1361,15 @@ async def _play_action(bot: Bot, game: Game, p: Player, target: Player | None) -
     head = f"🃏 <b>{_e(p.name)}</b> играет {emoji} <b>{title}</b>"
     if action == "immunity":
         game.immune.add(p.user_id)
-        await _send(bot, game.chat_id, f"{head}! Голоса против него(неё) в этом голосовании не считаются.")
+        dropped = [v for v, t in game.votes.items() if t == p.user_id]
+        for v in dropped:  # голоса против иммунного сгорают — пусть выбирают заново
+            game.votes.pop(v, None)
+        again = ""
+        if dropped:
+            who = _names([_mention(game.players[v]) for v in dropped if v in game.players])
+            again = f"\n\n🔁 {who}: ваш голос сгорел — выберите другого."
+        await _send(bot, game.chat_id,
+                    f"{head}! В этом голосовании против него(неё) голосовать нельзя.{again}")
     elif action == "double":
         game.doubled.add(p.user_id)
         await _send(bot, game.chat_id, f"{head}! Его(её) голос сейчас считается за два.")
@@ -1513,7 +1525,7 @@ async def _threat(bot: Bot, game: Game) -> bool:
     text = f"🦸 <b>{_e(p.name)} справился(ась) и вернулся(ась)!</b>"
     if story:
         text += f"\n\n{_host(game, story)}"
-    text += "\n\n🛡 Награда: иммунитет в ближайшем голосовании."
+    text += "\n\n🛡 Награда: иммунитет — в ближайшем голосовании против него(неё) голосовать нельзя."
     await _say(bot, game.chat_id, text, delay=HOST_DELAY if story else STEP_DELAY)
     return False
 
@@ -1723,6 +1735,10 @@ async def cb_vote(call: CallbackQuery) -> None:
 
     if game.stage == "closed":
         await call.answer("Голосование уже закрыто.", show_alert=True)
+        return
+    if target in game.immune:
+        await call.answer(f"🛡 {game.players[target].name} под иммунитетом — в этом голосовании против "
+                          "него(неё) голосовать нельзя.", show_alert=True)
         return
     if game.vote_targets and target not in game.vote_targets:
         await call.answer("Сейчас голосуем только между теми, у кого ничья.", show_alert=True)

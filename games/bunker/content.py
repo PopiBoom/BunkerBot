@@ -519,7 +519,7 @@ def fallback_setup(names: list[str], catastrophe: tuple[str, str, str] | None = 
 
 ACTIONS: dict[str, tuple[str, str, str, str, bool]] = {
     "immunity": ("🛡", "Иммунитет",
-                 "Голоса против тебя в текущем голосовании не считаются.", "vote", False),
+                 "В текущем голосовании против тебя нельзя проголосовать.", "vote", False),
     "double": ("✌️", "Двойной голос",
                "Твой голос в текущем голосовании считается за два.", "vote", False),
     "curse": ("🧿", "Проклятие",
