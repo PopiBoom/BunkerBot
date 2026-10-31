@@ -20,6 +20,8 @@ from keyboards import (
 )
 
 router = Router(name="admin")
+# Админка — только в личке, чтобы не светить панель и рассылку в группах.
+router.message.filter(F.chat.type == "private")
 
 
 class AdminStates(StatesGroup):

@@ -19,6 +19,7 @@ import random
 from dataclasses import dataclass, field
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -31,6 +32,9 @@ router = Router(name="bunker")
 MIN_PLAYERS = 2
 MAX_PLAYERS = 16
 TURN_TIMEOUT = 60        # сек на ход каждого игрока
+VOTE_TIMEOUT = 90        # сек на голосование, потом итог подводится автоматически
+LOBBY_TIMEOUT = 15 * 60  # сек: брошенное лобби закрывается само
+MAX_TEXT = 3800          # запас до лимита Telegram в 4096 символов
 STEP_DELAY = float(os.getenv("BUNKER_DELAY", "5") or 5)  # пауза между сюжетными сообщениями
 QUIP_DELAY = max(2.0, STEP_DELAY - 1)
 
@@ -83,6 +87,7 @@ class Game:
 
 
 games: dict[int, Game] = {}  # chat_id -> Game
+_tasks: set[asyncio.Task] = set()  # держим ссылки, чтобы задачи не собрал GC
 
 
 def _alive(game: Game) -> list[Player]:
@@ -93,25 +98,70 @@ def _is_active(game: Game) -> bool:
     return games.get(game.chat_id) is game and game.phase != "ended"
 
 
-def _launch(coro) -> None:
-    task = asyncio.create_task(coro)
-
-    def _done(t: asyncio.Task) -> None:
-        if t.cancelled():
-            return
-        exc = t.exception()
-        if exc:
-            logger.warning("round task error: %s", exc)
-
-    task.add_done_callback(_done)
+def _end_game(game: Game) -> None:
+    game.phase = "ended"
+    if games.get(game.chat_id) is game:
+        games.pop(game.chat_id, None)
+    if game.pick_event:
+        game.pick_event.set()  # будим цикл раунда, чтобы он сразу завершился
 
 
-# ---------- пауза / «печатает» ----------
+def _launch(bot: Bot, game: Game, coro) -> None:
+    """Запускает ход игры отдельной задачей. Если она упала — сообщаем в чат."""
+
+    async def runner() -> None:
+        try:
+            await coro
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("bunker task crashed in chat %s", game.chat_id)
+            if _is_active(game):
+                _end_game(game)
+                try:
+                    await _send(bot, game.chat_id,
+                                "💥 Ведущий споткнулся о генератор… Игра прервана.\n"
+                                "/bunker — начать заново.")
+                except Exception:
+                    pass
+
+    task = asyncio.create_task(runner())
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+
+
+def _unique_name(game: Game, raw: str | None) -> str:
+    """Имя игрока, уникальное в пределах партии («Саша», «Саша 2», …)."""
+    base = (raw or "").strip()[:32] or "Игрок"
+    taken = {p.name for p in game.players.values()}
+    if base not in taken:
+        return base
+    n = 2
+    while f"{base} {n}" in taken:
+        n += 1
+    return f"{base} {n}"
+
+
+# ---------- отправка / пауза / «печатает» ----------
+
+
+async def _send(bot: Bot, chat_id: int, text: str, **kwargs) -> Message:
+    """send_message, который переживает флуд-лимит Telegram (RetryAfter)."""
+    attempts = 4
+    for attempt in range(attempts):
+        try:
+            return await bot.send_message(chat_id, text, **kwargs)
+        except TelegramRetryAfter as e:
+            if attempt == attempts - 1:
+                raise
+            logger.info("flood limit in %s, sleeping %ss", chat_id, e.retry_after)
+            await asyncio.sleep(e.retry_after + 0.5)
+    raise RuntimeError("unreachable")
 
 
 async def _say(bot: Bot, chat_id: int, text: str, delay: float = STEP_DELAY,
                reply_markup: InlineKeyboardMarkup | None = None) -> Message:
-    msg = await bot.send_message(chat_id, text, reply_markup=reply_markup)
+    msg = await _send(bot, chat_id, text, reply_markup=reply_markup)
     if delay > 0:
         try:
             await bot.send_chat_action(chat_id, "typing")
@@ -190,7 +240,23 @@ def _full_card_text(p: Player) -> str:
     return "\n".join(lines)
 
 
-def _dossier(game: Game) -> str:
+def _chunks(header: str, blocks: list[str], sep: str = "\n\n") -> list[str]:
+    """Склеивает блоки в сообщения не длиннее MAX_TEXT; заголовок — в первом."""
+    out: list[str] = []
+    cur = header
+    for block in blocks:
+        candidate = f"{cur}{sep}{block}" if cur else block
+        if len(candidate) > MAX_TEXT and cur:
+            out.append(cur)
+            cur = block
+        else:
+            cur = candidate
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _dossier_blocks(game: Game) -> list[str]:
     blocks = []
     for p in _alive(game):
         c = p.card or {}
@@ -202,7 +268,7 @@ def _dossier(game: Game) -> str:
         else:
             lines.append("   <i>пока ничего не открыто</i>")
         blocks.append("\n".join(lines))
-    return "\n\n".join(blocks)
+    return blocks
 
 
 def _lobby_text(game: Game) -> str:
@@ -276,12 +342,28 @@ async def cmd_bunker(message: Message) -> None:
     except Exception:
         game.bot_username = ""
     game.players[user.id] = Player(
-        user_id=user.id, name=user.first_name or "Игрок", username=user.username
+        user_id=user.id, name=_unique_name(game, user.first_name), username=user.username
     )
     games[chat_id] = game
 
     sent = await message.answer(_lobby_text(game), reply_markup=_lobby_kb(game))
     game.lobby_msg_id = sent.message_id
+    _launch(message.bot, game, _lobby_timer(message.bot, game))
+
+
+async def _lobby_timer(bot: Bot, game: Game) -> None:
+    await asyncio.sleep(LOBBY_TIMEOUT)
+    if games.get(game.chat_id) is not game or game.phase != "lobby":
+        return
+    _end_game(game)
+    try:
+        if game.lobby_msg_id:
+            await bot.edit_message_text(
+                "⌛ Лобби закрыто — игра так и не началась.\n/bunker — собрать заново.",
+                chat_id=game.chat_id, message_id=game.lobby_msg_id,
+            )
+    except Exception:
+        pass
 
 
 @router.message(CommandStart(deep_link=True, magic=F.args.func(lambda a: bool(a) and a.startswith("bk_"))))
@@ -311,16 +393,17 @@ async def cmd_deeplink_join(message: Message, command: CommandObject) -> None:
         await message.answer("Увы, мест в лобби больше нет.")
         return
 
-    game.players[user.id] = Player(
-        user_id=user.id, name=user.first_name or "Игрок", username=user.username, dm_ok=True
+    player = Player(
+        user_id=user.id, name=_unique_name(game, user.first_name), username=user.username, dm_ok=True
     )
+    game.players[user.id] = player
     await message.answer(
         "✅ Ты в игре «Бункер»!\n"
         "Когда ведущий начнёт — сюда придёт твоя секретная карточка, "
         "и в свой ход ты будешь выбирать здесь, что открыть."
     )
     try:
-        await message.bot.send_message(chat_id, f"➕ <b>{_e(user.first_name or 'Игрок')}</b> спускается в бункер!")
+        await _send(message.bot, chat_id, f"➕ <b>{_e(player.name)}</b> спускается в бункер!")
     except Exception:
         pass
     await _refresh_lobby(message.bot, game)
@@ -335,8 +418,7 @@ async def cmd_bunker_stop(message: Message) -> None:
     if message.from_user and message.from_user.id != game.host_id:
         await message.answer("Остановить игру может только ведущий (кто её создал).")
         return
-    game.phase = "ended"
-    games.pop(message.chat.id, None)
+    _end_game(game)
     await message.answer("🛑 Игра в Бункер остановлена.")
 
 
@@ -356,12 +438,13 @@ async def cb_join(call: CallbackQuery) -> None:
     if len(game.players) >= MAX_PLAYERS:
         await call.answer("Мест в лобби больше нет.", show_alert=True)
         return
-    game.players[uid] = Player(
-        user_id=uid, name=call.from_user.first_name or "Игрок", username=call.from_user.username
+    player = Player(
+        user_id=uid, name=_unique_name(game, call.from_user.first_name), username=call.from_user.username
     )
+    game.players[uid] = player
     await call.answer("Ты в игре! (без ЛС — карточка не придёт, ход откроется автоматически)")
     try:
-        await call.bot.send_message(game.chat_id, f"➕ <b>{_e(call.from_user.first_name or 'Игрок')}</b> спускается в бункер!")
+        await _send(call.bot, game.chat_id, f"➕ <b>{_e(player.name)}</b> спускается в бункер!")
     except Exception:
         pass
     await _refresh_lobby(call.bot, game)
@@ -394,8 +477,7 @@ async def cb_cancel(call: CallbackQuery) -> None:
     if call.from_user.id != game.host_id:
         await call.answer("Отменить может только ведущий.", show_alert=True)
         return
-    game.phase = "ended"
-    games.pop(game.chat_id, None)
+    _end_game(game)
     await call.answer("Игра отменена.")
     if call.message:
         await call.message.edit_text("❌ Игра в Бункер отменена.")
@@ -433,12 +515,45 @@ async def cb_start(call: CallbackQuery) -> None:
 
     await call.answer("Поехали!")
     game.phase = "revealing"
-    _launch(_run_game(call.bot, game))
+    _launch(call.bot, game, _run_game(call.bot, game))
+
+
+def _assign_cards(players: list[Player], cards: list) -> None:
+    """Раздаёт карточки от ИИ: по имени, иначе любую свободную, иначе запасную.
+
+    Каждая карточка достаётся не больше чем одному игроку; пустые поля
+    добиваются из запасного генератора.
+    """
+    pool = [c for c in cards if isinstance(c, dict)]
+    names = {p.name for p in players}
+    by_name: dict[str, dict] = {}
+    for c in pool:
+        by_name.setdefault(str(c.get("name", "")).strip(), c)
+
+    used: set[int] = set()
+    for p in players:
+        card = by_name.get(p.name)
+        if card is not None and id(card) in used:
+            card = None
+        if card is None:
+            card = next(
+                (c for c in pool
+                 if id(c) not in used and str(c.get("name", "")).strip() not in names),
+                None,
+            )
+        if card is not None:
+            used.add(id(card))
+        base = _fallback_setup([p.name])["cards"][0]
+        extra = {
+            k: str(v).strip() for k, v in (card or {}).items()
+            if k in ATTR_MAP and v is not None and str(v).strip()
+        }
+        p.card = {**base, **extra, "name": p.name}
 
 
 async def _run_game(bot: Bot, game: Game) -> None:
     names = [p.name for p in game.players.values()]
-    status = await bot.send_message(game.chat_id, "🎙 Ведущий готовит сценарий…")
+    status = await _send(bot, game.chat_id, "🎙 Ведущий готовит сценарий…")
 
     try:
         setup = await ai.generate_setup(names) if ai.available() else _fallback_setup(names)
@@ -449,14 +564,9 @@ async def _run_game(bot: Bot, game: Game) -> None:
     game.catastrophe = str(setup.get("catastrophe", "")).strip() or "Произошла катастрофа."
     game.bunker = str(setup.get("bunker", "")).strip() or "Бункер с ограниченным числом мест."
 
-    cards = setup.get("cards") or []
-    by_name = {str(c.get("name", "")).strip(): c for c in cards if isinstance(c, dict)}
+    cards = setup.get("cards")
     players = list(game.players.values())
-    for i, p in enumerate(players):
-        card = by_name.get(p.name)
-        if card is None and i < len(cards) and isinstance(cards[i], dict):
-            card = cards[i]
-        p.card = card or _fallback_setup([p.name])["cards"][0]
+    _assign_cards(players, cards if isinstance(cards, list) else [])
 
     game.spots = max(1, len(players) // 2)
 
@@ -464,7 +574,7 @@ async def _run_game(bot: Bot, game: Game) -> None:
     no_dm = []
     for p in players:
         try:
-            await bot.send_message(p.user_id, _full_card_text(p))
+            await _send(bot, p.user_id, _full_card_text(p))
             p.dm_ok = True
         except Exception:
             p.dm_ok = False
@@ -537,8 +647,8 @@ async def _reveal_round(bot: Bot, game: Game) -> None:
         if p.dm_ok:
             sent = False
             try:
-                msg = await bot.send_message(
-                    p.user_id, f"🔦 Раунд {game.round_no}. Твой ход! Что открываешь?",
+                msg = await _send(
+                    bot, p.user_id, f"🔦 Раунд {game.round_no}. Твой ход! Что открываешь?",
                     reply_markup=_pick_kb(game, p),
                 )
                 p.pick_msg_id = msg.message_id
@@ -555,7 +665,9 @@ async def _reveal_round(bot: Bot, game: Game) -> None:
                 try:
                     await asyncio.wait_for(game.pick_event.wait(), timeout=TURN_TIMEOUT)
                 except asyncio.TimeoutError:
-                    if _is_active(game) and p.user_id not in game.revealed_this_round:
+                    if not _is_active(game):
+                        return
+                    if p.user_id not in game.revealed_this_round and p.user_id not in game.revealed_this_round:
                         rem = [k for k, _, _ in ATTRS if k not in p.revealed]
                         await _reveal_attr(bot, game, p, random.choice(rem), auto=True)
                         try:
@@ -648,13 +760,39 @@ async def _open_voting(bot: Bot, game: Game) -> None:
     game.phase = "voting"
     game.current_picker = None
     game.votes = {}
-    await _say(bot, game.chat_id, f"📋 <b>Досье — раунд {game.round_no}</b>\n{HR}\n{_dossier(game)}")
+    parts = _chunks(f"📋 <b>Досье — раунд {game.round_no}</b>\n{HR}", _dossier_blocks(game))
+    for part in parts:
+        await _say(bot, game.chat_id, part, delay=0 if part is not parts[-1] else STEP_DELAY)
+    if not _is_active(game):
+        return
     await _say(
         bot, game.chat_id,
         f"🗳 <b>ГОЛОСОВАНИЕ</b>\n{HR}\nВ живых: {len(_alive(game))} · мест: {game.spots}\n"
-        f"Выберите, кого НЕ пускать в бункер 👇 (можно переголосовать)",
+        f"Выберите, кого НЕ пускать в бункер 👇 (можно переголосовать)\n"
+        f"⏳ На голосование {VOTE_TIMEOUT} сек, потом итог подведётся сам.",
         delay=0, reply_markup=_vote_kb(game),
     )
+    _launch(bot, game, _vote_timer(bot, game, game.round_no))
+
+
+def _voting_open(game: Game, round_no: int) -> bool:
+    return _is_active(game) and game.phase == "voting" and game.round_no == round_no
+
+
+async def _vote_timer(bot: Bot, game: Game, round_no: int) -> None:
+    warn_at = 30
+    await asyncio.sleep(max(0, VOTE_TIMEOUT - warn_at))
+    if not _voting_open(game, round_no):
+        return
+    if VOTE_TIMEOUT > warn_at:
+        await _send(
+            bot, game.chat_id,
+            f"⏳ {warn_at} сек до конца голосования! "
+            f"Проголосовали: {len(game.votes)}/{len(_alive(game))}",
+        )
+        await asyncio.sleep(warn_at)
+    if _voting_open(game, round_no):
+        await _do_tally(bot, game)
 
 
 @router.callback_query(F.data.startswith("bk:vote:"))
@@ -685,7 +823,7 @@ async def cb_vote(call: CallbackQuery) -> None:
         pass
 
     if len(game.votes) >= len(_alive(game)):
-        await _do_tally(call.bot, game)
+        _launch(call.bot, game, _do_tally(call.bot, game))
 
 
 @router.callback_query(F.data == "bk:tally")
@@ -701,24 +839,29 @@ async def cb_tally(call: CallbackQuery) -> None:
         await call.answer("Ещё никто не проголосовал.", show_alert=True)
         return
     await call.answer()
-    await _do_tally(call.bot, game)
+    _launch(call.bot, game, _do_tally(call.bot, game))
 
 
 async def _do_tally(bot: Bot, game: Game) -> None:
-    if game.phase != "voting":
+    if not _is_active(game) or game.phase != "voting":
         return
     game.phase = "counting"
 
     counts: dict[int, int] = {}
     for target in game.votes.values():
-        counts[target] = counts.get(target, 0) + 1
-    top = max(counts.values())
-    candidates = [uid for uid, c in counts.items() if c == top]
+        if target in game.players and game.players[target].alive:
+            counts[target] = counts.get(target, 0) + 1
+    if counts:
+        top = max(counts.values())
+        candidates = [uid for uid, c in counts.items() if c == top]
+        tie_note = " (жребий среди равных)" if len(candidates) > 1 else ""
+    else:
+        candidates = [p.user_id for p in _alive(game)]
+        tie_note = " (никто не проголосовал — решил жребий)"
     loser_id = random.choice(candidates)
     loser = game.players[loser_id]
     loser.alive = False
 
-    tie_note = " (жребий среди равных)" if len(candidates) > 1 else ""
     await _say(
         bot, game.chat_id,
         f"{HR}\n🧮 <b>Итог раунда {game.round_no}</b>\nИз бункера не пускают "
@@ -733,6 +876,8 @@ async def _do_tally(bot: Bot, game: Game) -> None:
         except Exception as e:
             logger.warning("AI narrate failed: %s", e)
 
+    if not _is_active(game):
+        return
     if len(_alive(game)) <= game.spots:
         await _finish(bot, game)
     else:
@@ -754,5 +899,6 @@ async def _finish(bot: Bot, game: Game) -> None:
         except Exception as e:
             logger.warning("AI epilogue failed: %s", e)
 
-    await bot.send_message(game.chat_id, "Игра окончена! Спасибо за игру 🖤\n/bunker — сыграть ещё.")
-    games.pop(game.chat_id, None)
+    await _send(bot, game.chat_id, "Игра окончена! Спасибо за игру 🖤\n/bunker — сыграть ещё.")
+    if games.get(game.chat_id) is game:
+        games.pop(game.chat_id, None)

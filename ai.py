@@ -48,15 +48,33 @@ def _extract_json(text: str) -> dict:
     return json.loads(text)
 
 
-async def _complete(system: str, user: str, max_tokens: int = 2000) -> str:
+# Модели, у которых есть серверный фолбэк при отказе (stop_reason == "refusal").
+_FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
+
+
+async def _complete(system: str, user: str, max_tokens: int = 4000) -> str:
+    """Один запрос к Claude, возвращает текст ответа.
+
+    max_tokens берём с запасом: у текущих моделей размышление включено и тратит
+    тот же лимит. Длину ответа задаём в самом промпте.
+    """
     client = _get_client()
-    resp = await client.messages.create(
+    kwargs = dict(
         model=MODEL,
         max_tokens=max_tokens,
         system=system,
         output_config={"effort": "low"},
         messages=[{"role": "user", "content": user}],
     )
+    if MODEL in _FALLBACK_MODELS:
+        # При отказе API само переотправит запрос подходящей модели.
+        resp = await client.beta.messages.create(
+            betas=["server-side-fallback-2026-07-01"], fallbacks="default", **kwargs
+        )
+    else:
+        resp = await client.messages.create(**kwargs)
+    if resp.stop_reason == "refusal":
+        raise AIUnavailable("модель отказалась отвечать")
     return "".join(b.text for b in resp.content if b.type == "text").strip()
 
 
@@ -98,7 +116,7 @@ async def generate_setup(player_names: list[str]) -> dict:
         "Каждое поле — коротко (2-7 слов), смешно и абсурдно. Лёгкое 18+ допустимо, "
         "но без пошлятины и чернухи."
     )
-    text = await _complete(SETUP_SYSTEM, user, max_tokens=4000)
+    text = await _complete(SETUP_SYSTEM, user, max_tokens=16000)
     return _extract_json(text)
 
 
@@ -117,7 +135,7 @@ async def narrate_intro(catastrophe: str, bunker: str) -> str:
         "Скажи вступительное слово как ведущий (2-3 предложения): задай настроение, "
         "подколи игроков, объясни что сейчас будут раскрывать карты и голосовать."
     )
-    return await _complete(HOST_SYSTEM, user, max_tokens=350)
+    return await _complete(HOST_SYSTEM, user, max_tokens=2000)
 
 
 async def narrate_quip(name: str, label: str, value: str) -> str:
@@ -125,7 +143,7 @@ async def narrate_quip(name: str, label: str, value: str) -> str:
         f"Игрок «{name}» только что открыл характеристику — {label}: «{value}».\n"
         "Отреагируй ОДНОЙ короткой смешной фразой ведущего (до 20 слов)."
     )
-    return await _complete(HOST_SYSTEM, user, max_tokens=120)
+    return await _complete(HOST_SYSTEM, user, max_tokens=2000)
 
 
 async def narrate_elimination(catastrophe: str, card: dict, round_no: int) -> str:
@@ -135,7 +153,7 @@ async def narrate_elimination(catastrophe: str, card: dict, round_no: int) -> st
         f"{json.dumps(card, ensure_ascii=False)}\n"
         "Опиши коротко и с чёрным юмором (2-3 предложения), как он уходит от бункера."
     )
-    return await _complete(HOST_SYSTEM, user, max_tokens=400)
+    return await _complete(HOST_SYSTEM, user, max_tokens=2000)
 
 
 async def narrate_epilogue(catastrophe: str, bunker: str, survivors: list[dict]) -> str:
@@ -145,4 +163,4 @@ async def narrate_epilogue(catastrophe: str, bunker: str, survivors: list[dict])
         "Напиши эпилог (4-6 предложений): смогут ли они ужиться, с чёрным юмором "
         "и неожиданным поворотом."
     )
-    return await _complete(HOST_SYSTEM, user, max_tokens=700)
+    return await _complete(HOST_SYSTEM, user, max_tokens=3000)
