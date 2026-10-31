@@ -101,13 +101,14 @@ async def cb_compare_vote(call: CallbackQuery, db: Database, config: Config) -> 
     winner = run["models"].get(letter)
     await call.answer(f"Победил {letter}")
     current = await db.get_setting(POST_MODEL_KEY, "") or ai.POST_MODEL
+    current_set = {m.strip() for m in current.split(",")}
     lines = [f"🏆 <b>Победил {letter}: {html.escape(_short(winner))}</b>", ""]
     for ltr, model in run["models"].items():
         mark = "🏆" if ltr == letter else "•"
-        now = " ← сейчас пишет посты" if model == current else ""
+        now = " ← сейчас пишет посты" if model in current_set else ""
         lines.append(f"{mark} {ltr} — <code>{html.escape(model)}</code>{now}")
     kb = None
-    if winner != current:
+    if current_set != {winner}:
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text=f"📢 Пусть {_short(winner)} пишет посты", callback_data=f"cmpset:{run_id}:{letter}"),
         ]])

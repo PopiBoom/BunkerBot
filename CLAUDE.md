@@ -24,8 +24,9 @@ Telegram-бот на aiogram 3 + Claude API. Владелец общается �
   прожаркой) и «вопрос дня» в тишину (3 ч днём, раз в сутки; вкл/выкл в /admin). Фон — из roast.background.
 - `handlers/channel_posts.py` — посты бота «от себя» в канал бати (сейчас только тест: каждые 2 мин,
   сам выключается через 30 мин; /admin → «📢 Посты в канал»). Канал — linked_chat_id чата или
-  BOT_CHANNEL_ID. Пишет AI_MODEL_POSTS (Opus по умолчанию) с effort high — на Sonnet/low юмор был
-  плоский. Без подписи; тон злой, с матом и оскорблениями «вас»/людей в целом — без имён и
+  BOT_CHANNEL_ID. Пишет AI_MODEL_POSTS — по умолчанию по очереди Opus 5.5 и Gemini 4 Argon (победители
+  слепого /compare владельца; Gemini — через OpenRouter, без ключа только Opus), effort high —
+  на Sonnet/low юмор был плоский. Без подписи; тон злой, с матом и оскорблениями «вас»/людей в целом — без имён и
   переписки из чата (канал публичный); свои посты в чате не комментирует.
 - `handlers/compare.py` — /compare (админ, ЛС): слепое сравнение моделей на постах (ai.COMPARE_MODELS:
   Claude напрямую, остальные — OpenRouter, `OPENROUTER_API_KEY`); победитель → настройка `post_model`

@@ -101,7 +101,7 @@ python bot.py
 | `AI_MODEL_EDIT`    | редактор реплик стёб-бота (claude-sonnet-5-5)                      |
 | `AI_MODEL_REPLY`   | кто пишет ответы людям в чате (по умолчанию = `AI_MODEL_EDIT`)     |
 | `BOT_CHANNEL_NAMES`| названия каналов бати, посты которых бот комментирует (Memento Mori) |
-| `AI_MODEL_POSTS`   | кто пишет посты в канал (по умолчанию = `AI_MODEL`, Opus; круче — claude-fable-5-1) |
+| `AI_MODEL_POSTS`   | кто пишет посты в канал, можно несколько через запятую (по умолчанию Opus 5.5 и Gemini 4 Argon по очереди) |
 | `AI_POSTS_EFFORT`  | насколько модель думает над постом: low / medium / high (по умолчанию high) |
 | `OPENROUTER_API_KEY` | ключ OpenRouter — сторонние модели (GPT, Grok, Gemini, Kimi…) для постов и `/compare` |
 | `COMPARE_MODELS`   | кого сравнивать в `/compare` (через запятую; Claude — `claude-…`, остальные — `vendor/model`) |

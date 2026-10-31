@@ -1468,7 +1468,17 @@ _BANNED_TOPICS = ("«когда-нибудь», «потом», откладыв
                   "листание ленты")
 
 
-POST_MODEL = os.getenv("AI_MODEL_POSTS", "").strip() or MODEL   # кто пишет посты в канал
+# Кто пишет посты в канал. Можно несколько через запятую — каждый пост пишет случайная из них (так разнообразнее).
+# По умолчанию: Opus 5.5 и Gemini 4 Argon по очереди (победители слепого сравнения владельца);
+# без ключа OpenRouter остаётся только Opus.
+POST_MODEL = os.getenv("AI_MODEL_POSTS", "").strip() or "claude-opus-5-5,google/gemini-4-argon"
+
+
+def pick_post_model(models: str | None = None) -> str:
+    """Одна модель из списка через запятую; сторонние — только если есть ключ OpenRouter."""
+    pool = [m.strip() for m in (models or POST_MODEL).split(",") if m.strip()]
+    usable = [m for m in pool if not is_openrouter(m) or openrouter_available()] or [MODEL]
+    return random.choice(usable)
 POST_EFFORT = os.getenv("AI_POSTS_EFFORT", "").strip() or "high"  # юмору нужно подумать
 
 
@@ -1508,7 +1518,7 @@ async def own_channel_post(examples: list[str], previous: list[str], model: str 
         "Придумай про себя 3 варианта и выдай только самый смешной."
         + _JSON_REPLY
     )
-    out = _clean_reply(await complete_any(ROAST_SYSTEM, user, model=model or POST_MODEL, max_tokens=16000,
+    out = _clean_reply(await complete_any(ROAST_SYSTEM, user, model=pick_post_model(model), max_tokens=16000,
                                           effort=effort or POST_EFFORT))
     return await fix_looks(scrub(out))
 
