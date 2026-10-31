@@ -588,3 +588,33 @@ BOT_SPEECHES = [
     "Я храплю тихо. Честно. Почти тихо.",
     "Мне мама сказала, что я особенный(ая). Это аргумент.",
 ]
+
+
+# ---------- звания в рейтинге (/top) ----------
+
+# (эмодзи, звание, условие по сумме статистики игрока, пояснение)
+TITLES: list[tuple[str, str, object, str]] = [
+    ("👑", "Король бункера", lambda s: s["games"] >= 5 and s["survived"] / s["games"] >= 0.7,
+     "выживает в 70%+ партий"),
+    ("🪳", "Таракан", lambda s: s["best_streak"] >= 3, "выжил(а) 3+ партии подряд"),
+    ("🦸", "Герой", lambda s: s["heroes"] >= 2, "2+ раза справился(ась) с угрозой"),
+    ("🍀", "Везунчик", lambda s: s["lucky"] >= 3, "3+ раза выжил(а) без единого голоса против"),
+    ("🎯", "Мишень", lambda s: s["games"] >= 3 and s["votes_against"] / s["games"] >= 2.5,
+     "в среднем 2.5+ голоса против за партию"),
+    ("💥", "Камикадзе", lambda s: s["first_out"] >= 3, "3+ раза вылетел(а) первым(ой)"),
+    ("☠️", "Смертник", lambda s: s["deaths"] >= 2, "2+ раза не вернулся(ась) с угрозы"),
+    ("🧓", "Ветеран", lambda s: s["games"] >= 20, "20+ партий"),
+    ("🐣", "Новичок", lambda s: s["games"] < 3, "меньше 3 партий"),
+]
+
+
+def titles(stats: dict) -> list[tuple[str, str, str]]:
+    """Звания игрока по его статистике: [(эмодзи, звание, за что)]."""
+    out = []
+    for emoji, name, cond, why in TITLES:
+        try:
+            if cond(stats):
+                out.append((emoji, name, why))
+        except (KeyError, ZeroDivisionError, TypeError):
+            continue
+    return out

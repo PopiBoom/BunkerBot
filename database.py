@@ -150,6 +150,12 @@ class Database:
                 )
                 """
             )
+            # Миграция: статистика Бункера для званий (серии, голоса против, угроза)
+            cur = await db.execute("PRAGMA table_info(bunker_stats)")
+            bcols = {r[1] for r in await cur.fetchall()}
+            for col in ("streak", "best_streak", "votes_against", "heroes", "deaths", "lucky"):
+                if col not in bcols:
+                    await db.execute(f"ALTER TABLE bunker_stats ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
             # Миграция: в старых базах у stickers нет описания и вида (стикер / гифка)
             cur = await db.execute("PRAGMA table_info(stickers)")
             cols = {r[1] for r in await cur.fetchall()}
@@ -572,28 +578,53 @@ class Database:
     # --- статистика Бункера ---
 
     async def record_bunker_game(self, results: list[dict]) -> None:
-        """results: [{user_id, name, survived: bool, first_out: bool}]"""
+        """results: [{user_id, name, survived, first_out, votes_against, hero, died, lucky}]
+
+        Серия выживаний: выжил — streak + 1, нет — 0; лучшая серия запоминается.
+        (В UPDATE SQLite все выражения видят старые значения строки.)
+        """
         async with aiosqlite.connect(self.path) as db:
             for r in results:
+                surv = int(bool(r["survived"]))
                 await db.execute(
-                    "INSERT INTO bunker_stats (user_id, name, games, survived, first_out) "
-                    "VALUES (?, ?, 1, ?, ?) "
-                    "ON CONFLICT(user_id) DO UPDATE SET name = excluded.name, "
-                    "games = games + 1, survived = survived + excluded.survived, "
-                    "first_out = first_out + excluded.first_out",
-                    (r["user_id"], r["name"], int(r["survived"]), int(r["first_out"])),
+                    "INSERT INTO bunker_stats (user_id, name, games, survived, first_out, streak, best_streak, "
+                    "votes_against, heroes, deaths, lucky) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET name = excluded.name, games = games + 1, "
+                    "survived = survived + excluded.survived, first_out = first_out + excluded.first_out, "
+                    "streak = CASE WHEN excluded.survived = 1 THEN streak + 1 ELSE 0 END, "
+                    "best_streak = MAX(best_streak, CASE WHEN excluded.survived = 1 THEN streak + 1 ELSE 0 END), "
+                    "votes_against = votes_against + excluded.votes_against, heroes = heroes + excluded.heroes, "
+                    "deaths = deaths + excluded.deaths, lucky = lucky + excluded.lucky",
+                    (r["user_id"], r["name"], surv, int(bool(r["first_out"])), surv, surv,
+                     int(r.get("votes_against", 0)), int(bool(r.get("hero"))), int(bool(r.get("died"))),
+                     int(bool(r.get("lucky")))),
                 )
             await db.commit()
 
-    async def bunker_top(self, limit: int = 10) -> list[tuple]:
-        """(name, games, survived, first_out), лучшие по выживаниям."""
+    _BUNKER_COLS = ("user_id", "name", "games", "survived", "first_out", "streak", "best_streak",
+                    "votes_against", "heroes", "deaths", "lucky")
+
+    async def bunker_top(self, limit: int = 10) -> list[dict]:
+        """Лучшие по выживаниям: [{name, games, survived, first_out, streak, best_streak, …}]."""
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
-                "SELECT name, games, survived, first_out FROM bunker_stats "
+                f"SELECT {', '.join(self._BUNKER_COLS)} FROM bunker_stats "
                 "ORDER BY survived DESC, games ASC LIMIT ?",
                 (limit,),
             )
-            return list(await cur.fetchall())
+            return [dict(zip(self._BUNKER_COLS, r)) for r in await cur.fetchall()]
+
+    async def bunker_profile(self, user_id: int) -> dict | None:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                f"SELECT {', '.join(self._BUNKER_COLS)} FROM bunker_stats WHERE user_id = ?", (user_id,))
+            row = await cur.fetchone()
+            if not row:
+                return None
+            prof = dict(zip(self._BUNKER_COLS, row))
+            cur = await db.execute("SELECT COUNT(*) FROM bunker_stats WHERE survived > ?", (prof["survived"],))
+            prof["place"] = int((await cur.fetchone())[0]) + 1
+            return prof
 
     # --- пользователи ---
 

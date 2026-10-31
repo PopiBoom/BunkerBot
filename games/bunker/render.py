@@ -14,6 +14,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 from .content import ACTIONS, ATTR_ICON, ATTRS
+from .icons import badge
 
 FONTS = Path(__file__).resolve().parents[2] / "assets" / "fonts"
 
@@ -181,7 +182,11 @@ def render_card_image(
     # Шапка
     d.text((PAD, 74), subtitle, font=_mono(30), fill=ACCENT)
     d.text((W - PAD, 74), f"№ {serial:04d}", font=_mono(30), fill=MUTED, anchor="ra")
-    name_lines = _wrap(probe, name, _bold(64), W - 2 * PAD, 1)
+    # значок персонажа справа в шапке: человек, камень, инопланетянин… (по «Данным»)
+    bsize = 140
+    mark = badge(card.get("bio", ""), bsize)
+    img.paste(mark, (W - PAD - bsize, 112), mark)
+    name_lines = _wrap(probe, name, _bold(64), W - 2 * PAD - bsize - 30, 1)
     d.text((PAD, 126), name_lines[0], font=_bold(64), fill=TEXT)
     d.text((PAD, 214), "ДОСЬЕ ВЫЖИВШЕГО · ХРАНИТЬ В ТАЙНЕ", font=_regular(22), fill=MUTED)
     d.line([(PAD, 262), (W - PAD, 262)], fill=LINE, width=3)
@@ -293,50 +298,79 @@ def render_bunker(bunker: str, players: int, spots: int, serial: int) -> bytes:
                    [(f"МЕСТ: {spots}", ACCENT), (f"ИГРОКОВ: {players}", TEXT)])
 
 
-# ---------- итоговая открытка ----------
+# ---------- финальные титры ----------
 
 
-def render_postcard(title: str, survivors: list[str], exiled: list[str], survived: bool,
-                    serial: int, date: str) -> bytes:
+def render_credits(title: str, survivors: list[dict], exiled: list[dict], nominations: list[tuple[str, str, str]],
+                   survived: bool, serial: int, date: str) -> bytes:
+    """Итоговая картинка партии.
+
+    survivors — [{name, card}], exiled — [{name, round, died}],
+    nominations — [(НАЗВАНИЕ, имя, пояснение)].
+    """
     w = 1000
     probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    name_f = _bold(40)
-    out_f = _regular(30)
-    surv_lines = sum(len(_wrap(probe, n, name_f, w - 2 * PAD - 60, 1)) for n in survivors)
-    out_text = ", ".join(exiled) or "—"
-    out_lines = _wrap(probe, out_text, out_f, w - 2 * PAD, 4)
-    h = 420 + 56 * surv_lines + 60 + 40 * len(out_lines) + 260
+    title_lines = _wrap(probe, title.upper(), _bold(54), w - 2 * PAD, 2)
+    row_h, out_h, nom_h = 132, 42, 150
+    verdict = ("ВЫЖИЛИ", GREEN) if survived else ("ПОГИБЛИ", RED)
+    layer = _stamp_layer(*verdict)
+    layer = layer.resize((int(layer.width * 0.75), int(layer.height * 0.75)), Image.LANCZOS)
+    h = (150 + 66 * len(title_lines) + 40
+         + 70 + row_h * len(survivors)
+         + (70 + out_h * len(exiled) if exiled else 0)
+         + (70 + (nom_h + 14) * len(nominations) if nominations else 0)
+         + layer.height + 60)  # снизу — место под печать, чтобы она ничего не закрывала
     img = _canvas(w, h, serial + 1)
     d = ImageDraw.Draw(img)
 
-    d.text((PAD, 74), f"БУНКЕР № {serial:04d}", font=_mono(30), fill=ACCENT)
+    d.text((PAD, 74), f"ТИТРЫ · БУНКЕР № {serial:04d}", font=_mono(30), fill=ACCENT)
     d.text((w - PAD, 74), date, font=_mono(30), fill=MUTED, anchor="ra")
-    y = 130
-    for line in _wrap(d, title.upper(), _bold(58), w - 2 * PAD, 2):
-        d.text((PAD, y), line, font=_bold(58), fill=TEXT)
-        y += 70
-    y += 20
+    y = 136
+    for line in title_lines:
+        d.text((PAD, y), line, font=_bold(54), fill=TEXT)
+        y += 66
+    y += 16
     d.line([(PAD, y), (w - PAD, y)], fill=LINE, width=3)
-    y += 40
+    y += 34
 
-    d.text((PAD, y), "В БУНКЕРЕ", font=_mono(30), fill=(52, 199, 89))
+    d.text((PAD, y), f"В БУНКЕРЕ · {len(survivors)}", font=_mono(30), fill=GREEN)
     y += 56
-    for n in survivors:
-        d.ellipse([PAD + 6, y + 14, PAD + 26, y + 34], fill=(52, 199, 89))
-        d.text((PAD + 50, y), _wrap(probe, n, name_f, w - 2 * PAD - 60, 1)[0], font=name_f, fill=TEXT)
-        y += 56
-    y += 30
-    d.text((PAD, y), "ЗА ДВЕРЬЮ", font=_mono(30), fill=RED)
-    y += 50
-    for line in out_lines:
-        d.text((PAD, y), line, font=out_f, fill=MUTED)
-        y += 40
+    text_x = PAD + 124
+    for p in survivors:
+        card = p.get("card") or {}
+        mark = badge(card.get("bio", ""), 100, ring=GREEN)
+        img.paste(mark, (PAD, y), mark)
+        d = ImageDraw.Draw(img)
+        d.text((text_x, y + 4), _wrap(probe, p["name"], _bold(40), w - text_x - PAD, 1)[0], font=_bold(40), fill=TEXT)
+        about = " · ".join(str(card.get(k, "")).strip() for k in ("profession", "bio") if card.get(k))
+        d.text((text_x, y + 58), _wrap(probe, about or "—", _regular(26), w - text_x - PAD, 1)[0],
+               font=_regular(26), fill=MUTED)
+        y += row_h
 
-    verdict = ("ВЫЖИЛИ", (52, 199, 89)) if survived else ("ПОГИБЛИ", RED)
-    layer = _stamp_layer(*verdict)
-    layer = layer.resize((int(layer.width * 0.8), int(layer.height * 0.8)), Image.LANCZOS)
+    if exiled:
+        y += 14
+        d.text((PAD, y), f"ЗА ДВЕРЬЮ · {len(exiled)}", font=_mono(30), fill=RED)
+        y += 56
+        for p in exiled:
+            how = "не вернулся(ась) с угрозы" if p.get("died") else "изгнан(а)"
+            line = f"{p['name']} — {how}" + (f", раунд {p['round']}" if p.get("round") else "")
+            d.text((PAD, y), _wrap(probe, line, _regular(28), w - 2 * PAD, 1)[0], font=_regular(28), fill=MUTED)
+            y += out_h
+
+    if nominations:
+        y += 14
+        d.text((PAD, y), "НОМИНАЦИИ", font=_mono(30), fill=ACCENT)
+        y += 56
+        for label, name, note in nominations:
+            d.rounded_rectangle([PAD, y, w - PAD, y + nom_h], radius=16, fill=PANEL, outline=LINE, width=2)
+            d.text((PAD + 24, y + 16), label.upper(), font=_mono(26), fill=ACCENT)
+            d.text((PAD + 24, y + 52), _wrap(probe, name, _bold(36), w - 2 * PAD - 48, 1)[0], font=_bold(36), fill=TEXT)
+            d.text((PAD + 24, y + 104), _wrap(probe, note, _regular(26), w - 2 * PAD - 48, 1)[0], font=_regular(26),
+                   fill=MUTED)
+            y += nom_h + 14
+
     out = img.convert("RGBA")
-    out.alpha_composite(layer, (w - layer.width - 20, h - layer.height - 50))
+    out.alpha_composite(layer, (w - layer.width - 20, h - layer.height - 46))
     return _png(out.convert("RGB"))
 
 

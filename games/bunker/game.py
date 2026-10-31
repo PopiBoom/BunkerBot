@@ -136,6 +136,8 @@ class Game:
     pick_event: asyncio.Event | None = None
     pending: set[str] = field(default_factory=set)
     first_out: int | None = None
+    round_votes: list[dict] = field(default_factory=list)  # по раундам: {"main": {кто: против кого}, "final": …, "out": id}
+    heroes: set[int] = field(default_factory=set)          # кто справился с угрозой
     serial: int = 0
     title: str = ""
     # угроза в середине игры
@@ -783,25 +785,64 @@ async def cmd_bunker_stop(message: Message) -> None:
 
 
 @router.message(Command("top", "bunker_top"))
-async def cmd_top(message: Message, db: Database) -> None:
+async def cmd_top(message: Message, command: CommandObject, db: Database) -> None:
+    """Рейтинг выживших со званиями; ответом на сообщение или /top @ник — профиль игрока."""
+    rt = message.reply_to_message
+    arg = (command.args or "").strip()
+    if rt and rt.from_user and not rt.from_user.is_bot:
+        await _bunker_profile(message, db, rt.from_user.id, rt.from_user.first_name or "Игрок")
+        return
+    if arg.startswith("@"):
+        found = await db.find_user(message.chat.id, arg.split()[0])
+        if not found:
+            await message.answer("Не знаю такого. Пусть сначала что-нибудь напишет в чат.")
+            return
+        await _bunker_profile(message, db, found[0], found[1] or arg)
+        return
+
     rows = await db.bunker_top(10)
     if not rows:
         await message.answer("🏆 Рейтинг пуст — сыграйте первую партию: /bunker")
         return
     medals = ["🥇", "🥈", "🥉"]
     blocks = [f"🏆 <b>РЕЙТИНГ ВЫЖИВШИХ</b>\n{HR}"]
-    for i, (name, games_n, surv, _first_out) in enumerate(rows):
+    for i, r in enumerate(rows):
         place = medals[i] if i < 3 else f"<b>{i + 1}.</b>"
-        rate = surv / games_n if games_n else 0
+        rate = r["survived"] / r["games"] if r["games"] else 0
         filled = round(rate * 10)
         bar = "▰" * filled + "▱" * (10 - filled)
+        ttl = C.titles(r)
+        streak = f" · 🔥 серия {r['streak']}" if r["streak"] >= 2 else ""
         blocks.append(
-            f"{place} <b>{_e(name)}</b>\n"
-            f"🏚 Выжил(а): <b>{surv}</b> из {games_n}\n"
-            f"<code>{bar}</code> {round(rate * 100)}%"
+            f"{place} <b>{_e(r['name'])}</b>"
+            + (f"\n🏅 {', '.join(f'{e} {n}' for e, n, _w in ttl[:3])}" if ttl else "")
+            + f"\n🏚 Выжил(а): <b>{r['survived']}</b> из {r['games']}{streak}"
+            f"\n<code>{bar}</code> {round(rate * 100)}%"
         )
-    blocks.append(f"{HR}\n🔁 Сыграть ещё: /bunker")
-    lines = ["\n\n".join(blocks)]
+    blocks.append(f"{HR}\n👤 Профиль игрока: ответь /top на его сообщение или /top @ник\n🔁 Сыграть ещё: /bunker")
+    await message.answer("\n\n".join(blocks))
+
+
+async def _bunker_profile(message: Message, db: Database, user_id: int, name: str) -> None:
+    prof = await db.bunker_profile(user_id)
+    if not prof or not prof["games"]:
+        await message.answer(f"🏚 {_e(name)} ещё не играл(а) в Бункер. /bunker — исправить.")
+        return
+    g = prof["games"]
+    rate = round(100 * prof["survived"] / g)
+    ttl = C.titles(prof)
+    lines = [f"👤 <b>{_e(prof['name'] or name)}</b> · БУНКЕР", HR, "",
+             f"🏆 Место в рейтинге: <b>{prof['place']}</b>",
+             f"🏚 Выжил(а): <b>{prof['survived']}</b> из {g} ({rate}%)",
+             f"🔥 Серия сейчас: <b>{prof['streak']}</b> · лучшая: <b>{prof['best_streak']}</b>",
+             f"💥 Вылетал(а) первым(ой): <b>{prof['first_out']}</b>",
+             f"🎯 Голосов против: <b>{prof['votes_against']}</b> (≈{prof['votes_against'] / g:.1f} за партию)",
+             f"🦸 Справился(ась) с угрозой: <b>{prof['heroes']}</b> · ☠️ не вернулся(ась): <b>{prof['deaths']}</b>",
+             f"🍀 Выжил(а) без голосов против: <b>{prof['lucky']}</b>"]
+    if ttl:
+        lines += ["", "🏅 <b>Звания</b>"] + [f"{e} <b>{n}</b> — {w}" for e, n, w in ttl]
+    else:
+        lines += ["", "🏅 Званий пока нет — играй ещё."]
     await message.answer("\n".join(lines))
 
 
@@ -1468,6 +1509,7 @@ async def _threat(bot: Bot, game: Game) -> bool:
         return True
 
     game.hero = p.user_id
+    game.heroes.add(p.user_id)
     text = f"🦸 <b>{_e(p.name)} справился(ась) и вернулся(ась)!</b>"
     if story:
         text += f"\n\n{_host(game, story)}"
@@ -1536,6 +1578,7 @@ async def _voting(bot: Bot, game: Game) -> None:
         return game.force_tally or not _is_active(game)
 
     note = ""
+    main_votes: dict[int, int] = {}
     for attempt in range(MAX_REVOTES + 1):
         game.revote = attempt
         game.votes = {}
@@ -1572,6 +1615,8 @@ async def _voting(bot: Bot, game: Game) -> None:
         if not _is_active(game):
             return
         game.stage = "closed"  # дальше голоса не принимаются и сообщение не «оживает»
+        if attempt == 0:
+            main_votes = dict(game.votes)  # для номинаций и званий: основное голосование раунда
         candidates, top = _pick_loser(game)
         logger.info(
             "vote chat=%s round=%s revote=%s votes=%s scores=%s immune=%s doubled=%s cursed=%s -> %s",
@@ -1604,7 +1649,10 @@ async def _voting(bot: Bot, game: Game) -> None:
         game.vote_targets = set(candidates)
 
     if _is_active(game):
-        await _tally(bot, game, game.players[random.choice(candidates)], note)
+        loser = game.players[random.choice(candidates)]
+        game.round_votes.append({"round": game.round_no, "main": main_votes, "final": dict(game.votes),
+                                 "out": loser.user_id})
+        await _tally(bot, game, loser, note)
 
 
 async def _start_speech(bot: Bot, game: Game, leaders: list[int]) -> None:
@@ -1741,6 +1789,46 @@ async def _tally(bot: Bot, game: Game, loser: Player, note: str = "") -> None:
 # ---------- финал ----------
 
 
+def _votes_against(game: Game) -> dict[int, int]:
+    """Сколько голосов против каждого собрал за партию (основные голосования раундов)."""
+    out: dict[int, int] = {}
+    for r in game.round_votes:
+        for target in r["main"].values():
+            out[target] = out.get(target, 0) + 1
+    return out
+
+
+def _nominations(game: Game, against: dict[int, int]) -> list[tuple[str, str, str]]:
+    """Номинации для титров: Мишень, Везунчик, Снайпер, Предатель, Герой."""
+    name = lambda uid: game.players[uid].name if uid in game.players else "?"  # noqa: E731
+    noms: list[tuple[str, str, str]] = []
+    if against:
+        uid, n = max(against.items(), key=lambda kv: kv[1])
+        noms.append(("Мишень", name(uid), f"{n} голос(а) против за игру"))
+    survivors = [p for p in _alive(game)]
+    lucky = [p for p in survivors if not against.get(p.user_id)]
+    if lucky and game.round_votes:
+        noms.append(("Везунчик", ", ".join(p.name for p in lucky[:2]), "ни одного голоса против"))
+    hits: dict[int, int] = {}
+    betray: dict[int, int] = {}
+    alive_ids = {p.user_id for p in survivors}
+    for r in game.round_votes:
+        for voter, target in r["final"].items():
+            if target == r["out"]:
+                hits[voter] = hits.get(voter, 0) + 1
+            if target in alive_ids:
+                betray[voter] = betray.get(voter, 0) + 1
+    if hits:
+        uid, n = max(hits.items(), key=lambda kv: kv[1])
+        noms.append(("Снайпер", name(uid), f"{n} раз(а) попал(а) в изгнанного"))
+    if betray:
+        uid, n = max(betray.items(), key=lambda kv: kv[1])
+        noms.append(("Предатель", name(uid), f"{n} раз(а) голосовал(а) против выживших"))
+    for uid in game.heroes:
+        noms.append(("Герой угрозы", name(uid), "справился(ась) и вернулся(ась)"))
+    return noms[:5]
+
+
 async def _finish(bot: Bot, game: Game) -> None:
     game.phase = "ended"
     survivors = _alive(game)
@@ -1792,18 +1880,23 @@ async def _finish(bot: Bot, game: Game) -> None:
     await _say(bot, game.chat_id,
                f"📖 <b>ЭПИЛОГ</b>\n{HR}\n\n{_quote(verdict['story'])}\n\n🏁 Вердикт: {result}", delay=5)
 
+    against = _votes_against(game)
     try:
         from datetime import date
+        exiled_info = [{"name": p.name, "round": p.out_round, "died": p.died}
+                       for p in sorted(exiled, key=lambda x: x.out_round or 0)]
         card = await asyncio.to_thread(
-            R.render_postcard, game.title, [p.name for p in survivors], [p.name for p in exiled],
-            bool(verdict["survived"]), game.serial, date.today().strftime("%d.%m.%Y"))
-        await _send_photo(bot, game.chat_id, card, "🖼 <b>Итоговая открытка партии</b>")
+            R.render_credits, game.title, [{"name": p.name, "card": p.card} for p in survivors], exiled_info,
+            _nominations(game, against), bool(verdict["survived"]), game.serial, date.today().strftime("%d.%m.%Y"))
+        await _send_photo(bot, game.chat_id, card, "🎬 <b>Титры партии</b>")
         await asyncio.sleep(3)
     except Exception as e:
         logger.warning("postcard failed: %s", e)
 
     results = [{"user_id": p.user_id, "name": p.name, "survived": p.alive,
-                "first_out": p.user_id == game.first_out}
+                "first_out": p.user_id == game.first_out, "votes_against": against.get(p.user_id, 0),
+                "hero": p.user_id in game.heroes, "died": p.died,
+                "lucky": p.alive and not against.get(p.user_id)}
                for p in game.players.values() if not p.is_bot]
 
     if game.db:
