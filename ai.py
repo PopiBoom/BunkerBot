@@ -1564,8 +1564,8 @@ async def _complete_openrouter(system: str, user: str, model: str, max_tokens: i
 
 async def complete_any(system: str, user: str, model: str, max_tokens: int = 8000, effort: str = "high") -> str:
     """Claude — через SDK Anthropic, всё с «/» в названии — через OpenRouter."""
-    if is_openrouter(model):
-        return await _complete_openrouter(system, user, model, max_tokens)
+    if is_openrouter(model):  # посты короткие: большой запас токенов там только мешает (и OpenRouter его резервирует)
+        return await _complete_openrouter(system, user, model, min(max_tokens, 4000))
     return await _complete(system, user, max_tokens=max_tokens, model=model, effort=effort)
 
 
