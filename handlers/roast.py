@@ -1044,7 +1044,10 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int, interval: int) -> No
     rows = await db.recent_messages(chat_id, limit=30)
     answered = _answered.get(chat_id, set())
     since = max(int(last), int(_last_bot_msg.get(chat_id, 0)))
-    new_ids = {r[0] for r in rows if r[4] >= since and r[0] not in answered and r[1] > 0}
+    # Отвечать можно только на живой текст: на «[фото]», «[стикер…]», «[переслано…]» здесь бот
+    # не видит самого содержимого и ответил бы мимо — по прошлым сообщениям. Они — только фон.
+    new_ids = {r[0] for r in rows if r[4] >= since and r[0] not in answered and r[1] > 0
+               and not str(r[3]).startswith("[")}
     if not new_ids:
         return
     await _remember_lines(db, chat_id)
