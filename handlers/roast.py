@@ -71,6 +71,10 @@ _RUDE = re.compile(
     re.IGNORECASE,
 )
 _SEND_OFF = re.compile(r"на\s*хуй|нахуй|\bнах\b|в\s*жоп|в\s*пизд", re.IGNORECASE)
+# Бате бот не грубит — даже если батя послал его первым
+FATHER_MIRRORS = ["Не могу, бать, кто ж тогда за чатом следить будет.", "Понял, ухожу… минут через пять.",
+                  "И я тебя люблю, батя.", "Бать, ты меня таким и собрал — сам виноват.",
+                  "Ладно-ладно, пап, не кипятись."]
 MIRRORS = ["Сам пошёл нахуй, {n}.", "Сам иди нахуй, {n} 🖕", "Только после тебя, {n}. Сам пошёл нахуй.",
            "{n}, сам пошёл нахуй — ты там уже как дома."]
 # Оскорбления в адрес человека (для «защиты бати»)
@@ -521,7 +525,7 @@ async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
         logger.warning("channel comment failed: %s", e)
         return
     if answer:
-        await _say_human(bot, chat_id, answer, reply_to=message.message_id)
+        await _say_human(bot, chat_id, ai.vary_father(answer), reply_to=message.message_id)
 
 
 # ---------- реакции на шутки бота: чему чат ставит 🔥, а чему 👎 ----------
@@ -816,7 +820,7 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
 
     if rude and _SEND_OFF.search(text):
         # Посылают — отвечаем зеркально, в лоб, а ИИ добавляет короткий подкол
-        answer = random.choice(MIRRORS).format(n="бать" if is_father else name)
+        answer = random.choice(FATHER_MIRRORS) if is_father else random.choice(MIRRORS).format(n=name)
         if ai.available():
             try:
                 jab = await ai.comeback(name, text, short=True, dossier=dossier, samples=samples, is_father=is_father)
@@ -828,7 +832,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
                         answer = full
             except Exception as e:
                 logger.warning("comeback failed: %s", e)
-        await _say_human(bot, chat_id, answer, reply_to=last_msg.message_id)
+        await _say_human(bot, chat_id, ai.vary_father(answer) if is_father else answer,
+                         reply_to=last_msg.message_id)
         if who:
             _thread.setdefault((chat_id, who.id), []).append(time.time())
         return
@@ -849,7 +854,9 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
         except Exception as e:
             logger.warning("bot reply failed: %s", e)
     if not answer and rude:
-        answer = random.choice(COMEBACKS)
+        answer = random.choice(FATHER_MIRRORS) if is_father else random.choice(COMEBACKS)
+    if answer and is_father:
+        answer = ai.vary_father(answer)
     if answer:
         await _say_human(bot, chat_id, answer, reply_to=last_msg.message_id)
         if who:
@@ -1169,7 +1176,7 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
         logger.warning("%s roast failed: %s", label, e)
         return
     if answer:
-        await _say_human(bot, chat_id, answer, reply_to=message.message_id)
+        await _say_human(bot, chat_id, ai.vary_father(answer) if is_father else answer, reply_to=message.message_id)
 
 
 # ---------- «Клоун дня» ----------

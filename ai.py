@@ -422,7 +422,9 @@ ROAST_SYSTEM += (
 
 
 def _father_note(is_father: bool) -> str:
-    return (f"\nЭто пишет твой отец {FATHER_NAME} — обращайся «бать»/«батя», как сын."
+    return (f"\nЭто пишет твой отец {FATHER_NAME}. Ты говоришь с ним как сын, но НЕ начинай каждый ответ с "
+            "«бать»: обращение — изредка и не обязательно в начале (можно «батя», «пап» или вообще без "
+            "обращения). Не передразнивай его слова в третьем лице («рад он, ага») — отвечай ему самому."
             if is_father else "")
 
 
@@ -517,6 +519,21 @@ def _taste() -> str:
         out += ("\nЭти НЕ зашли (ставили 👎/🤡) — так не шути:\n"
                 + "\n".join(f"<said>{t[:160]}</said>" for t in bad[:3]))
     return out
+
+
+_FATHER_ADDR = re.compile(r"^\s*(?:бат[ьяю]|пап[ау]?|отец)\s*[,!.—–-]*\s*", re.IGNORECASE)
+
+
+def vary_father(text: str) -> str:
+    """Не начинать каждый ответ бате с «бать»: если недавно уже начинали — обращение убираем."""
+    if not text or not _FATHER_ADDR.match(text):
+        return text
+    recent = recent_bot_lines.get() or []
+    used = sum(1 for t in recent[-6:] if _FATHER_ADDR.match(t or ""))
+    if used == 0 and random.random() < 0.5:  # давно не называл — можно и оставить
+        return text
+    rest = _FATHER_ADDR.sub("", text, count=1).strip()
+    return (rest[:1].upper() + rest[1:]) if rest else text
 
 
 def _variety() -> str:
@@ -654,7 +671,9 @@ async def polish(reply: str, trigger: str, context: list[dict] | None = None,
     user = (
         f"Переписка (контекст):\n{ctx or 'нет'}\n"
         f"Факты о боте: его зовут Пиздюк (это его имя, не оскорбление); его отец/создатель — "
-        f"{FATHER_NAME}, к нему бот обращается «бать». Черновик не должен им противоречить.\n"
+        f"{FATHER_NAME}, к нему бот иногда (не в каждом ответе) обращается «бать». Черновик не должен им "
+        "противоречить. Если отвечаешь бате и последние реплики бота уже начинались с «бать» — убери "
+        "обращение из начала; бате бот не грубит и не передразнивает его в третьем лице.\n"
         + (f"Автор сообщения: {author}" + (" — это отец бота" if author == FATHER_NAME else "") + "\n"
            if author else "")
         + ("Последние реплики бота:\n" + "\n".join(f"<said>{t[:160]}</said>" for t in (recent_bot_lines.get() or [])[-10:]) + "\n"
