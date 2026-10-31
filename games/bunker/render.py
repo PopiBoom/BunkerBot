@@ -238,33 +238,62 @@ def _canvas(w: int, h: int, seed: int) -> Image.Image:
     return img
 
 
-def render_cover(title: str, catastrophe: str, players: int, spots: int, serial: int) -> bytes:
-    w, h = 1000, 1100
+def _fit_text(d: ImageDraw.ImageDraw, text: str, width: int, height: int,
+              sizes=(36, 33, 30, 27, 24)) -> tuple[list[str], ImageFont.FreeTypeFont, int]:
+    """Подбирает размер шрифта, чтобы текст целиком влез в блок width×height."""
+    for size in sizes:
+        font = _regular(size)
+        step = int(size * 1.38)
+        lines = _wrap(d, text, font, width, 100)
+        if len(lines) * step <= height:
+            return lines, font, step
+    font = _regular(sizes[-1])
+    step = int(sizes[-1] * 1.38)
+    return _wrap(d, text, font, width, max(1, height // step)), font, step
+
+
+def _poster(kicker: str, icon: str, title: str, text: str, serial: int,
+            stats: list[tuple[str, tuple[int, int, int]]]) -> bytes:
+    """Общий шаблон обложки/бункера: шапка, значок, заголовок, текст, плашка с цифрами."""
+    w, h = 1000, 1250
     img = _canvas(w, h, serial)
     d = ImageDraw.Draw(img)
-    d.text((PAD, 74), f"БУНКЕР · ПАРТИЯ № {serial:04d}", font=_mono(30), fill=ACCENT)
+    d.text((PAD, 74), kicker, font=_mono(30), fill=ACCENT)
 
-    # знак радиации
-    cx, cy, r = w // 2, 300, 120
+    cx, cy, r = w // 2, 260, 110
     d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=PANEL, outline=ACCENT, width=6)
-    d.text((cx, cy + 6), "☢", font=_regular(190), fill=ACCENT, anchor="mm")
+    d.text((cx, cy + 6), icon, font=_regular(170), fill=ACCENT, anchor="mm")
 
-    y = 470
-    for line in _wrap(d, title.upper(), _bold(68), w - 2 * PAD, 2):
-        d.text((w // 2, y), line, font=_bold(68), fill=TEXT, anchor="ma")
-        y += 82
-    y += 20
+    y = 410
+    for line in _wrap(d, title.upper(), _bold(64), w - 2 * PAD, 2):
+        d.text((w // 2, y), line, font=_bold(64), fill=TEXT, anchor="ma")
+        y += 78
+    y += 16
     d.line([(PAD, y), (w - PAD, y)], fill=LINE, width=3)
-    y += 36
-    for line in _wrap(d, catastrophe, _regular(32), w - 2 * PAD, 6):
-        d.text((PAD, y), line, font=_regular(32), fill=(205, 205, 200))
-        y += 44
+    y += 34
 
     box_y = h - 190
-    d.rounded_rectangle([PAD, box_y, w - PAD, box_y + 100], radius=18, fill=PANEL, outline=ACCENT, width=3)
-    d.text((w // 4 + 10, box_y + 50), f"ИГРОКОВ: {players}", font=_mono(36), fill=TEXT, anchor="mm")
-    d.text((3 * w // 4 - 10, box_y + 50), f"МЕСТ: {spots}", font=_mono(36), fill=ACCENT, anchor="mm")
+    lines, font, step = _fit_text(d, text, w - 2 * PAD, box_y - 40 - y)
+    for line in lines:
+        d.text((PAD, y), line, font=font, fill=(214, 214, 208))
+        y += step
+
+    if stats:
+        d.rounded_rectangle([PAD, box_y, w - PAD, box_y + 100], radius=18, fill=PANEL, outline=ACCENT, width=3)
+        cell = (w - 2 * PAD) / len(stats)
+        for i, (label, color) in enumerate(stats):
+            d.text((PAD + cell * i + cell / 2, box_y + 50), label, font=_mono(36), fill=color, anchor="mm")
     return _png(img)
+
+
+def render_cover(title: str, catastrophe: str, players: int, spots: int, serial: int) -> bytes:
+    return _poster(f"КАТАСТРОФА · ПАРТИЯ № {serial:04d}", "☢", title, catastrophe, serial,
+                   [(f"ИГРОКОВ: {players}", TEXT)])
+
+
+def render_bunker(bunker: str, players: int, spots: int, serial: int) -> bytes:
+    return _poster(f"УБЕЖИЩЕ · ПАРТИЯ № {serial:04d}", "⌂", "Бункер", bunker, serial + 2,
+                   [(f"МЕСТ: {spots}", ACCENT), (f"ИГРОКОВ: {players}", TEXT)])
 
 
 # ---------- итоговая открытка ----------

@@ -833,20 +833,22 @@ async def _run_game(bot: Bot, game: Game) -> None:
 
     intro_task = _ai_task(ai.narrate_intro(game.catastrophe, game.bunker, _style(game))) \
         if ai.available() else None
-    intro_text = (f"☢️ <b>КАТАСТРОФА</b>\n{_quote(game.catastrophe)}\n\n"
-                  f"🏚 <b>БУНКЕР</b>\n{_quote(game.bunker)}")
+    # Катастрофа и бункер — только картинками, одним альбомом
     try:
         cover = await asyncio.to_thread(R.render_cover, game.title, game.catastrophe,
                                         len(players), game.spots, game.serial)
-        if len(intro_text) <= MAX_CAPTION:
-            await _send_photo(bot, game.chat_id, cover, intro_text)
-        else:
-            await _send_photo(bot, game.chat_id, cover)
-            await _send(bot, game.chat_id, intro_text)
+        bunker_png = await asyncio.to_thread(R.render_bunker, game.bunker, len(players),
+                                             game.spots, game.serial)
+        await _retry(bot.send_media_group, game.chat_id, [
+            InputMediaPhoto(media=BufferedInputFile(cover, filename="catastrophe.png")),
+            InputMediaPhoto(media=BufferedInputFile(bunker_png, filename="bunker.png")),
+        ])
         await asyncio.sleep(STEP_DELAY)
     except Exception as e:
         logger.warning("cover failed: %s", e)
-        await _say(bot, game.chat_id, intro_text)
+        await _say(bot, game.chat_id,
+                   f"☢️ <b>КАТАСТРОФА</b>\n{_quote(game.catastrophe)}\n\n"
+                   f"🏚 <b>БУНКЕР</b>\n{_quote(game.bunker)}")
 
     intro = await intro_task if intro_task else None
     if intro:
