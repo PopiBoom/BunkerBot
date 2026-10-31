@@ -429,7 +429,8 @@ FATHER_RUDE_CHANCE = 0.35
 def _father_mode() -> str:
     if father_rude.get():
         return ("В этот раз можешь нагрубить бате по-сыновьи: с матом, огрызнуться, послать, обозвать — "
-                "как наглый сын, который всё равно его любит.")
+                "как наглый сын, который всё равно его любит. Грубость простая и понятная, по его словам — "
+                "без выдуманных поручений и просьб («иди допиши мне…»), которых не было в переписке.")
     return "В этот раз — подъёб по-доброму, без мата в его адрес."
 
 
@@ -535,6 +536,46 @@ def _taste() -> str:
 
 
 _FATHER_ADDR = re.compile(r"^\s*(?:бат[ьяю]|пап[ау]?|отец)\s*[,!.—–-]*\s*", re.IGNORECASE)
+
+
+_PRON = {"он", "она", "оно", "они"}
+_FILLERS = {"ага", "угу", "как же", "ну да", "ну конечно", "конечно", "да-да", "ага-ага", "ну-ну", "щас", "ну"}
+_ADDR = re.compile(r"^(?:бат[ьяю]|пап[ау]?|отец)$", re.IGNORECASE)
+
+
+def _stems3(text: str) -> set[str]:
+    return {w[:4] if len(w) > 4 else w for w in re.findall(r"[а-яё]{3,}", (text or "").lower())} - _PRON
+
+
+def drop_echo(reply: str, trigger: str) -> str:
+    """Убирает передразнивание в начале: «любит он, ага, …», «рад он. …» — эхо слов собеседника
+    в третьем лице. Модель делает так упорно, несмотря на запрет, — поэтому чистим в коде."""
+    if not reply or not trigger:
+        return reply
+    parts = re.split(r"([,.!?;…—–]+\s*)", reply.strip())
+    clauses = [(parts[i], parts[i + 1] if i + 1 < len(parts) else "") for i in range(0, len(parts), 2)]
+    head: list[str] = []
+    i = 0
+    if clauses and _ADDR.match(clauses[0][0].strip()):  # «бать, любит он, ага, …» — обращение оставим
+        head.append(clauses[0][0].strip())
+        i = 1
+    if i >= len(clauses):
+        return reply
+    words = re.findall(r"[а-яё]+", clauses[i][0].lower())
+    is_echo = (0 < len(words) <= 4 and _PRON & set(words) and _stems3(clauses[i][0]) & _stems3(trigger))
+    if not is_echo:
+        return reply
+    i += 1
+    while i < len(clauses) and clauses[i][0].strip().lower() in _FILLERS:  # «…, ага, как же, …»
+        i += 1
+    rest = "".join(c + sep for c, sep in clauses[i:]).strip()
+    if len(rest.split()) < 3:  # без эха ничего не осталось — пусть лучше будет как было
+        return reply
+    if head:  # «Бать, сам меня…» — после обращения со строчной
+        out = ", ".join(head) + ", " + rest[:1].lower() + rest[1:]
+    else:
+        out = rest
+    return out[:1].upper() + out[1:]
 
 
 def vary_father(text: str) -> str:
@@ -718,6 +759,11 @@ async def polish(reply: str, trigger: str, context: list[dict] | None = None,
         "нет в переписке и не искажает сказанное (кто что сделал, заказал, сказал) — если черновик "
         "что-то перепутал, исправь по переписке, а если непонятно, о чём речь, сделай короткий "
         "подкол без фактов; реплики с именем «🤖 ты (бот)» — это прошлые ответы самого бота; "
+        "2б) прочитай черновик глазами участника чата, который знает только эту переписку: смысл КАЖДОЙ "
+        "фразы должен быть очевиден; фразу с непонятным смыслом или выдуманной просьбой, которой не было "
+        "в переписке (плохо: «иди и допиши мне выход») — перепиши простым понятным подколом; "
+        "2в) НЕ передразнивай собеседника его же словами в третьем лице («любит он, ага», «рад он») — "
+        "сразу отвечай ему по сути; "
         "3) нет бессмысленных метафор и сравнений: если смысл образа нельзя пересказать одной простой "
         "фразой (плохо: «у тебя в голове один пустой стакан, и тот мимо», «воздух доедаешь») — замени "
         "прямым подколом по факту из переписки; "
@@ -745,7 +791,7 @@ async def polish(reply: str, trigger: str, context: list[dict] | None = None,
         out = reply
     if _garbled(out):  # сбой модели вроде «еблаor» — лучше черновик, чем мусор
         out = "" if _garbled(reply) else reply
-    out = scrub(out)
+    out = scrub(drop_echo(out, trigger))
     if about_looks(out):  # шутка про внешность — одна попытка переписать, иначе молчим
         try:
             out = scrub(_clean_reply(await _complete(
