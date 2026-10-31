@@ -546,7 +546,7 @@ def _garbled(text: str) -> bool:
 
 async def polish(reply: str, trigger: str, context: list[dict] | None = None,
                  max_words: int = 15, author: str = "", about_photo: bool = False,
-                 long_form: bool = False, image: tuple[bytes, str] | None = None) -> str:
+                 long_form: bool = False, image: tuple[bytes, str] | None = None, seen: str = "") -> str:
     """Редактор: проверяет смысл и длину реплики. Возвращает исправленную реплику или "" (не слать)."""
     reply = (reply or "").strip()
     if not reply:
@@ -564,8 +564,10 @@ async def polish(reply: str, trigger: str, context: list[dict] | None = None,
            "с фото: всё, что видно на фото, — НЕ выдумка, оставляй. Шутка должна цеплять конкретное "
            "содержимое фото (еда, место, вещи, надписи, ситуация); если черновик мимо фото или "
            "назвал увиденное невнятно («что-то непонятное») — перепиши по тому, что на фото на самом "
-           "деле. Если черновик начинается с пересказа фото («X и Y. А дальше шутка») — убери пересказ, "
-           "оставь сразу шутку с деталью внутри: фото все видят. НЕ заменяй ответ общим подколом про то, что фото без подписи, и про подпись вообще "
+           "деле. Если черновик пересказывает фото — описывает, кто где сидит/стоит, что держит, какая "
+           "обстановка («Сеня, сидишь ночью на мокрой лавке с энергетиком, как будто…») — убери "
+           "пересказ, оставь сразу подкол с одной деталью внутри: фото все видят"
+           + (f" (на нём: «{seen}»)" if seen else "") + ". НЕ заменяй ответ общим подколом про то, что фото без подписи, и про подпись вообще "
            "не пиши. Переписка выше — только фон: ответ должен быть про ФОТО, а не про прошлые "
            "сообщения; не приписывай автору фото то, что в переписке делали или говорили другие. "
            "Нельзя шутить про внешность людей на фото.\n" if about_photo and image else
@@ -836,9 +838,70 @@ async def promise_reminder(name: str, what: str, original: str, dossier: str = "
 # ---------- стёб по фото ----------
 
 
+# Модели любят сначала «поставить сцену» — пересказать фото, а потом шутить. В чате это звучит тупо:
+# фото все и так видят. Правило + пример ровно того ответа, на который жаловались.
+_NO_RETELL = (
+    "\n{seen}Твоя реплика — реакция ПОСЛЕ того, как все это увидели: НЕ описывай, кто где сидит, стоит, "
+    "что держит, какая обстановка, время суток, погода. Сразу подкол или вывод. Деталь фото — максимум "
+    "одна и одним-двумя словами внутри шутки.\n"
+    "ПЛОХО (пересказ + вывод): «Сеня, сидишь ночью на мокрой лавке с банкой энергетика, как будто жизнь "
+    "удалась». ПЛОХО: «Сеня, фиолетовая лента под потолком и бетонная стена. Это студия?»\n"
+    "Так — шутка без пересказа, с одной деталью внутри."
+)
+
+
+_SEEN_STOP = {"этот", "этой", "котор", "рядо", "справ", "слев", "центр", "фоне", "видн", "изоб", "фото",
+              "сним", "кадр", "тако", "всег", "оччень", "очен", "нахо", "стои", "над", "можн"}
+
+
+def _stems(text: str) -> set[str]:
+    return {w[:4] for w in re.findall(r"[а-яё]{4,}", (text or "").lower())} - _SEEN_STOP
+
+
+def retell_score(reply: str, seen: str) -> int:
+    """Сколько корней из описания фото повторено в ответе (пересказ того, что все и так видят)."""
+    if not reply or not seen:
+        return 0
+    return len(_stems(reply) & _stems(seen))
+
+
+def retells(reply: str, seen: str, max_shared: int = 1) -> bool:
+    """Ответ «ставит сцену»: тащит из описания фото больше одной детали."""
+    return retell_score(reply, seen) > max_shared
+
+
+async def drop_retell(reply: str, seen: str, author: str = "", max_words: int = 15, tries: int = 2) -> str:
+    """Переписывает ответ, который пересказывает фото, в чистый подкол (до tries попыток, берём лучший)."""
+    father = author == FATHER_NAME
+    words = sorted({w for w in re.findall(r"[а-яё]{4,}", seen.lower()) if w[:4] not in _SEEN_STOP})
+    best, best_score = reply, retell_score(reply, seen)
+    for _ in range(tries):
+        user = (
+            f"На фото (все в чате это видят): «{seen}».\n"
+            f"Реплика бота про это фото: <draft>{best[:600]}</draft>\n"
+            "Она пересказывает, что на фото («сидишь ночью на лавке с энергетиком…», «закат с лодочкой…»), "
+            "и только потом шутит — в чате это звучит тупо, фото все видят. Перепиши в чистый подкол или "
+            "вывод: НЕ ставь сцену, НЕ перечисляй, что на фото. Слова из описания фото (и их формы) НЕ "
+            f"используй, максимум ОДНО: {', '.join(words)}.\n"
+            f"Тон, обращение и мат сохрани, до {max_words} слов, разговорно, смешно и понятно."
+            + (f" Автор фото — твой отец {FATHER_NAME}: обращайся «бать», без мата, не оскорбляй и не обзывай."
+               if father else "")
+            + _JSON_REPLY
+        )
+        out = _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, model=EDIT_MODEL))
+        if not out:
+            continue
+        score = retell_score(out, seen)
+        if score < best_score:
+            best, best_score = out, score
+        if score <= 1:
+            break
+    return best
+
+
 async def roast_photo(image: bytes, mime: str, name: str, caption: str = "", is_father: bool = False,
                       samples: list[str] | None = None, forwarded_from: str | None = None,
-                      count: int = 1, father_channel: bool = False) -> str:
+                      count: int = 1, father_channel: bool = False, seen: str = "") -> str:
     what = f"альбом из {count} фото (ты видишь первое)" if count > 1 else "фото"
     if father_channel:
         head = f"«{name}» переслал(а) в чат {what} из канала бати {FATHER_NAME} — это батин пост"
@@ -859,6 +922,7 @@ async def roast_photo(image: bytes, mime: str, name: str, caption: str = "", is_
         "манеры ниже — не тема ответа. СТРОГО НЕЛЬЗЯ шутить про внешность людей на фото "
         "(лицо, тело, вес, кожа, причёска) — если на фото человек, шути про ситуацию, а не про него. "
         "Если на фото непонятно что — так и съязви."
+        + _NO_RETELL.format(seen=f"Все в чате уже видят на фото: «{seen}». " if seen else "")
         + (_father_note(is_father) if not forwarded_from else
            (f"\nПереслал это твой отец {FATHER_NAME} — к нему «бать», но пост не его." if is_father else ""))
         + _voice(samples) + _JSON_REPLY
@@ -947,11 +1011,16 @@ async def channel_comment(channel: str, text: str, media: str = "", image: tuple
         '{"seen": "что на картинке, 1 предложение, по фактам", "text": "<только сама реплика>"}'
     )
     out = await _complete(ROAST_SYSTEM, user, max_tokens=2000, model=EDIT_MODEL, image=image)
+    seen = ""
     try:
-        logger.info("пост канала, на картинке: %s", str(_extract_json(out).get("seen") or "?")[:200])
+        seen = str(_extract_json(out).get("seen") or "")
+        logger.info("пост канала, на картинке: %s", seen[:200] or "?")
     except Exception:
         pass
-    return _clean_reply(out)
+    text = _clean_reply(out)
+    if text and retells(text, seen):  # «закат с корабликом, а ты…» — пересказ, переписываем
+        text = await drop_retell(text, seen, FATHER_NAME, max_words=25)
+    return text
 
 
 # ---------- стикеры ----------

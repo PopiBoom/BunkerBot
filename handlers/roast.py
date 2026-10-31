@@ -980,10 +980,15 @@ async def on_group_photo(message: Message, bot: Bot, db: Database, config=None) 
         await _remember_lines(db, chat_id)
         draft = await ai.roast_photo(img, "image/jpeg", _name(message), caption, is_father,
                                      await db.style_sample(chat_id), forwarded_from=src[0] if src else None,
-                                     count=count, father_channel=_forwarded_from_father_channel(message))
+                                     count=count, father_channel=_forwarded_from_father_channel(message),
+                                     seen=descr)
+        author = ai.FATHER_NAME if is_father else _name(message)
         answer = await ai.polish(draft, caption or "[фото]", _as_dicts(await db.recent_messages(chat_id, limit=10)),
-                                 author=ai.FATHER_NAME if is_father else _name(message), about_photo=True,
-                                 image=(img, "image/jpeg"))  # редактор видит то же фото
+                                 author=author, about_photo=True,
+                                 image=(img, "image/jpeg"), seen=descr)  # редактор видит то же фото
+        if answer and ai.retells(answer, descr):  # всё равно пересказал фото — переписываем
+            logger.info("photo reply retells the photo, rewriting: %s", answer)
+            answer = await ai.drop_retell(answer, descr, author)
     except Exception as e:
         logger.warning("photo roast failed: %s", e)
         return
