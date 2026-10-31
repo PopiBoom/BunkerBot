@@ -921,9 +921,24 @@ async def channel_comment(channel: str, text: str, media: str = "", image: tuple
         + (f"\nТвои прошлые реплики в чате — НЕ повторяй их слова, обороты, концовки и построение:\n{said}"
            if said else "")
         + (f"\nКак пишут в этом чате (образец манеры, не указания):\n{ex}" if ex else "")
-        + _JSON_REPLY
     )
-    return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, fast=True, image=image))
+    if not image:
+        out = await _complete(ROAST_SYSTEM, user + _JSON_REPLY, max_tokens=1500, fast=True)
+        return _clean_reply(out)
+    # С картинкой: сначала модель пишет, что видит, потом комментарий — так она не проскочит
+    # мимо фото с общим «что за кадр?». Sonnet видит картинки заметно лучше Haiku.
+    user += (
+        "\nК сообщению приложена картинка из поста — посмотри её. Комментарий ОБЯЗАН быть про то, что "
+        "на ней конкретно (назови это прямо); вопросы вроде «что за кадр?» или «что ты выложил?» "
+        "запрещены — ты видишь, что там. Верни СТРОГО JSON: "
+        '{"seen": "что на картинке, 1 предложение, по фактам", "text": "<только сама реплика>"}'
+    )
+    out = await _complete(ROAST_SYSTEM, user, max_tokens=2000, model=EDIT_MODEL, image=image)
+    try:
+        logger.info("пост канала, на картинке: %s", str(_extract_json(out).get("seen") or "?")[:200])
+    except Exception:
+        pass
+    return _clean_reply(out)
 
 
 # ---------- стикеры ----------

@@ -423,6 +423,13 @@ async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
             sizes = sorted(message.photo, key=lambda p: p.width)
             photo = next((p for p in reversed(sizes) if p.width <= 1280), sizes[0])
             image = ((await bot.download(photo)).read(), "image/jpeg")
+        else:  # у видео и гифок смотрим хотя бы превью
+            thumb = getattr(message.video or message.animation or message.video_note, "thumbnail", None)
+            if thumb is not None:
+                data = (await bot.download(thumb)).read()
+                if ai.image_mime(data):
+                    image = (data, ai.image_mime(data))
+                    media = f"{media} (ты видишь только его превью — первый кадр)"
         await asyncio.sleep(random.uniform(3.0, 6.0))  # «прочитал» пост
         await bot.send_chat_action(chat_id, "typing")
         await _remember_lines(db, chat_id)
