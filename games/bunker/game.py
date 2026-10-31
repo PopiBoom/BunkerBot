@@ -81,6 +81,7 @@ class Player:
     serial: int = 0
     out_round: int | None = None
     died: bool = False  # погиб на угрозе, а не изгнан голосованием
+    is_bot: bool = False  # тестовый бот (/bunker_bots): ходит и голосует сам
 
 
 @dataclass
@@ -292,9 +293,16 @@ def _cut(s, n: int) -> str:
 
 
 def _mention(p: Player) -> str:
+    if p.is_bot:
+        return f"<b>{_e(p.name)}</b>"
     if p.username:
         return f"@{p.username}"
     return f'<a href="tg://user?id={p.user_id}">{_e(p.name)}</a>'
+
+
+def _names(names: list[str], last: str = " и ") -> str:
+    """«A», «A и B», «A, B и C»."""
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + last + names[-1]
 
 
 def _quote(text: str) -> str:
@@ -350,7 +358,7 @@ def _lobby_text(game: Game) -> str:
              f"🎭 Ведущий: {_mode_title(game)}", ""]
     for p in game.players.values():
         host = " 👑" if p.user_id == game.host_id else ""
-        dm = "" if p.dm_ok else " <i>(не открыл бота)</i>"
+        dm = "" if p.dm_ok or p.is_bot else " <i>(не открыл бота)</i>"
         lines.append(f"• {_e(p.name)}{host}{dm}")
     lines += [
         "",
@@ -496,7 +504,7 @@ def _bars(game: Game) -> str:
 def _vote_text(game: Game) -> str:
     alive = _alive(game)
     if game.revote:
-        names = " или ".join(f"<b>{_e(game.players[u].name)}</b>" for u in game.vote_targets)
+        names = _names([f"<b>{_e(game.players[u].name)}</b>" for u in game.vote_targets], " или ")
         lines = [f"⚖️ <b>ПЕРЕГОЛОСОВАНИЕ · раунд {game.round_no}</b>", HR, "",
                  f"Ничья! Выбираем только между: {names}", ""]
     else:
@@ -554,7 +562,11 @@ async def cmd_bunker(message: Message, command: CommandObject, db: Database) -> 
 
     game = Game(chat_id=chat_id, host_id=user.id, db=db)
     arg = (command.args or "").strip().lower()
-    game.mode = C.MODE_ALIASES.get(arg, game.mode)
+    saved = await db.get_setting(_mode_key(chat_id), "classic")
+    game.mode = saved if saved in C.MODES else "classic"
+    if arg in C.MODE_ALIASES:
+        game.mode = C.MODE_ALIASES[arg]
+        await db.set_setting(_mode_key(chat_id), game.mode)
     try:
         game.bot_username = (await message.bot.me()).username or ""
     except Exception:
@@ -614,6 +626,81 @@ async def cmd_deeplink_join(message: Message, command: CommandObject) -> None:
     except Exception:
         pass
     await _edit(message.bot, game.chat_id, game.lobby_msg_id, _lobby_text(game), _lobby_kb(game))
+
+
+def _mode_key(chat_id: int) -> str:
+    return f"bunker_mode:{chat_id}"
+
+
+# ---------- тестовые боты (временно) ----------
+
+BOT_NAMES = ["🤖 Валера", "🤖 Зинаида", "🤖 Геннадий", "🤖 Снежана", "🤖 Аркадий", "🤖 Люська"]
+
+
+@router.message(Command("bunker_bots"))
+async def cmd_bunker_bots(message: Message, command: CommandObject) -> None:
+    """Добавить в лобби тестовых ботов: /bunker_bots [сколько, по умолчанию 3]."""
+    game = games.get(message.chat.id)
+    if not game or game.phase != "lobby":
+        await message.answer("Сначала создайте лобби: /bunker")
+        return
+    if message.from_user and message.from_user.id != game.host_id:
+        await message.answer("Добавлять ботов может только ведущий.")
+        return
+    try:
+        n = max(1, min(6, int((command.args or "3").strip())))
+    except ValueError:
+        n = 3
+    added = []
+    existing = sum(1 for p in game.players.values() if p.is_bot)
+    for i in range(n):
+        if len(game.players) >= MAX_PLAYERS:
+            break
+        uid = -(existing + i + 1)  # отрицательные id — точно не настоящие люди
+        name = _unique_name(game, BOT_NAMES[(existing + i) % len(BOT_NAMES)])
+        game.players[uid] = Player(user_id=uid, name=name, is_bot=True)
+        added.append(name)
+    await message.answer("➕ В бункер спускаются тестовые боты: " + ", ".join(_e(a) for a in added))
+    await _edit(message.bot, game.chat_id, game.lobby_msg_id, _lobby_text(game), _lobby_kb(game))
+
+
+def _bots(game: Game) -> list[Player]:
+    return [p for p in _alive(game) if p.is_bot]
+
+
+async def _bots_vote(bot: Bot, game: Game, threat: bool = False) -> None:
+    """Боты голосуют со случайной задержкой, как живые."""
+    revote = game.revote
+    for p in random.sample(_bots(game), len(_bots(game))):
+        await asyncio.sleep(random.uniform(2, 6))
+        if not _is_active(game) or game.phase != ("threat" if threat else "voting") or not p.alive:
+            return
+        if threat:
+            targets = [o.user_id for o in _alive(game)]
+            game.threat_votes[p.user_id] = random.choice(targets)
+            _schedule(bot, game, "threat", lambda: _edit(bot, game.chat_id, game.threat_msg_id,
+                                                         _threat_text(game), _threat_kb(game)))
+            if len(game.threat_votes) >= len(_alive(game)) and game.advance:
+                game.advance.set()
+            continue
+        if game.revote != revote:
+            return
+        targets = [u for u in (game.vote_targets or {o.user_id for o in _alive(game)}) if u != p.user_id]
+        if not targets:
+            continue
+        game.votes[p.user_id] = random.choice(targets)
+        _schedule(bot, game, "vote", lambda: _refresh_vote(bot, game))
+        if game.stage in ("open", "revote") and len(game.votes) >= len(_alive(game)) and game.advance:
+            game.advance.set()
+
+
+async def _bot_speech(bot: Bot, game: Game, p: Player) -> None:
+    await asyncio.sleep(random.uniform(3, 10))
+    if game.stage != "speech" or p.user_id not in game.speakers:
+        return
+    line = random.choice(C.BOT_SPEECHES)
+    game.speakers[p.user_id].append(line)
+    await _send(bot, game.chat_id, f"🎤 <b>{_e(p.name)}:</b> «{_e(line)}»")
 
 
 @router.message(Command("bunker_stop"))
@@ -676,6 +763,8 @@ async def cb_mode(call: CallbackQuery) -> None:
         return
     i = C.MODE_ORDER.index(game.mode) if game.mode in C.MODE_ORDER else 0
     game.mode = C.MODE_ORDER[(i + 1) % len(C.MODE_ORDER)]
+    if game.db:
+        await game.db.set_setting(_mode_key(game.chat_id), game.mode)  # запомним на следующие партии
     await call.answer(f"Ведущий: {_mode_title(game)}")
     await _edit(call.bot, game.chat_id, game.lobby_msg_id, _lobby_text(game), _lobby_kb(game))
 
@@ -816,6 +905,8 @@ async def _run_game(bot: Bot, game: Game) -> None:
     # Карточки-картинки — в личку
     no_dm = []
     for p in players:
+        if p.is_bot:
+            continue
         try:
             png = await _render(p, game, action=p.action)
             kb = InlineKeyboardBuilder()
@@ -957,6 +1048,11 @@ def _turn_text(p: Player, left: int) -> str:
 async def _turn(bot: Bot, game: Game, p: Player, remaining: list[str]) -> None:
     game.current_picker = p.user_id
     game.pick_event = asyncio.Event()
+
+    if p.is_bot:
+        await asyncio.sleep(random.uniform(2, 4))
+        await _reveal_attr(bot, game, p, random.choice(remaining), auto=False)
+        return
 
     if p.dm_ok:
         try:
@@ -1248,6 +1344,8 @@ async def _threat(bot: Bot, game: Game) -> bool:
     game.threat_chances = await _threat_chances(game)
     msg = await _send(bot, game.chat_id, _threat_text(game), reply_markup=_threat_kb(game))
     game.threat_msg_id = msg.message_id
+    if _bots(game):
+        _launch(bot, game, _bots_vote(bot, game, threat=True), fatal=False)
     try:
         await asyncio.wait_for(game.advance.wait(), timeout=THREAT_VOTE)
     except asyncio.TimeoutError:
@@ -1369,6 +1467,8 @@ async def _voting(bot: Bot, game: Game) -> None:
         game.advance = asyncio.Event()
         msg = await _say(bot, game.chat_id, _vote_text(game), delay=0, reply_markup=_vote_kb(game))
         game.vote_msg_id = msg.message_id
+        if _bots(game):
+            _launch(bot, game, _bots_vote(bot, game), fatal=False)
 
         if attempt == 0:
             # Напоминание тем, у кого есть карта «для голосования»
@@ -1402,7 +1502,7 @@ async def _voting(bot: Bot, game: Game) -> None:
         if attempt == MAX_REVOTES:
             note = " (снова ничья — решил жребий)"
             break
-        names = " и ".join(f"<b>{_e(game.players[u].name)}</b>" for u in candidates)
+        names = _names([f"<b>{_e(game.players[u].name)}</b>" for u in candidates])
         await _send(bot, game.chat_id, f"⚖️ <b>Ничья!</b> У {names} поровну голосов.\n\n"
                                        f"Переголосование — только между ними 👇")
         game.vote_targets = set(candidates)
@@ -1422,6 +1522,9 @@ async def _start_speech(bot: Bot, game: Game) -> None:
     note = "" if any(scores[u] > 0 for u in leaders) else "Голосов пока нет — ведущий сам выбрал подозреваемых. "
     game.speakers = {u: [] for u in leaders}
     game.stage = "speech"
+    for u in leaders:
+        if game.players[u].is_bot:
+            _launch(bot, game, _bot_speech(bot, game, game.players[u]), fatal=False)
     who = " и ".join(_mention(game.players[u]) for u in leaders)
     await _send(bot, game.chat_id,
                 f"🎤 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n{HR}\n\n"
@@ -1604,7 +1707,7 @@ async def _finish(bot: Bot, game: Game) -> None:
 
     results = [{"user_id": p.user_id, "name": p.name, "survived": p.alive,
                 "first_out": p.user_id == game.first_out, "goal_done": False}
-               for p in game.players.values()]
+               for p in game.players.values() if not p.is_bot]
 
     if game.db:
         try:

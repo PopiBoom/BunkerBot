@@ -37,6 +37,7 @@ async def set_commands(bot: Bot, config) -> None:
     group = [
         BotCommand(command="bunker", description="Начать «Бункер» (можно: /bunker злой, добрый, кринж)"),
         BotCommand(command="bunker_stop", description="Остановить игру (только ведущий)"),
+        BotCommand(command="bunker_bots", description="Добавить в лобби тестовых ботов (временно)"),
         BotCommand(command="top", description="Рейтинг выживших"),
     ]
     admin = private + [BotCommand(command="admin", description="Панель администратора")]
