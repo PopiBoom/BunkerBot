@@ -597,6 +597,8 @@ async def update_dossier(name: str, old: str, new_messages: list[str]) -> str:
         "Верни только текст досье."
     )
     text = await _complete(ROAST_SYSTEM, user, max_tokens=3000, fast=True)
+    # модель иногда сама оборачивает ответ в <dossier>…</dossier> — теги не храним
+    text = re.sub(r"</?dossier[^>]*>", "", text)
     return text.strip()[:900]
 
 
