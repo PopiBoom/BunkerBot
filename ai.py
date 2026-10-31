@@ -428,21 +428,27 @@ async def roast_auto(messages: list[dict], dossiers: dict[str, str], new_ids: se
     return {"reply_to": data.get("reply_to"), "text": str(data.get("text") or "").strip()}
 
 
-async def comeback(name: str, text: str, short: bool = False) -> str:
+async def comeback(name: str, text: str, short: bool = False, dossier: str = "") -> str:
     """Дерзкий ответ тому, кто нагрубил боту. short=True — одна добивающая фраза после «сам пошёл»."""
     if short:
-        task = ("Ты уже ответил ему «сам пошёл нахуй». Добавь ОДНУ короткую дерзкую добивку "
-                "(до 15 слов), можно с матом, без повторения «пошёл нахуй».")
+        task = ("Ты уже ответил ему «сам пошёл нахуй». Добавь ОДНУ короткую злую и смешную "
+                "добивку (до 15 слов), можно с матом, без повторения «пошёл нахуй». Лучше всего — "
+                "уколи его конкретным фактом из досье (обещание, противоречие, хвастовство); "
+                "если досье пустое — подколи сам факт, что он ругается на бота.")
     else:
         task = ("Ответь ему одной-двумя короткими дерзкими фразами в тон, с матом, не смягчай. "
                 "Без угроз и без запрещённых тем.")
-    user = (f"Участник «{name}» нагрубил тебе: <msg>{text[:300]}</msg>\n{task}\n"
+    user = (f"Участник «{name}» нагрубил тебе: <msg>{text[:300]}</msg>\n"
+            f"<dossier>{dossier or 'пусто'}</dossier>\n{task}\n"
             "Верни ТОЛЬКО сам ответ — без пояснений, кавычек и вариантов.")
     out = await _complete(ROAST_SYSTEM, user, max_tokens=1500, fast=True)
     if short:  # страховка: одна строка, без «вот вариант:» и т.п.
         lines = [ln.strip().strip("«»\"") for ln in out.splitlines() if ln.strip()]
         lines = [ln for ln in lines if not ln.endswith(":")]
         out = lines[0] if lines else ""
+    # служебные метки в начале: «Ответ:», «Добивка —», «Вариант 1:»
+    out = re.sub(r"^\s*(ответ|добивка|вариант|реплика|фраза)\s*\d*\s*[:\-—–]\s*", "", out.strip(),
+                 flags=re.IGNORECASE).strip().strip("«»\"")
     return out
 
 

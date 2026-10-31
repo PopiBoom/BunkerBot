@@ -34,7 +34,7 @@ router.message.filter(F.chat.type.in_({"group", "supergroup"}))
 ENABLED_KEY = "roast_enabled"
 KEEP_DAYS = 30                 # сколько хранить сырые сообщения
 INTERVAL_KEY = "roast_interval"  # как часто бот может сам встревать (сек, 0 — никогда)
-DEFAULT_INTERVAL = 90 * 60
+DEFAULT_INTERVAL = 5 * 60
 # (секунды, подпись, сколько новых сообщений нужно, чтобы был повод встрять)
 INTERVALS = [
     (10, "10 сек", 1), (60, "1 мин", 2), (5 * 60, "5 мин", 3), (15 * 60, "15 мин", 5),
@@ -262,7 +262,8 @@ async def on_group_message(message: Message, bot: Bot, db: Database) -> None:
         answer = random.choice(MIRRORS).format(n=_name(message))
         if ai.available():
             try:
-                jab = await ai.comeback(_name(message), text, short=True)
+                dossier = await db.get_dossier(chat_id, user.id)
+                jab = await ai.comeback(_name(message), text, short=True, dossier=dossier)
                 if jab:
                     answer = f"{answer}\n\n{jab}"
             except Exception as e:
@@ -272,7 +273,7 @@ async def on_group_message(message: Message, bot: Bot, db: Database) -> None:
     if ai.available():
         try:
             if rude:
-                answer = await ai.comeback(_name(message), text)
+                answer = await ai.comeback(_name(message), text, dossier=await db.get_dossier(chat_id, user.id))
             else:
                 ctx = await db.recent_messages(chat_id, limit=12)
                 answer = await ai.banter(_name(message), text, _as_dicts(ctx))

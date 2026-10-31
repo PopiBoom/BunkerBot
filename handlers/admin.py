@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
@@ -20,6 +21,7 @@ from keyboards import (
 )
 
 router = Router(name="admin")
+logger = logging.getLogger("admin")
 # Админка — только в личке, чтобы не светить панель и рассылку в группах.
 router.message.filter(F.chat.type == "private")
 
@@ -95,13 +97,16 @@ async def admin_roast_freq(call: CallbackQuery, db: Database, config: Config) ->
     current = await get_interval(db)
     await call.answer()
     if call.message:
-        await call.message.answer(
-            f"⏱ <b>Как часто стёб-бот сам встревает в разговор</b>\n\n"
-            f"Сейчас: <b>{interval_label(current)}</b>\n\n"
-            "Бот встревает, только если с прошлого раза в чате появились новые сообщения: "
-            "чем чаще интервал, тем меньше их нужно. На ответы на грубость и обращения это не влияет.",
-            reply_markup=roast_interval_keyboard(current),
-        )
+        await call.message.answer(_freq_text(interval_label(current)), reply_markup=roast_interval_keyboard(current))
+
+
+def _freq_text(label: str) -> str:
+    return (
+        f"⏱ <b>Как часто стёб-бот сам встревает в разговор</b>\n\n"
+        f"Сейчас: <b>{label}</b>\n\n"
+        "Бот встревает, только если с прошлого раза в чате появились новые сообщения: "
+        "чем чаще интервал, тем меньше их нужно. На ответы на грубость и обращения это не влияет."
+    )
 
 
 @router.callback_query(F.data.startswith("admin:roast_freq:"))
@@ -123,10 +128,10 @@ async def admin_roast_freq_set(call: CallbackQuery, db: Database, config: Config
     await db.set_setting(INTERVAL_KEY, str(sec))
     await call.answer(f"Готово: {interval_label(sec)}")
     if call.message:
-        try:
-            await call.message.edit_reply_markup(reply_markup=roast_interval_keyboard(sec))
-        except Exception:
-            pass
+        try:  # обновляем и текст «Сейчас: …», и галочку
+            await call.message.edit_text(_freq_text(interval_label(sec)), reply_markup=roast_interval_keyboard(sec))
+        except Exception as e:
+            logger.warning("interval menu edit failed: %s", e)
 
 
 @router.callback_query(F.data == "admin:ai_costs")
