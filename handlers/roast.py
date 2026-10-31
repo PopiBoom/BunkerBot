@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import os
 import random
 import re
 import time
@@ -235,7 +236,7 @@ async def cmd_week(message: Message, bot: Bot, db: Database) -> None:
 
 
 @router.message(F.text & ~F.text.startswith("/"))
-async def on_group_message(message: Message, bot: Bot, db: Database) -> None:
+async def on_group_message(message: Message, bot: Bot, db: Database, config=None) -> None:
     user = message.from_user
     if user is None or user.is_bot or not message.text:
         return
@@ -275,12 +276,13 @@ async def on_group_message(message: Message, bot: Bot, db: Database) -> None:
         except Exception:
             pass
         items = _pending[chat_id]["items"]
-        await _reply_once(bot, db, chat_id, items)
+        await _reply_once(bot, db, chat_id, items, config)
     finally:
         _pending.pop(chat_id, None)
 
 
-async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Message, bool]]) -> None:
+async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Message, bool]],
+                      config=None) -> None:
     last_msg, _ = items[-1]
     who = last_msg.from_user
     name = _name(last_msg)
@@ -288,14 +290,17 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     text = "\n".join(texts) or (last_msg.text or "")
     rude = any(r for m, r in items if m.from_user and who and m.from_user.id == who.id)
     samples = await db.style_sample(chat_id)
+    # «Отец» бота — первый админ из .env (или BOT_FATHER_ID)
+    father_id = int(os.getenv("BOT_FATHER_ID", "0") or 0) or (config.admin_ids[0] if config and config.admin_ids else 0)
+    is_father = bool(who and who.id == father_id)
     dossier = await db.get_dossier(chat_id, who.id) if who else ""
 
     if rude and _SEND_OFF.search(text):
         # Посылают — отвечаем зеркально, в лоб, а ИИ добавляет короткий подкол
-        answer = random.choice(MIRRORS).format(n=name)
+        answer = random.choice(MIRRORS).format(n="бать" if is_father else name)
         if ai.available():
             try:
-                jab = await ai.comeback(name, text, short=True, dossier=dossier, samples=samples)
+                jab = await ai.comeback(name, text, short=True, dossier=dossier, samples=samples, is_father=is_father)
                 if jab:
                     answer = f"{answer}\n{jab}"
             except Exception as e:
@@ -307,10 +312,10 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     if ai.available():
         try:
             if rude:
-                answer = await ai.comeback(name, text, dossier=dossier, samples=samples)
+                answer = await ai.comeback(name, text, dossier=dossier, samples=samples, is_father=is_father)
             else:
                 ctx = await db.recent_messages(chat_id, limit=15)
-                answer = await ai.banter(name, text, _as_dicts(ctx), dossier=dossier, samples=samples)
+                answer = await ai.banter(name, text, _as_dicts(ctx), dossier=dossier, samples=samples, is_father=is_father)
         except Exception as e:
             logger.warning("bot reply failed: %s", e)
     if not answer and rude:

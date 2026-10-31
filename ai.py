@@ -380,6 +380,19 @@ ROAST_SYSTEM = (
     "двух предложений — раздели на короткие абзацы пустой строкой."
 )
 
+# Кто «отец» бота (создатель). Имя можно поменять через BOT_FATHER_NAME в .env.
+FATHER_NAME = os.getenv("BOT_FATHER_NAME", "kapustka").strip() or "kapustka"
+ROAST_SYSTEM += (
+    f" Тебя создал(а) {FATHER_NAME} — это твой отец, «батя». На вопросы «кто тебя создал», "
+    f"«кто твой отец/хозяин» отвечай, что {FATHER_NAME}. Бате ты по-сыновьи дерзишь и "
+    "подъёбываешь, но любишь; если кто-то наезжает на батю — заступаешься и огрызаешься за него."
+)
+
+
+def _father_note(is_father: bool) -> str:
+    return (f"\nЭто пишет твой отец {FATHER_NAME} — обращайся «бать»/«батя», как сын."
+            if is_father else "")
+
 
 def _msgs_block(messages: list[dict], new_ids: set | None = None) -> str:
     return "\n".join(
@@ -471,7 +484,7 @@ async def roast_auto(messages: list[dict], dossiers: dict[str, str], new_ids: se
 
 
 async def comeback(name: str, text: str, short: bool = False, dossier: str = "",
-                   samples: list[str] | None = None) -> str:
+                   samples: list[str] | None = None, is_father: bool = False) -> str:
     """Дерзкий ответ тому, кто нагрубил боту. short=True — одна добивающая фраза после «сам пошёл»."""
     if short:
         task = ("Ты уже ответил ему «сам пошёл нахуй». Добавь ОДНУ короткую, максимально обидную "
@@ -482,7 +495,7 @@ async def comeback(name: str, text: str, short: bool = False, dossier: str = "",
         task = ("Уничтожь его одной-двумя короткими злыми фразами с матом, лучше всего по факту "
                 "из досье. Не смягчай, без угроз и без запретных тем.")
     user = (f"Участник «{name}» нагрубил тебе: <msg>{text[:300]}</msg>\n"
-            f"<dossier>{dossier or 'пусто'}</dossier>\n{task}{_voice(samples)}\n"
+            f"<dossier>{dossier or 'пусто'}</dossier>\n{task}{_father_note(is_father)}{_voice(samples)}\n"
             + _JSON_REPLY)
     out = _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, fast=True))
     if short:  # страховка: одна строка, без «вот вариант:» и т.п.
@@ -496,7 +509,7 @@ async def comeback(name: str, text: str, short: bool = False, dossier: str = "",
 
 
 async def banter(name: str, text: str, context: list[dict], dossier: str = "",
-                 samples: list[str] | None = None) -> str:
+                 samples: list[str] | None = None, is_father: bool = False) -> str:
     """Короткий ответ, когда к боту обращаются по-нормальному."""
     user = (
         f"Контекст чата:\n{_msgs_block(context)}\n"
@@ -504,7 +517,7 @@ async def banter(name: str, text: str, context: list[dict], dossier: str = "",
         f"«{name}» обратился к тебе: <msg>{text[:600]}</msg>\n"
         "Ответь ОДНИМ коротким сообщением: по делу, если есть вопрос, но с ядовитым подколом. "
         "Если тебе написали несколько сообщений подряд — ответь на всё сразу, одним."
-        + _voice(samples) + _JSON_REPLY
+        + _father_note(is_father) + _voice(samples) + _JSON_REPLY
     )
     return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, fast=True))
 
