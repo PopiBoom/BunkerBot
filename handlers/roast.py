@@ -842,7 +842,14 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     text = "\n".join(texts) or (last_msg.text or "")
     rt = last_msg.reply_to_message
     if rt and rt.from_user and rt.from_user.id == bot.id and rt.text:
-        text = f"(отвечает на твою реплику «{rt.text[:300]}»)\n{text}"
+        meaning = ""
+        if len(text.split()) <= 3 and ai.available():  # «Я», «мне», «не я» — сначала понять точный смысл
+            try:
+                meaning = await ai.short_answer_meaning(rt.text, text)
+            except Exception as e:
+                logger.debug("short answer meaning failed: %s", e)
+        text = (f"(отвечает на твою реплику «{rt.text[:300]}»"
+                + (f"; смысл ответа: {meaning}" if meaning else "") + f")\n{text}")
     rude = any(r for m, r in items if m.from_user and who and m.from_user.id == who.id)
     samples = await db.style_sample(chat_id)
     await _remember_lines(db, chat_id)

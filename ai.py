@@ -552,6 +552,13 @@ def drop_echo(reply: str, trigger: str) -> str:
     в третьем лице. Модель делает так упорно, несмотря на запрет, — поэтому чистим в коде."""
     if not reply or not trigger:
         return reply
+    said = (trigger.strip().splitlines() or [""])[-1].strip()
+    if 0 < len(said.split()) <= 3:  # «"Я" — ага, …» — короткую реплику не цитируем в начале
+        q = re.match(r"^\s*[«\"„“]\s*" + re.escape(said.strip("«»\"")) + r"\s*[»\"“”]\s*[—–:,-]*\s*"
+                     r"(?:(?:ага|угу|ну да|ну конечно|как же|конечно)\s*[,.!—–-]*\s*)*", reply, re.IGNORECASE)
+        if q and len(reply[q.end():].split()) >= 3:
+            rest = reply[q.end():].strip()
+            return rest[:1].upper() + rest[1:]
     parts = re.split(r"([,.!?;…—–]+\s*)", reply.strip())
     clauses = [(parts[i], parts[i + 1] if i + 1 < len(parts) else "") for i in range(0, len(parts), 2)]
     head: list[str] = []
@@ -576,6 +583,23 @@ def drop_echo(reply: str, trigger: str) -> str:
     else:
         out = rest
     return out[:1].upper() + out[1:]
+
+
+async def short_answer_meaning(bot_line: str, answer: str) -> str:
+    """«Кому его не жалко?» + «Я» → «мне его не жалко». Чтобы бот не додумывал смысл короткого ответа."""
+    user = (
+        f"Бот написал: <msg>{bot_line[:400]}</msg>\nЕму коротко ответили: <msg>{answer[:100]}</msg>\n"
+        "Что именно значит этот ответ? Подставь ответ в реплику бота и перескажи смысл полным "
+        "предложением от лица ответившего, точно сохраняя отрицания («не жалко» ≠ «жалко», «получу» ≠ "
+        "«выдам»). Если смысл неясен — так и напиши: «непонятно, что имел в виду». "
+        'Верни СТРОГО JSON: {"meaning": "..."}'
+    )
+    out = await _complete("Ты точно понимаешь короткие ответы в переписке. Строго JSON.", user,
+                          max_tokens=600, model=EDIT_MODEL)
+    try:
+        return str(_extract_json(out).get("meaning") or "").strip()[:200]
+    except Exception:
+        return ""
 
 
 def vary_father(text: str) -> str:
