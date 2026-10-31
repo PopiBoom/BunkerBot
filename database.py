@@ -129,7 +129,7 @@ class Database:
         """Случайные живые фразы из чата — образец манеры общения для бота."""
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
-                "SELECT text FROM chat_messages WHERE chat_id = ? AND length(text) BETWEEN 3 AND 160 "
+                "SELECT text FROM chat_messages WHERE chat_id = ? AND user_id != 0 AND length(text) BETWEEN 3 AND 160 "
                 "ORDER BY RANDOM() LIMIT ?", (chat_id, n),
             )
             return [r[0] for r in await cur.fetchall()]
@@ -159,7 +159,8 @@ class Database:
     async def count_messages_since(self, chat_id: int, since: int) -> int:
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
-                "SELECT COUNT(*) FROM chat_messages WHERE chat_id = ? AND ts >= ?", (chat_id, since)
+                "SELECT COUNT(*) FROM chat_messages WHERE chat_id = ? AND ts >= ? AND user_id != 0",
+                (chat_id, since)
             )
             row = await cur.fetchone()
             return int(row[0]) if row else 0
@@ -189,7 +190,7 @@ class Database:
                        COALESCE(d.updated, 0) AS upd
                 FROM chat_messages m
                 LEFT JOIN dossiers d ON d.chat_id = m.chat_id AND d.user_id = m.user_id
-                WHERE m.ts > COALESCE(d.updated, 0)
+                WHERE m.ts > COALESCE(d.updated, 0) AND m.user_id != 0
                   AND NOT EXISTS (SELECT 1 FROM roast_optout o
                                   WHERE o.chat_id = m.chat_id AND o.user_id = m.user_id)
                 GROUP BY m.chat_id, m.user_id

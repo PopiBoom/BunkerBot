@@ -187,6 +187,10 @@ REPLY_DELAY = (2.0, 4.0)                   # «читает» пару секу�
 QUIET_AFTER_SPEAKING = 20                  # сам не встревает, если только что что-то сказал
 
 
+BOT_SELF = "🤖 ты (бот)"  # так собственные реплики бота подписаны в контексте для ИИ
+_db_ref: list = []         # база для записи своих реплик (заполняется при первом сообщении)
+
+
 async def _say(bot: Bot, chat_id: int, text: str, reply_to: int | None = None) -> None:
     kwargs = {}
     if reply_to:
@@ -196,7 +200,14 @@ async def _say(bot: Bot, chat_id: int, text: str, reply_to: int | None = None) -
         if len(answered) > 500:
             answered.clear()
     _last_bot_msg[chat_id] = time.time()
-    await bot.send_message(chat_id, html.escape(text.strip())[:4000], **kwargs)
+    sent = await bot.send_message(chat_id, html.escape(text.strip())[:4000], **kwargs)
+    # Запоминаем свою реплику: иначе бот не понимает, когда его спрашивают про им же сказанное
+    if _db_ref:
+        try:
+            await _db_ref[0].add_chat_message(chat_id, getattr(sent, "message_id", 0) or 0, 0,
+                                              BOT_SELF, None, text.strip()[:1000])
+        except Exception as e:
+            logger.debug("save own message failed: %s", e)
 
 
 # ---------- команды ----------
@@ -270,7 +281,9 @@ async def cmd_roast(message: Message, command: CommandObject, bot: Bot, db: Data
 async def _week_digest(bot: Bot, db: Database, chat_id: int) -> bool:
     rows = await db.recent_messages(chat_id, limit=2000, since=int(time.time()) - 7 * 86400)
     by_user: dict[str, list[str]] = {}
-    for _mid, _uid, name, text, _ts in rows:
+    for _mid, uid, name, text, _ts in rows:
+        if uid == 0:  # свои реплики не номинируем
+            continue
         by_user.setdefault(name or "Аноним", []).append(text)
     active = sorted(by_user.items(), key=lambda kv: -len(kv[1]))[:10]
     if len(active) < 2:
@@ -310,6 +323,8 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     if user is None or user.is_bot or not message.text:
         return
     chat_id = message.chat.id
+    if not _db_ref:
+        _db_ref.append(db)
     if not await _enabled(db):
         return
     optout = await db.is_optout(chat_id, user.id)
@@ -361,6 +376,9 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     name = _name(last_msg)
     texts = [m.text or "" for m, _ in items if m.from_user and who and m.from_user.id == who.id]
     text = "\n".join(texts) or (last_msg.text or "")
+    rt = last_msg.reply_to_message
+    if rt and rt.from_user and rt.from_user.id == bot.id and rt.text:
+        text = f"(отвечает на твою реплику «{rt.text[:300]}»)\n{text}"
     rude = any(r for m, r in items if m.from_user and who and m.from_user.id == who.id)
     samples = await db.style_sample(chat_id)
     # «Отец» бота — первый админ из .env (или BOT_FATHER_ID)
@@ -389,10 +407,10 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
             if rude:
                 answer = await ai.comeback(name, text, dossier=dossier, samples=samples, is_father=is_father)
             else:
-                ctx = await db.recent_messages(chat_id, limit=15)
+                ctx = await db.recent_messages(chat_id, limit=25)
                 answer = await ai.banter(name, text, _as_dicts(ctx), dossier=dossier, samples=samples, is_father=is_father)
             if answer:  # редактор: связно ли, к месту ли, коротко ли
-                answer = await ai.polish(answer, text, _as_dicts(await db.recent_messages(chat_id, limit=8)))
+                answer = await ai.polish(answer, text, _as_dicts(await db.recent_messages(chat_id, limit=20)))
         except Exception as e:
             logger.warning("bot reply failed: %s", e)
     if not answer and rude:
@@ -421,7 +439,7 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int, interval: int) -> No
     rows = await db.recent_messages(chat_id, limit=30)
     answered = _answered.get(chat_id, set())
     since = max(int(last), int(_last_bot_msg.get(chat_id, 0)))
-    new_ids = {r[0] for r in rows if r[4] >= since and r[0] not in answered}
+    new_ids = {r[0] for r in rows if r[4] >= since and r[0] not in answered and r[1] != 0}
     if not new_ids:
         return
     names = {r[2] for r in rows}
