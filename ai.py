@@ -1559,13 +1559,16 @@ async def _complete_openrouter(system: str, user: str, model: str, max_tokens: i
         except Exception as e:
             logger.warning("usage sink failed: %s", e)
     choice = (data.get("choices") or [{}])[0]
-    return str((choice.get("message") or {}).get("content") or "").strip()
+    text = str((choice.get("message") or {}).get("content") or "").strip()
+    if not text:  # всё ушло на «размышления» или модель промолчала — пусть вызывающий увидит ошибку
+        raise AIUnavailable(f"{model} вернула пустой ответ (finish={choice.get('finish_reason')})")
+    return text
 
 
 async def complete_any(system: str, user: str, model: str, max_tokens: int = 8000, effort: str = "high") -> str:
     """Claude — через SDK Anthropic, всё с «/» в названии — через OpenRouter."""
-    if is_openrouter(model):  # посты короткие: большой запас токенов там только мешает (и OpenRouter его резервирует)
-        return await _complete_openrouter(system, user, model, min(max_tokens, 4000))
+    if is_openrouter(model):  # запас с учётом «размышлений» (Kimi думает долго), но не 16000 — OpenRouter его резервирует
+        return await _complete_openrouter(system, user, model, min(max_tokens, 8000))
     return await _complete(system, user, max_tokens=max_tokens, model=model, effort=effort)
 
 
