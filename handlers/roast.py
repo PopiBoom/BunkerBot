@@ -120,6 +120,7 @@ async def _maybe_defend(message: Message, bot: Bot, db: Database, config) -> boo
     _last_defense[key] = time.time()
 
     await asyncio.sleep(random.uniform(1.0, 2.0))
+    await _remember_lines(db, message.chat.id)
     name = _name(message)
     answer = ""
     if ai.available():
@@ -191,6 +192,12 @@ QUIET_AFTER_SPEAKING = 20                  # сам не встревает, е�
 
 BOT_SELF = "🤖 ты (бот)"  # так собственные реплики бота подписаны в контексте для ИИ
 _db_ref: list = []         # база для записи своих реплик (заполняется при первом сообщении)
+
+
+async def _remember_lines(db: Database, chat_id: int) -> None:
+    """Подсовываем ИИ последние реплики бота, чтобы он не повторял одни и те же слова."""
+    rows = await db.recent_messages(chat_id, limit=10, user_id=0)
+    ai.recent_bot_lines.set([r[3] for r in rows])
 
 
 async def _say(bot: Bot, chat_id: int, text: str, reply_to: int | None = None) -> None:
@@ -384,6 +391,7 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
         text = f"(отвечает на твою реплику «{rt.text[:300]}»)\n{text}"
     rude = any(r for m, r in items if m.from_user and who and m.from_user.id == who.id)
     samples = await db.style_sample(chat_id)
+    await _remember_lines(db, chat_id)
     # «Отец» бота — первый админ из .env (или BOT_FATHER_ID)
     is_father = bool(who and who.id == _father_id(config))
     dossier = await db.get_dossier(chat_id, who.id) if who else ""
@@ -447,6 +455,7 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int, interval: int) -> No
     new_ids = {r[0] for r in rows if r[4] >= since and r[0] not in answered and r[1] != 0}
     if not new_ids:
         return
+    await _remember_lines(db, chat_id)
     names = {r[2] for r in rows}
     dossiers = {n: d for n, d in (await db.chat_dossiers(chat_id)).items() if n in names}
     result = await ai.roast_auto(_as_dicts(rows), dossiers, new_ids, await db.style_sample(chat_id))
