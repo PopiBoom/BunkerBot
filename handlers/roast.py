@@ -305,6 +305,7 @@ async def _remember_lines(db: Database, chat_id: int) -> None:
 
 
 async def _say(bot: Bot, chat_id: int, text: str, reply_to: int | None = None) -> None:
+    text = ai.scrub(text)  # слова за красными линиями не уходят в чат, что бы ни написала модель
     kwargs = {}
     if reply_to:
         kwargs["reply_parameters"] = ReplyParameters(message_id=reply_to, allow_sending_without_reply=True)
@@ -629,7 +630,10 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
 _thread: dict[tuple[int, int], list[float]] = {}  # когда бот отвечал этому человеку
 THREAD_WINDOW = 180                                # перепалка — ответы за последние 3 минуты
 _EMPTY = re.compile(r"^\W*(да|нет|ага|угу|и\s*ч[её]|ч[её]|ну\s*и\s*\w+|знаю|ок|окей|пофиг|похуй|ладно|"
-                    r"мм+|хм+|ха(ха)*|ахах\w*|лол|кек|\+|\)+|не\s*буду|буду|пойду|делай|сам\s*такой)\W*$",
+                    r"мм+|хм+|ха(ха)*|ахах\w*|лол|кек|\+|\)+|не\s*буду|буду|пойду|делай|сам\s*такой|"
+                    r"я\s*тоже|и\s*я|тоже|согласен|согласна|понял|поняла|ясно|понятно|норм|база|жиза|"
+                    r"спасибо|спс|пасиб\w*|го|давай|точно|верно|правда|реально|ну\s*да|ну|угар|ору|"
+                    r"\?+|!+|\.+)\W*$",
                     re.IGNORECASE)
 COOL_REACTIONS = ["🗿", "🤡", "🥱", "🙈", "😴"]
 
@@ -1058,11 +1062,17 @@ async def cmd_clowns(message: Message, db: Database) -> None:
 # ---------- фоновая работа ----------
 
 
+def _trivial(text: str) -> bool:
+    """Пустая реплика — «я тоже», «ок», «ага», пара слов: стебать в ней нечего, выйдет натянутый бред."""
+    t = str(text).strip()
+    return bool(_EMPTY.match(t)) or (len(t.split()) <= 2 and len(t) < 14)
+
+
 def _replyable(text: str) -> bool:
-    """Можно ли подколоть это сообщение в фоне: живой текст или фото с описанием."""
+    """Можно ли подколоть это сообщение в фоне: содержательный текст или фото с описанием."""
     t = str(text)
     if not t.startswith("["):
-        return True
+        return not _trivial(t)
     head = t.split("]", 1)[0]
     return (t.startswith("[фото: ") or t.startswith("[альбом, ")) and ": " in head
 

@@ -116,7 +116,8 @@ class Game:
     votes: dict[int, int] = field(default_factory=dict)            # кто голосует -> против кого
     vote_targets: set[int] = field(default_factory=set)  # за кого можно голосовать (при ничьей — только равные)
     revote: int = 0                                        # номер переголосования (0 — основное)
-    immune: set[int] = field(default_factory=set)
+    immune: set[int] = field(default_factory=set)        # защищены в ИДУЩЕМ голосовании
+    immune_next: set[int] = field(default_factory=set)   # сыграли иммунитет — защищены в СЛЕДУЮЩЕМ
     doubled: set[int] = field(default_factory=set)
     cursed: set[int] = field(default_factory=set)
     stage: str = ""        # open | speech | after — стадии голосования
@@ -1360,16 +1361,11 @@ async def _play_action(bot: Bot, game: Game, p: Player, target: Player | None) -
     emoji, title, *_ = C.ACTIONS[action]
     head = f"🃏 <b>{_e(p.name)}</b> играет {emoji} <b>{title}</b>"
     if action == "immunity":
-        game.immune.add(p.user_id)
-        dropped = [v for v, t in game.votes.items() if t == p.user_id]
-        for v in dropped:  # голоса против иммунного сгорают — пусть выбирают заново
-            game.votes.pop(v, None)
-        again = ""
-        if dropped:
-            who = _names([_mention(game.players[v]) for v in dropped if v in game.players])
-            again = f"\n\n🔁 {who}: ваш голос сгорел — выберите другого."
-        await _send(bot, game.chat_id,
-                    f"{head}! В этом голосовании против него(неё) голосовать нельзя.{again}")
+        # Иммунитет всегда на СЛЕДУЮЩЕЕ голосование: нельзя дождаться голосов против и «сжечь» их
+        game.immune_next.add(p.user_id)
+        when = ("в голосовании следующего раунда" if game.phase == "voting"
+                else "в ближайшем голосовании")
+        await _send(bot, game.chat_id, f"{head}! {when.capitalize()} против него(неё) голосовать нельзя.")
     elif action == "double":
         game.doubled.add(p.user_id)
         await _send(bot, game.chat_id, f"{head}! Его(её) голос сейчас считается за два.")
@@ -1574,6 +1570,9 @@ async def _voting(bot: Bot, game: Game) -> None:
     game.phase = "voting"
     game.current_picker = None
     game.immune, game.doubled, game.cursed = set(), set(), set()
+    # иммунитет, сыгранный заранее (до этого голосования), включается сейчас и сгорает после него
+    game.immune = {u for u in game.immune_next if u in game.players and game.players[u].alive}
+    game.immune_next = set()
     game.speakers = {}
     if game.hero and game.hero in game.players and game.players[game.hero].alive:
         game.immune.add(game.hero)  # награда за устранённую угрозу
