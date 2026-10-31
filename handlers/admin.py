@@ -192,7 +192,7 @@ async def admin_import_file(message: Message, bot: Bot, db: Database, config: Co
         await status.edit_text(f"Импорт сломался: {e}")
         return
     await status.edit_text(
-        f"✅ Готово!\n\nЧат: <code>{chat_id}</code>\nСообщений загружено: <b>{n}</b>\n"
+        f"✅ Готово!\n\nЧат: <code>{chat_id}</code>\nНовых сообщений загружено: <b>{n}</b>\n"
         f"Участников: <b>{people}</b>\nДосье составлено: <b>{built}</b>\n\n"
         "Теперь бот знает ваши фразы и может стебать по старым грехам. "
         "Хранятся последние 3000 сообщений чата, досье — бессрочно."
@@ -436,6 +436,9 @@ async def admin_broadcast(call: CallbackQuery, state: FSMContext, config: Config
 @router.message(AdminStates.broadcast)
 async def broadcast_preview(message: Message, state: FSMContext, config: Config) -> None:
     if message.from_user is None or not _is_admin(message.from_user.id, config):
+        return
+    if not (message.text or "").strip():
+        await message.answer("Рассылка — только текстом. Пришли текст сообщения.", reply_markup=cancel_keyboard())
         return
     await state.update_data(text=message.html_text)
     await message.answer("👆 Так будет выглядеть рассылка. Отправляем?")

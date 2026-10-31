@@ -353,7 +353,7 @@ def _num(x: float) -> str:
 
 
 def _lobby_text(game: Game) -> str:
-    lines = [f"🏚 <b>БУНКЕР</b>", HR, "",
+    lines = ["🏚 <b>БУНКЕР</b>", HR, "",
              f"👥 Сбор игроков: <b>{len(game.players)}/{MAX_PLAYERS}</b>",
              f"🎭 Ведущий: {_mode_title(game)}", ""]
     for p in game.players.values():
@@ -899,7 +899,6 @@ async def _run_game(bot: Bot, game: Game) -> None:
     _assign_cards(players, cards if isinstance(cards, list) else [])
     for p, action in zip(players, C.deal_actions(len(players))):
         p.action = action
-        others = [(o.user_id, o.name) for o in players if o.user_id != p.user_id]
         p.serial = random.randint(1, 9999)
 
     game.spots = max(1, len(players) // 2)

@@ -846,7 +846,7 @@ def parse_export(data: dict, limit: int = IMPORT_LIMIT) -> tuple[int, list[tuple
 async def import_history(db: Database, data: dict, progress=None) -> tuple[int, int, int, int]:
     """Загружает последние 2000 сообщений и сразу строит досье по ним.
 
-    Возвращает (chat_id, загружено сообщений, людей, досье построено).
+    Возвращает (chat_id, новых сообщений (без дублей), людей, досье построено).
     """
     chat_id, rows = parse_export(data)
     optout = await db.optout_ids(chat_id)
@@ -872,4 +872,4 @@ async def import_history(db: Database, data: dict, progress=None) -> tuple[int, 
                     built += 1
             except Exception as e:
                 logger.warning("import dossier failed for %s: %s", name, e)
-    return chat_id, len(rows), len(by_user), built
+    return chat_id, added, len(by_user), built

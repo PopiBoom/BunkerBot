@@ -47,7 +47,10 @@ async def set_commands(bot: Bot, config) -> None:
         BotCommand(command="forget_me", description="Забыть меня и не стебать"),
         BotCommand(command="remember_me", description="Снова запоминать меня"),
     ]
-    admin = private + [BotCommand(command="admin", description="Панель администратора")]
+    admin = private + [
+        BotCommand(command="admin", description="Панель администратора"),
+        BotCommand(command="backup", description="Бэкап базы файлом"),
+    ]
     try:
         await bot.set_my_commands(private, scope=BotCommandScopeAllPrivateChats())
         await bot.set_my_commands(group, scope=BotCommandScopeAllGroupChats())

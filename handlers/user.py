@@ -1,6 +1,8 @@
 """Пользовательские обработчики: /start и проверка подписки."""
 from __future__ import annotations
 
+import html
+
 from aiogram import Bot, F, Router
 from aiogram.filters import CommandStart
 from aiogram.types import CallbackQuery, Message
@@ -17,8 +19,11 @@ router.message.filter(F.chat.type == "private")
 
 
 def _personalize(text: str, name: str) -> str:
-    """Подставляет имя вместо {name}. Безопасно, даже если в тексте есть другие {}."""
-    return text.replace("{name}", name)
+    """Подставляет имя вместо {name}. Безопасно, даже если в тексте есть другие {}.
+
+    Имя экранируем: тексты уходят в HTML-разметке, и имя вроде «<3 Маша» ломало отправку.
+    """
+    return text.replace("{name}", html.escape(name))
 
 
 async def _send_reward(message: Message, db: Database, user_id: int, name: str) -> None:
