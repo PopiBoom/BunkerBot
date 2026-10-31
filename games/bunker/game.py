@@ -52,7 +52,8 @@ SPECTATOR_WEIGHT = 0.5    # вес голоса зрителя
 LOBBY_TIMEOUT = 15 * 60   # сек: брошенное лобби закрывается само
 MAX_TEXT = 3800           # запас до лимита Telegram в 4096 символов
 MAX_CAPTION = 1000        # лимит подписи к фото — 1024
-STEP_DELAY = float(os.getenv("BUNKER_DELAY", "5") or 5)  # пауза между сюжетными сообщениями
+STEP_DELAY = float(os.getenv("BUNKER_DELAY", "20") or 20)  # пауза после сюжетных сообщений, чтобы все дочитали
+REVEAL_DELAY = 4          # сек: пауза после открытия одной характеристики
 REFRESH_DELAY = 1.2       # сек: склеиваем частые правки табло/голосования в одну
 
 HR = "━━━━━━━━━━━━━━━"
@@ -276,6 +277,31 @@ def _quote(text: str) -> str:
     return f"<blockquote expandable>{_e(text)}</blockquote>"
 
 
+def _host(game: Game, text: str) -> str:
+    """Реплика ведущего: заголовок в духе режима и текст абзацами в цитате."""
+    voice = C.MODE_VOICE.get(game.mode, C.MODE_VOICE["classic"])
+    return f"{voice}\n<blockquote>{_e(text.strip())}</blockquote>"
+
+
+def _ai_task(coro) -> asyncio.Task:
+    """Запускает запрос к ИИ заранее, пока идёт пауза; ошибки не роняют игру."""
+    async def safe():
+        try:
+            return await coro
+        except Exception as e:
+            logger.warning("AI call failed: %s", e)
+            return None
+    return asyncio.create_task(safe())
+
+
+def _bot_kb(game: Game, text: str = "🃏 Открыть свою карточку") -> InlineKeyboardMarkup | None:
+    if not game.bot_username:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=text, url=f"https://t.me/{game.bot_username}")
+    ]])
+
+
 def _msg_link(game: Game, message_id: int | None) -> str | None:
     s = str(game.chat_id)
     if message_id is None or not s.startswith("-100"):
@@ -295,8 +321,9 @@ def _num(x: float) -> str:
 
 
 def _lobby_text(game: Game) -> str:
-    lines = [f"🏚 <b>БУНКЕР</b>", HR,
-             f"Сбор игроков: <b>{len(game.players)}/{MAX_PLAYERS}</b> · Ведущий: {_mode_title(game)}", ""]
+    lines = [f"🏚 <b>БУНКЕР</b>", HR, "",
+             f"👥 Сбор игроков: <b>{len(game.players)}/{MAX_PLAYERS}</b>",
+             f"🎭 Ведущий: {_mode_title(game)}", ""]
     for p in game.players.values():
         host = " 👑" if p.user_id == game.host_id else ""
         dm = "" if p.dm_ok else " <i>(не открыл бота)</i>"
@@ -304,8 +331,10 @@ def _lobby_text(game: Game) -> str:
     lines += [
         "",
         "🎮 Жми «Вступить в игру» — откроется бот, нажми Start, и ты в игре.",
-        "В ЛС придут карточка, карта действия и тайная цель.",
-        "Ведущий тоже жмёт «Вступить», потом «Начать».",
+        "",
+        "📬 В ЛС придут карточка, карта действия и тайная цель.",
+        "",
+        "👑 Ведущий тоже жмёт «Вступить», потом «Начать».",
     ]
     return "\n".join(lines)
 
@@ -326,33 +355,42 @@ def _lobby_kb(game: Game) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+def _board_player(p: Player, short: bool) -> str:
+    shown = [k for k in C.ATTR_KEYS if k in p.revealed]
+    if not shown:
+        return f"<b>{_e(p.name)}</b>\n<i>пока ничего не открыто</i>"
+    if short:
+        return f"<b>{_e(p.name)}</b>  " + " ".join(C.ATTR_MAP[k][1] for k in shown)
+    lines = [f"<b>{_e(p.name)}</b>"]
+    for k in shown:
+        lines.append(f"{C.ATTR_MAP[k][1]} {_e(_cut((p.card or {}).get(k, '—'), 48))}")
+    return "\n".join(lines)
+
+
 def _board_text(game: Game, short: bool = False) -> str:
     alive = _alive(game)
-    head = [
+    out_players = sorted((p for p in game.players.values() if not p.alive), key=lambda x: x.out_round or 0)
+    parts = [
         f"📌 <b>БУНКЕР · раунд {game.round_no}</b>" if game.round_no else "📌 <b>БУНКЕР</b>",
-        f"🎟 Мест: <b>{game.spots}</b> · В игре: <b>{len(alive)}</b> · {_mode_title(game)}",
+        f"🎟 Мест: <b>{game.spots}</b> · В игре: <b>{len(alive)}</b>"
+        + (" · 🏁 <b>игра окончена</b>" if game.phase == "ended" else ""),
     ]
-    if game.phase == "ended":
-        head.append("🏁 <b>Игра окончена</b>")
     if game.bunker_known:
-        head += [HR, "🏚 <b>Что известно о бункере:</b>"]
-        head += [f"• {_e(_cut(f, 90))}" for f in game.bunker_known]
-    head.append(HR)
-    rows = []
-    for p in game.players.values():
-        if not p.alive:
-            continue
-        shown = [k for k in C.ATTR_KEYS if k in p.revealed]
-        if not shown:
-            info = "<i>ничего не открыто</i>"
-        elif short:
-            info = " ".join(C.ATTR_MAP[k][1] for k in shown)
-        else:
-            info = " · ".join(f"{C.ATTR_MAP[k][1]} {_e(_cut((p.card or {}).get(k, '—'), 28))}" for k in shown)
-        rows.append(f"🟢 <b>{_e(p.name)}</b> — {info}")
-    for p in sorted((p for p in game.players.values() if not p.alive), key=lambda x: x.out_round or 0):
-        rows.append(f"💀 <s>{_e(p.name)}</s> — изгнан(а) в раунде {p.out_round}")
-    text = "\n".join(head + rows)
+        facts = "\n".join(f"• {_e(_cut(f, 90))}" for f in game.bunker_known)
+        parts.append(f"🏚 <b>Что известно о бункере</b>\n{facts}")
+
+    title = "✅ <b>ПОПАЛИ В БУНКЕР</b>" if game.phase == "ended" else "🟢 <b>В ИГРЕ</b>"
+    blocks = "\n\n".join(_board_player(p, short) for p in alive)
+    opened = sum(len(p.revealed) for p in alive)
+    if opened > 6:  # много открытых карт — сворачиваем, чтобы закреп не был простынёй
+        blocks = f"<blockquote expandable>{blocks}</blockquote>"
+    parts.append(f"{title} ({len(alive)})\n\n{blocks}")
+
+    if out_players:
+        gone = "\n".join(f"<s>{_e(p.name)}</s> — раунд {p.out_round}" for p in out_players)
+        parts.append(f"💀 <b>ИЗГНАНЫ</b> ({len(out_players)})\n{gone}")
+
+    text = f"\n{HR}\n".join(parts)
     if len(text) > MAX_TEXT and not short:
         return _board_text(game, short=True)
     return text[:MAX_TEXT]
@@ -436,9 +474,9 @@ def _bars(game: Game) -> str:
 def _vote_text(game: Game) -> str:
     alive = _alive(game)
     lines = [
-        f"🗳 <b>ГОЛОСОВАНИЕ · раунд {game.round_no}</b>", HR,
-        f"В живых: {len(alive)} · мест: {game.spots} · проголосовали: "
-        f"{len(game.votes)}/{len(alive)} · зрителей: {len(game.spectator_votes)}",
+        f"🗳 <b>ГОЛОСОВАНИЕ · раунд {game.round_no}</b>", HR, "",
+        f"👥 В живых: {len(alive)} · 🎟 мест: {game.spots}",
+        f"✋ Проголосовали: {len(game.votes)}/{len(alive)} · 👀 зрителей: {len(game.spectator_votes)}",
         "",
         _bars(game),
         "",
@@ -452,11 +490,11 @@ def _vote_text(game: Game) -> str:
         effects.append("🧿 голос не считается: " + ", ".join(_e(game.players[u].name) for u in game.cursed))
     if effects:
         lines += effects + [""]
-    lines.append("Кого НЕ пускать в бункер? Голос можно менять. "
-                 f"Голос зрителя = {_num(SPECTATOR_WEIGHT)}.")
+    lines.append("❓ Кого <b>НЕ</b> пускать в бункер? Голос можно менять.")
+    lines.append(f"👀 Голос зрителя = {_num(SPECTATOR_WEIGHT)}.")
     link = _msg_link(game, game.board_msg_id)
     if link:
-        lines.append(f'📌 <a href="{link}">Табло с открытыми картами</a>')
+        lines += ["", f'📌 <a href="{link}">Табло с открытыми картами</a>']
     return "\n".join(lines)
 
 
@@ -582,11 +620,19 @@ async def cmd_top(message: Message, db: Database) -> None:
         await message.answer("🏆 Рейтинг пуст — сыграйте первую партию: /bunker")
         return
     medals = ["🥇", "🥈", "🥉"]
-    lines = ["🏆 <b>Рейтинг выживших</b>", HR]
-    for i, (name, games_n, surv, first_out, goals) in enumerate(rows):
-        place = medals[i] if i < 3 else f"{i + 1}."
-        lines.append(f"{place} <b>{_e(name)}</b> — выжил(а) {surv} из {games_n} · "
-                     f"🎯 {goals} · 🥾 первым вылетал(а) {first_out}")
+    blocks = [f"🏆 <b>РЕЙТИНГ ВЫЖИВШИХ</b>\n{HR}"]
+    for i, (name, games_n, surv, _first_out, _goals) in enumerate(rows):
+        place = medals[i] if i < 3 else f"<b>{i + 1}.</b>"
+        rate = surv / games_n if games_n else 0
+        filled = round(rate * 10)
+        bar = "▰" * filled + "▱" * (10 - filled)
+        blocks.append(
+            f"{place} <b>{_e(name)}</b>\n"
+            f"🏚 Выжил(а): <b>{surv}</b> из {games_n}\n"
+            f"<code>{bar}</code> {round(rate * 100)}%"
+        )
+    blocks.append(f"{HR}\n🔁 Сыграть ещё: /bunker")
+    lines = ["\n\n".join(blocks)]
     await message.answer("\n".join(lines))
 
 
@@ -751,34 +797,34 @@ async def _run_game(bot: Bot, game: Game) -> None:
     except Exception:
         pass
 
+    intro_task = _ai_task(ai.narrate_intro(game.catastrophe, game.bunker, _style(game))) \
+        if ai.available() else None
     await _say(bot, game.chat_id,
-               f"☢️ <b>КАТАСТРОФА</b>\n{_quote(game.catastrophe)}\n"
+               f"☢️ <b>КАТАСТРОФА</b>\n{_quote(game.catastrophe)}\n\n"
                f"🏚 <b>БУНКЕР</b>\n{_quote(game.bunker)}")
 
-    if ai.available():
-        try:
-            intro = await ai.narrate_intro(game.catastrophe, game.bunker, _style(game))
-            if intro:
-                await _say(bot, game.chat_id, f"🎙 <i>{_e(intro)}</i>")
-        except Exception as e:
-            logger.warning("AI intro failed: %s", e)
+    intro = await intro_task if intro_task else None
+    if intro:
+        await _say(bot, game.chat_id, _host(game, intro))
 
     roster = ", ".join(_e(p.name) for p in players)
     await _say(
         bot, game.chat_id,
-        f"👥 <b>Игроков: {len(players)}</b> — {roster}\n"
-        f"🎟 Мест в бункере: <b>{game.spots}</b>\n{HR}\n"
-        f"📬 У каждого в ЛС: карточка, 🃏 одноразовая карта действия и 🎯 тайная цель.\n"
-        f"🔦 Раунд: новый факт о бункере → по очереди открываем по характеристике "
-        f"(на ход {TURN_TIMEOUT} сек) → голосование.\n"
-        f"🎤 Двое лидеров голосования получают последнее слово.\n"
+        f"👥 <b>Игроков: {len(players)}</b>\n{roster}\n\n"
+        f"🎟 Мест в бункере: <b>{game.spots}</b>\n"
+        f"{HR}\n\n"
+        f"📬 У каждого в ЛС: карточка, 🃏 одноразовая карта действия и 🎯 тайная цель.\n\n"
+        f"🔦 <b>Раунд:</b> новый факт о бункере → по очереди открываем по одной "
+        f"характеристике (на ход {TURN_TIMEOUT} сек) → голосование.\n\n"
+        f"🎤 Двое лидеров голосования получают последнее слово.\n\n"
         f"👀 Зрители тоже голосуют — их голос весит {_num(SPECTATOR_WEIGHT)}.",
     )
     if no_dm:
         who = ", ".join(_mention(p) for p in no_dm)
         await _say(bot, game.chat_id,
-                   f"⚠️ {who}: не удалось написать вам в ЛС — откройте бота и нажмите Start. "
-                   f"Пока характеристики будут открываться за вас автоматически.", delay=1)
+                   f"⚠️ {who}: не удалось написать вам в ЛС.\n\n"
+                   f"Откройте бота и нажмите Start — пока характеристики будут открываться "
+                   f"за вас автоматически.", delay=3, reply_markup=_bot_kb(game, "🤖 Открыть бота"))
 
     board = await _send(bot, game.chat_id, _board_text(game))
     game.board_msg_id = board.message_id
@@ -802,6 +848,22 @@ async def _run_game(bot: Bot, game: Game) -> None:
 # ---------- фаза раскрытия ----------
 
 
+def _round_summary(game: Game) -> str:
+    """Большая карточка «итоги раунда»: всё, что открыли за раунд, по игрокам."""
+    by_player: dict[str, list[dict]] = {}
+    for r in game.round_reveals:
+        by_player.setdefault(r["name"], []).append(r)
+    blocks = []
+    for name, items in by_player.items():
+        lines = [f"<b>{_e(name)}</b>"]
+        lines += [f"{r['emoji']} {r['label']}: {_e(r['value'])}" for r in items]
+        blocks.append("\n".join(lines))
+    body = "\n\n".join(blocks)
+    quote = "blockquote expandable" if len(game.round_reveals) > 6 else "blockquote"
+    return (f"📋 <b>ИТОГИ РАУНДА {game.round_no}</b>\n{HR}\n\n"
+            f"<{quote}>{body}</{quote.split()[0]}>")[:MAX_TEXT]
+
+
 async def _reveal_round(bot: Bot, game: Game) -> None:
     game.phase = "revealing"
     game.round_no += 1
@@ -812,9 +874,9 @@ async def _reveal_round(bot: Bot, game: Game) -> None:
     if game.round_no - 1 < len(game.bunker_secrets):
         fact = game.bunker_secrets[game.round_no - 1]
         game.bunker_known.append(fact)
-    text = f"{HR}\n🔦 <b>Раунд {game.round_no}</b>\n"
+    text = f"{HR}\n🔦 <b>РАУНД {game.round_no}</b>\n{HR}\n\n"
     if fact:
-        text += f"🏚 Новое о бункере: <i>{_e(fact)}</i>\n"
+        text += f"🏚 <b>Новое о бункере:</b>\n<blockquote>{_e(fact)}</blockquote>\n\n"
     text += "Открываем характеристики по очереди 👇"
     await _say(bot, game.chat_id, text)
     await _refresh_board(bot, game)
@@ -831,15 +893,21 @@ async def _reveal_round(bot: Bot, game: Game) -> None:
         game.current_picker = None
         game.turn_msg_id = None
 
-    if not _is_active(game):
+    if not _is_active(game) or not game.round_reveals:
         return
-    if ai.available() and game.round_reveals:
-        try:
-            note = await ai.narrate_round(game.catastrophe, game.round_no, game.round_reveals, _style(game))
-            if note:
-                await _say(bot, game.chat_id, f"🎙 <i>{_e(note)}</i>")
-        except Exception as e:
-            logger.warning("AI round note failed: %s", e)
+    # Пока все читают итоги раунда, ведущий уже пишет комментарий
+    note_task = _ai_task(ai.narrate_round(game.catastrophe, game.round_no, game.round_reveals,
+                                          _style(game))) if ai.available() else None
+    await _say(bot, game.chat_id, _round_summary(game))
+    note = await note_task if note_task else None
+    if note and _is_active(game):
+        await _say(bot, game.chat_id, _host(game, note))
+
+
+def _turn_text(p: Player, left: int) -> str:
+    return (f"👉 <b>Ход {_mention(p)}</b>\n\n"
+            f"Выбери, какую характеристику открыть — кнопка ниже ведёт к боту.\n\n"
+            f"⏳ <b>{left} сек</b>")
 
 
 async def _turn(bot: Bot, game: Game, p: Player, remaining: list[str]) -> None:
@@ -858,8 +926,7 @@ async def _turn(bot: Bot, game: Game, p: Player, remaining: list[str]) -> None:
                            note="нет лички с ботом — открываю сам")
         return
 
-    turn = await _send(bot, game.chat_id,
-                       f"👉 Ход {_mention(p)} — выбери характеристику в ЛС у бота. ⏳ {TURN_TIMEOUT} сек")
+    turn = await _send(bot, game.chat_id, _turn_text(p, TURN_TIMEOUT), reply_markup=_bot_kb(game))
     game.turn_msg_id = turn.message_id
 
     left = TURN_TIMEOUT
@@ -873,8 +940,7 @@ async def _turn(bot: Bot, game: Game, p: Player, remaining: list[str]) -> None:
             return
         left = mark
         if mark:
-            await _edit(bot, game.chat_id, game.turn_msg_id,
-                        f"👉 Ход {_mention(p)} — выбери характеристику в ЛС у бота. ⏳ <b>{mark} сек</b>")
+            await _edit(bot, game.chat_id, game.turn_msg_id, _turn_text(p, mark), _bot_kb(game))
 
     rem = [k for k in C.ATTR_KEYS if k not in p.revealed]
     if rem:
@@ -883,25 +949,32 @@ async def _turn(bot: Bot, game: Game, p: Player, remaining: list[str]) -> None:
         await _edit(bot, p.user_id, p.pick_msg_id, "⏰ Время вышло — характеристика открыта автоматически.")
 
 
+def _reveal_text(p: Player, key: str, note: str = "", prefix: str = "") -> str:
+    label, emoji = C.ATTR_MAP[key]
+    val = (p.card or {}).get(key, "—")
+    tail = f"\n<i>{_e(note)}</i>" if note else ""
+    return (f"{prefix}🔓 <b>{_e(p.name)}</b> открывает карту{tail}\n\n"
+            f"<blockquote>{emoji} <b>{label.upper()}</b>\n{_e(val)}</blockquote>")
+
+
 async def _reveal_attr(bot: Bot, game: Game, p: Player, key: str, auto: bool,
                        note: str = "", count_turn: bool = True, prefix: str = "") -> None:
     if key in p.revealed:
         return
     p.revealed.add(key)
     label, emoji = C.ATTR_MAP[key]
-    val = (p.card or {}).get(key, "—")
     if count_turn:
         game.revealed_this_round.add(p.user_id)
-    game.round_reveals.append({"name": p.name, "label": label, "value": str(val)})
-    tail = f" <i>({_e(note)})</i>" if auto and note else (" <i>(авто)</i>" if auto else "")
-    text = f"{prefix}🔓 <b>{_e(p.name)}</b> → {emoji} <b>{label}:</b> {_e(val)}{tail}"
+    game.round_reveals.append({"name": p.name, "label": label, "emoji": emoji,
+                               "value": str((p.card or {}).get(key, "—"))})
+    text = _reveal_text(p, key, note=note if auto else "", prefix=prefix)
     edited = False
     if count_turn and game.turn_msg_id and game.current_picker == p.user_id:
-        edited = await _edit(bot, game.chat_id, game.turn_msg_id, text)
+        edited = await _edit(bot, game.chat_id, game.turn_msg_id, text)  # без кнопки
     if not edited:
         await _send(bot, game.chat_id, text)
     _schedule(bot, game, "board", lambda: _refresh_board(bot, game))
-    await asyncio.sleep(min(STEP_DELAY, 2))
+    await asyncio.sleep(REVEAL_DELAY)
 
 
 @router.callback_query(F.data.startswith("bkpk:"))
@@ -1038,7 +1111,7 @@ async def _play_action(bot: Bot, game: Game, p: Player, target: Player | None) -
     elif action == "expose" and target:
         hidden = [k for k in C.ATTR_KEYS if k not in target.revealed]
         await _reveal_attr(bot, game, target, random.choice(hidden), auto=False, count_turn=False,
-                           prefix=f"{head} на <b>{_e(target.name)}</b>!\n")
+                           prefix=f"{head} на <b>{_e(target.name)}</b>!\n\n")
     elif action == "swap" and target:
         mine, theirs = p.card.get("baggage", "—"), target.card.get("baggage", "—")
         p.card["baggage"], target.card["baggage"] = theirs, mine
@@ -1059,7 +1132,7 @@ async def _play_action(bot: Bot, game: Game, p: Player, target: Player | None) -
         p.card["health"] = random.choice(options)
         p.revealed.discard("health")
         await _reveal_attr(bot, game, p, "health", auto=False, count_turn=False,
-                           prefix=f"{head}! Здоровье переброшено:\n")
+                           prefix=f"{head}! Здоровье переброшено.\n\n")
     _schedule(bot, game, "board", lambda: _refresh_board(bot, game))
     _schedule(bot, game, "vote", lambda: _refresh_vote(bot, game))
 
@@ -1128,7 +1201,9 @@ async def _start_speech(bot: Bot, game: Game) -> None:
     game.stage = "speech"
     who = " и ".join(_mention(game.players[u]) for u in leaders)
     await _send(bot, game.chat_id,
-                f"🎤 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n{note}{who} — у вас {SPEECH_LEN} сек. "
+                f"🎤 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n{HR}\n\n"
+                + (f"<i>{note.strip()}</i>\n\n" if note else "")
+                + f"{who} — у вас <b>{SPEECH_LEN} сек</b>.\n\n"
                 f"Напишите в чат, почему вас нельзя оставлять за дверью!")
 
 
@@ -1141,12 +1216,12 @@ async def _end_speech(bot: Bot, game: Game) -> None:
         try:
             note = await ai.narrate_speeches(game.catastrophe, speeches, _style(game))
             if note:
-                await _send(bot, game.chat_id, f"🎙 <i>{_e(note)}</i>\n\n{tail}")
+                await _send(bot, game.chat_id, f"{_host(game, note)}\n\n{tail}")
                 return
         except Exception as e:
             logger.warning("AI speech note failed: %s", e)
     if not speeches:
-        tail = "🤐 Обвиняемые промолчали. " + tail
+        tail = "🤐 Обвиняемые промолчали.\n\n" + tail
     await _send(bot, game.chat_id, tail)
 
 
@@ -1237,28 +1312,27 @@ async def _tally(bot: Bot, game: Game) -> None:
     if game.first_out is None:
         game.first_out = loser.user_id
 
+    story_task = _ai_task(ai.narrate_elimination(game.catastrophe, loser.card or {}, game.round_no,
+                                                 _style(game))) if ai.available() else None
     await _edit(bot, game.chat_id, game.vote_msg_id,
                 f"🗳 <b>Голосование · раунд {game.round_no} — закрыто</b>\n\n{bars}")
     await _say(bot, game.chat_id,
-               f"{HR}\n🧮 <b>Итог раунда {game.round_no}</b>\n{bars}\n\n"
-               f"🚪 Из бункера не пускают <b>{_e(loser.name)}</b>{note}.", delay=2)
+               f"{HR}\n🧮 <b>ИТОГ РАУНДА {game.round_no}</b>\n{HR}\n\n{bars}\n\n"
+               f"🚪 Из бункера не пускают <b>{_e(loser.name)}</b>{note}.")
 
-    story = ""
-    if ai.available():
-        try:
-            story = await ai.narrate_elimination(game.catastrophe, loser.card or {}, game.round_no, _style(game))
-        except Exception as e:
-            logger.warning("AI narrate failed: %s", e)
+    story = (await story_task if story_task else None) or ""
+    voice = C.MODE_VOICE.get(game.mode, C.MODE_VOICE["classic"])
     caption = f"📂 <b>Досье изгнанного: {_e(loser.name)}</b>"
     if story:
-        caption += f"\n<blockquote expandable>{_e(_cut(story, MAX_CAPTION - len(caption) - 60))}</blockquote>"
+        room = MAX_CAPTION - len(caption) - len(voice) - 60
+        caption += f"\n\n{voice}\n<blockquote expandable>{_e(_cut(story, room))}</blockquote>"
     try:
         png = await _render(loser, game, stamp="out", revealed=set(loser.revealed))
         await _send_photo(bot, game.chat_id, png, caption)
     except Exception as e:
         logger.warning("exile card failed: %s", e)
         if story:
-            await _send(bot, game.chat_id, f"🎙 <i>{_e(story)}</i>")
+            await _send(bot, game.chat_id, _host(game, story))
     await _refresh_board(bot, game)
     await asyncio.sleep(STEP_DELAY)
 
@@ -1270,39 +1344,17 @@ async def _finish(bot: Bot, game: Game) -> None:
     game.phase = "ended"
     survivors = _alive(game)
     exiled = [p for p in game.players.values() if not p.alive]
+    # Вердикт ИИ пишет, пока все смотрят на пропуска выживших
+    verdict_task = _ai_task(ai.final_verdict(
+        game.catastrophe, game.bunker, game.bunker_known,
+        [p.card or {"name": p.name} for p in survivors], [p.name for p in exiled], _style(game),
+    )) if ai.available() else None
+
     names = ", ".join(_e(p.name) for p in survivors)
-    await _say(bot, game.chat_id, f"{HR}\n🚪🔒 <b>Люк задраен.</b>\nВ бункере остаются: <b>{names}</b>.")
+    await _say(bot, game.chat_id,
+               f"{HR}\n🚪🔒 <b>ЛЮК ЗАДРАЕН</b>\n{HR}\n\nВ бункере остаются:\n<b>{names}</b>", delay=3)
 
-    verdict = None
-    if ai.available():
-        try:
-            verdict = await ai.final_verdict(
-                game.catastrophe, game.bunker, game.bunker_known,
-                [p.card or {"name": p.name} for p in survivors], [p.name for p in exiled], _style(game),
-            )
-        except Exception as e:
-            logger.warning("AI verdict failed: %s", e)
-    if not verdict or not verdict.get("story"):
-        ok = random.random() < 0.55
-        verdict = {"survived": ok, "story": (
-            "Год в бункере прошёл в спорах о гречке и графике дежурств по туалету. "
-            + ("Когда люк открылся, снаружи их встретил новый мир — и он был не так уж плох."
-               if ok else "Когда пришло время открывать люк, открывать было уже некому.")
-        )}
-    result = "✅ <b>КОЛОНИЯ ВЫЖИЛА!</b>" if verdict["survived"] else "☠️ <b>КОЛОНИЯ ПОГИБЛА.</b>"
-    await _say(bot, game.chat_id, f"📖 <b>Эпилог</b>\n{_quote(verdict['story'])}\n🏁 Вердикт: {result}")
-
-    alive_ids = {p.user_id for p in survivors}
-    results = []
-    goal_lines = ["🎯 <b>Тайные цели</b>", HR]
-    for p in game.players.values():
-        done = C.goal_done(p.goal or {}, p.alive, alive_ids)
-        goal_lines.append(f"{'✅' if done else '❌'} <b>{_e(p.name)}</b> — {_e((p.goal or {}).get('text', '—'))}")
-        results.append({"user_id": p.user_id, "name": p.name, "survived": p.alive,
-                        "first_out": p.user_id == game.first_out, "goal_done": done})
-    await _say(bot, game.chat_id, "\n".join(goal_lines), delay=2)
-
-    # Альбом выживших с печатью «ДОПУЩЕН»
+    # Альбом выживших с печатью «ДОПУЩЕН» — до эпилога
     try:
         media = []
         for i, p in enumerate(survivors):
@@ -1313,8 +1365,32 @@ async def _finish(bot: Bot, game: Game) -> None:
             ))
         for i in range(0, len(media), 10):
             await _retry(bot.send_media_group, game.chat_id, media[i:i + 10])
+        if media:
+            await asyncio.sleep(STEP_DELAY)
     except Exception as e:
         logger.warning("survivor album failed: %s", e)
+
+    verdict = await verdict_task if verdict_task else None
+    if not verdict or not verdict.get("story"):
+        ok = random.random() < 0.55
+        verdict = {"survived": ok, "story": (
+            "Год в бункере прошёл в спорах о гречке и графике дежурств по туалету.\n\n"
+            + ("Когда люк открылся, снаружи их встретил новый мир — и он был не так уж плох."
+               if ok else "Когда пришло время открывать люк, открывать было уже некому.")
+        )}
+    result = "✅ <b>КОЛОНИЯ ВЫЖИЛА!</b>" if verdict["survived"] else "☠️ <b>КОЛОНИЯ ПОГИБЛА.</b>"
+    await _say(bot, game.chat_id,
+               f"📖 <b>ЭПИЛОГ</b>\n{HR}\n\n{_quote(verdict['story'])}\n\n🏁 Вердикт: {result}")
+
+    alive_ids = {p.user_id for p in survivors}
+    results = []
+    goal_lines = [f"🎯 <b>ТАЙНЫЕ ЦЕЛИ</b>\n{HR}"]
+    for p in game.players.values():
+        done = C.goal_done(p.goal or {}, p.alive, alive_ids)
+        goal_lines.append(f"{'✅' if done else '❌'} <b>{_e(p.name)}</b>\n{_e((p.goal or {}).get('text', '—'))}")
+        results.append({"user_id": p.user_id, "name": p.name, "survived": p.alive,
+                        "first_out": p.user_id == game.first_out, "goal_done": done})
+    await _say(bot, game.chat_id, "\n\n".join(goal_lines), delay=3)
 
     if game.db:
         try:
@@ -1328,6 +1404,8 @@ async def _finish(bot: Bot, game: Game) -> None:
             await bot.unpin_chat_message(game.chat_id, message_id=game.board_msg_id)
         except Exception:
             pass
-    await _send(bot, game.chat_id, "Игра окончена! Спасибо за игру 🖤\n/bunker — сыграть ещё · /top — рейтинг")
+    await _send(bot, game.chat_id,
+                "🖤 <b>Игра окончена!</b> Спасибо за игру.\n\n"
+                "🔁 /bunker — сыграть ещё\n🏆 /top — рейтинг выживших")
     if games.get(game.chat_id) is game:
         games.pop(game.chat_id, None)
