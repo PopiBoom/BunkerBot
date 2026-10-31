@@ -130,7 +130,8 @@ async def tick(bot: Bot, db: Database) -> None:
     except ValueError:
         prev = []
     try:
-        text = await ai.own_channel_post(await _style_examples(db), prev)
+        model = await db.get_setting("post_model", "") or None  # победитель /compare, если выбран
+        text = await ai.own_channel_post(await _style_examples(db), prev, model=model)
     except Exception as e:
         logger.warning("channel post text failed: %s", e)
         return

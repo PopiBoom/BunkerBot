@@ -6,6 +6,7 @@ from .quotes import router as quotes_router
 from .stats import router as stats_router
 from .roast import router as roast_router
 from .fun import router as fun_router
+from .compare import router as compare_router
 
 __all__ = ["user_router", "admin_router", "help_router", "quotes_router", "stats_router", "roast_router",
-           "fun_router"]
+           "fun_router", "compare_router"]

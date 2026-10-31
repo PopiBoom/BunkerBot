@@ -1472,15 +1472,21 @@ POST_MODEL = os.getenv("AI_MODEL_POSTS", "").strip() or MODEL   # кто пиш�
 POST_EFFORT = os.getenv("AI_POSTS_EFFORT", "").strip() or "high"  # юмору нужно подумать
 
 
-async def own_channel_post(examples: list[str], previous: list[str], model: str | None = None,
-                           effort: str | None = None) -> str:
-    """Пост в канал: сначала смешно, ругань — там, где бьёт. Модель и глубина — из настроек."""
+def pick_post_topic(previous: list[str]) -> str:
     prev_text = " ".join(previous[-12:]).lower()
     topics = [t for t in _POST_TOPICS if t not in _recent_topics
               and t.split()[0][:5].lower() not in prev_text] or _POST_TOPICS
     topic = random.choice(topics)
     _recent_topics.append(topic)
     del _recent_topics[:-15]
+    return topic
+
+
+async def own_channel_post(examples: list[str], previous: list[str], model: str | None = None,
+                           effort: str | None = None, topic: str | None = None) -> str:
+    """Пост в канал: сначала смешно, ругань — там, где бьёт. Модель и глубина — из настроек.
+    model: Claude (claude-…) или любая модель OpenRouter (x-ai/grok-4.7 и т.п.)."""
+    topic = topic or pick_post_topic(previous)
     ex = "\n".join(f"<post>{t[:300]}</post>" for t in examples[-8:])
     prev = "\n".join(f"<post>{t[:300]}</post>" for t in previous[-10:])
     user = (
@@ -1502,7 +1508,70 @@ async def own_channel_post(examples: list[str], previous: list[str], model: str 
         "Придумай про себя 3 варианта и выдай только самый смешной."
         + _JSON_REPLY
     )
-    out = _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=16000, model=model or POST_MODEL,
-                                       effort=effort or POST_EFFORT))
+    out = _clean_reply(await complete_any(ROAST_SYSTEM, user, model=model or POST_MODEL, max_tokens=16000,
+                                          effort=effort or POST_EFFORT))
     return await fix_looks(scrub(out))
 
+
+
+# ---------- сторонние модели через OpenRouter (для постов и слепого сравнения) ----------
+# Claude вызываем как обычно, через SDK Anthropic. Модель с «/» в названии (x-ai/grok-4.7,
+# openai/gpt-6.1-terra-pro…) — это OpenRouter: один ключ OPENROUTER_API_KEY на сотни моделей.
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def openrouter_available() -> bool:
+    return bool(os.getenv("OPENROUTER_API_KEY", "").strip())
+
+
+def is_openrouter(model: str | None) -> bool:
+    return bool(model) and "/" in model
+
+
+async def _complete_openrouter(system: str, user: str, model: str, max_tokens: int = 8000) -> str:
+    """Один запрос к модели через OpenRouter (их API совместим с OpenAI chat completions)."""
+    import aiohttp
+
+    key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not key:
+        raise AIUnavailable("OPENROUTER_API_KEY не задан")
+    body = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "usage": {"include": True},  # вернёт стоимость запроса в долларах — для «Расходов ИИ»
+    }
+    headers = {"Authorization": f"Bearer {key}", "X-Title": "BunkerBot"}
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180), trust_env=True) as s:
+        async with s.post(OPENROUTER_URL, json=body, headers=headers) as r:
+            data = await r.json(content_type=None)
+            if r.status != 200 or "error" in data:
+                err = (data.get("error") or {}).get("message") if isinstance(data, dict) else data
+                raise AIUnavailable(f"OpenRouter {r.status}: {err}")
+    usage = data.get("usage") or {}
+    tin, tout = int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
+    cost = float(usage.get("cost") or 0.0)
+    logger.info("AI %s: in=%s out=%s ≈ $%.4f", model, tin, tout, cost)
+    if _usage_sink:
+        try:
+            await _usage_sink(current_game.get(), model, tin, tout, cost)
+        except Exception as e:
+            logger.warning("usage sink failed: %s", e)
+    choice = (data.get("choices") or [{}])[0]
+    return str((choice.get("message") or {}).get("content") or "").strip()
+
+
+async def complete_any(system: str, user: str, model: str, max_tokens: int = 8000, effort: str = "high") -> str:
+    """Claude — через SDK Anthropic, всё с «/» в названии — через OpenRouter."""
+    if is_openrouter(model):
+        return await _complete_openrouter(system, user, model, max_tokens)
+    return await _complete(system, user, max_tokens=max_tokens, model=model, effort=effort)
+
+
+# Кого сравниваем в /compare (можно поменять в .env: COMPARE_MODELS через запятую)
+COMPARE_MODELS = [m.strip() for m in os.getenv(
+    "COMPARE_MODELS",
+    "claude-opus-5-5,claude-fable-5-1,openai/gpt-6.1-terra-pro,x-ai/grok-4.7,google/gemini-4-argon,"
+    "moonshotai/kimi-k3.1-pro",
+).split(",") if m.strip()]

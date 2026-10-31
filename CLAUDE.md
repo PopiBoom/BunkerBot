@@ -27,6 +27,9 @@ Telegram-бот на aiogram 3 + Claude API. Владелец общается �
   BOT_CHANNEL_ID. Пишет AI_MODEL_POSTS (Opus по умолчанию) с effort high — на Sonnet/low юмор был
   плоский. Без подписи; тон злой, с матом и оскорблениями «вас»/людей в целом — без имён и
   переписки из чата (канал публичный); свои посты в чате не комментирует.
+- `handlers/compare.py` — /compare (админ, ЛС): слепое сравнение моделей на постах (ai.COMPARE_MODELS:
+  Claude напрямую, остальные — OpenRouter, `OPENROUTER_API_KEY`); победитель → настройка `post_model`
+  в базе (перекрывает AI_MODEL_POSTS). `ai.complete_any()`: модель с «/» — OpenRouter, иначе Claude SDK.
 - `handlers/quotes.py` — цитатник «золотой фонд» (/quote, картинка-карточка, фразы дня от ИИ).
 - `handlers/stats.py` — /stats: статистика чата и личная, без ИИ (мат, нытьё, совы, молчуны).
 - `commands.py` — все команды по разделам: из него строятся меню «/» и /help (`handlers/help.py`).
