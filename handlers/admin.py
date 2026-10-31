@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import logging
 
 from aiogram import Bot, F, Router
@@ -156,8 +157,11 @@ async def admin_import_file(message: Message, bot: Bot, db: Database, config: Co
     if message.from_user is None or not _is_admin(message.from_user.id, config):
         return
     doc = message.document
+    if doc and (doc.file_name or "").lower().endswith(".db"):
+        await _restore_db(message, bot, db)
+        return
     if not doc or not (doc.file_name or "").lower().endswith(".json"):
-        await message.answer("Пришлите выгрузку чата в формате JSON (файл result.json).")
+        await message.answer("Пришлите выгрузку чата (result.json) или бэкап базы (*.db).")
         return
     if (doc.file_size or 0) > 20 * 1024 * 1024:
         await message.answer("Файл больше 20 МБ — Telegram не даст боту его скачать. "
@@ -242,6 +246,88 @@ async def admin_react_set(call: CallbackQuery, db: Database, config: Config) -> 
             await call.message.edit_text(_react_text(react_label(rate)), reply_markup=react_rate_keyboard(rate))
         except Exception as e:
             logger.warning("react menu edit failed: %s", e)
+
+
+# --- Бэкап и восстановление базы (для переезда на сервер) ---
+
+_DB_TABLES = {"users", "settings", "chat_messages", "dossiers", "bunker_stats"}
+
+
+@router.message(Command("backup"))
+async def cmd_backup(message: Message, bot: Bot, db: Database, config: Config) -> None:
+    if message.from_user is None or not _is_admin(message.from_user.id, config):
+        await message.answer(texts.ADMIN_ONLY)
+        return
+    await _send_backup(message, bot, db)
+
+
+@router.callback_query(F.data == "admin:backup")
+async def admin_backup(call: CallbackQuery, bot: Bot, db: Database, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    await call.answer()
+    if call.message:
+        await _send_backup(call.message, bot, db)
+
+
+async def _send_backup(message: Message, bot: Bot, db: Database) -> None:
+    """Согласованная копия базы (через sqlite backup API) — файлом в личку."""
+    import sqlite3
+    import tempfile
+    import time as _t
+
+    from aiogram.types import FSInputFile
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
+    src = sqlite3.connect(db.path)
+    dst = sqlite3.connect(tmp)
+    with dst:
+        src.backup(dst)
+    src.close()
+    dst.close()
+    name = f"bunkerbot-backup-{_t.strftime('%Y%m%d-%H%M')}.db"
+    await bot.send_document(
+        message.chat.id, FSInputFile(tmp, filename=name),
+        caption="💾 Бэкап базы: досье, переписка, рейтинги, обещания, настройки.\n\n"
+                "Чтобы восстановить на другом сервере — просто пришлите этот файл боту в личку.",
+    )
+    os.remove(tmp)
+
+
+async def _restore_db(message: Message, bot: Bot, db: Database) -> None:
+    import shutil
+    import sqlite3
+    import tempfile
+    import time as _t
+
+    doc = message.document
+    if (doc.file_size or 0) > 20 * 1024 * 1024:
+        await message.answer("Файл больше 20 МБ — Telegram не даст боту его скачать.")
+        return
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
+    await bot.download(doc, destination=tmp)
+    try:
+        con = sqlite3.connect(tmp)
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        con.close()
+    except Exception as e:
+        await message.answer(f"Это не база бота: {e}")
+        os.remove(tmp)
+        return
+    if not _DB_TABLES <= tables:
+        await message.answer("Это не бэкап этого бота — не хватает таблиц: " + ", ".join(sorted(_DB_TABLES - tables)))
+        os.remove(tmp)
+        return
+    old = f"{db.path}.before-restore-{_t.strftime('%Y%m%d-%H%M%S')}"
+    if os.path.exists(db.path):
+        shutil.copy2(db.path, old)
+    shutil.move(tmp, db.path)
+    await db.init()  # досоздаст таблицы, если бэкап старее кода
+    await message.answer(
+        "✅ База восстановлена: досье, переписка, рейтинги, обещания и настройки на месте.\n"
+        f"Прежняя база сохранена рядом: <code>{os.path.basename(old)}</code>"
+    )
 
 
 @router.callback_query(F.data == "admin:ai_costs")
