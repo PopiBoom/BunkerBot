@@ -1531,8 +1531,20 @@ async def own_channel_post(examples: list[str], previous: list[str], model: str 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
+_openrouter_key = ""  # ключ из базы бота (команда /setkey) — когда его нет в .env
+
+
+def set_openrouter_key(key: str) -> None:
+    global _openrouter_key
+    _openrouter_key = (key or "").strip()
+
+
+def openrouter_key() -> str:
+    return os.getenv("OPENROUTER_API_KEY", "").strip() or _openrouter_key
+
+
 def openrouter_available() -> bool:
-    return bool(os.getenv("OPENROUTER_API_KEY", "").strip())
+    return bool(openrouter_key())
 
 
 def is_openrouter(model: str | None) -> bool:
@@ -1543,9 +1555,9 @@ async def _complete_openrouter(system: str, user: str, model: str, max_tokens: i
     """Один запрос к модели через OpenRouter (их API совместим с OpenAI chat completions)."""
     import aiohttp
 
-    key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    key = openrouter_key()
     if not key:
-        raise AIUnavailable("OPENROUTER_API_KEY не задан")
+        raise AIUnavailable("ключ OpenRouter не задан (.env или /setkey)")
     body = {
         "model": model,
         "max_tokens": max_tokens,

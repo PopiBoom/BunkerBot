@@ -31,6 +31,8 @@ Telegram-бот на aiogram 3 + Claude API. Владелец общается �
 - `handlers/compare.py` — /compare (админ, ЛС): слепое сравнение моделей на постах (ai.COMPARE_MODELS:
   Claude напрямую, остальные — OpenRouter, `OPENROUTER_API_KEY`); победитель → настройка `post_model`
   в базе (перекрывает AI_MODEL_POSTS). `ai.complete_any()`: модель с «/» — OpenRouter, иначе Claude SDK.
+  Ключ OpenRouter: `.env` или `/setkey` в ЛС боту (хранится в базе, настройка `openrouter_key`;
+  в репозиторий ключи не класть — он публичный).
 - `handlers/quotes.py` — цитатник «золотой фонд» (/quote, картинка-карточка, фразы дня от ИИ).
 - `handlers/stats.py` — /stats: статистика чата и личная, без ИИ (мат, нытьё, совы, молчуны).
 - `commands.py` — все команды по разделам: из него строятся меню «/» и /help (`handlers/help.py`).

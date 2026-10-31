@@ -7,7 +7,7 @@ import logging
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
@@ -85,6 +85,61 @@ async def admin_roast_toggle(call: CallbackQuery, db: Database, config: Config) 
             "иногда сам подкалывает, отвечает на обращения, /roast, /week. "
             "Участники могут отказаться: /forget_me."
         )
+
+
+@router.message(Command("setkey"))
+async def cmd_setkey(message: Message, command: CommandObject, db: Database, config: Config) -> None:
+    """Ключ OpenRouter — в базу бота на сервере (не в GitHub). Сообщение с ключом бот сразу удаляет."""
+    if message.from_user is None or not _is_admin(message.from_user.id, config):
+        await message.answer(texts.ADMIN_ONLY)
+        return
+    import ai
+
+    arg = (command.args or "").strip()
+    if not arg:
+        await message.answer(
+            "🔑 <b>Ключ OpenRouter</b>\n\n<code>/setkey sk-or-...</code> — сохранить (сообщение с ключом удалю)\n"
+            "<code>/setkey off</code> — удалить\n\n"
+            f"Сейчас: {'есть ✅' if ai.openrouter_available() else 'нет'}. Ключ хранится в базе бота на сервере, "
+            "в GitHub не попадает (но есть в файлах /backup — их не пересылай).")
+        return
+    try:
+        await message.delete()  # ключ не должен висеть в переписке
+    except Exception:
+        pass
+    if arg.lower() in ("off", "удалить", "-"):
+        await db.set_setting("openrouter_key", "")
+        ai.set_openrouter_key("")
+        await message.answer("🔑 Ключ OpenRouter удалён из базы бота.")
+        return
+    if not arg.startswith("sk-or-"):
+        await message.answer("Это не похоже на ключ OpenRouter (он начинается с <code>sk-or-</code>).")
+        return
+    balance = await _openrouter_balance(arg)
+    if balance is None:
+        await message.answer("❌ OpenRouter не принял ключ — проверь, что он скопирован целиком и не удалён.")
+        return
+    await db.set_setting("openrouter_key", arg)
+    ai.set_openrouter_key(arg)
+    await message.answer(f"✅ Ключ OpenRouter сохранён на сервере, сообщение с ним удалил.\n"
+                         f"Баланс: <b>${balance:.2f}</b>. Теперь работают /compare и Gemini в постах.")
+
+
+async def _openrouter_balance(key: str) -> float | None:
+    """Остаток на OpenRouter или None, если ключ не принят."""
+    import aiohttp
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15), trust_env=True) as s:
+            async with s.get("https://openrouter.ai/api/v1/credits",
+                             headers={"Authorization": f"Bearer {key}"}) as r:
+                if r.status != 200:
+                    return None
+                d = (await r.json()).get("data") or {}
+                return float(d.get("total_credits") or 0) - float(d.get("total_usage") or 0)
+    except Exception as e:
+        logger.warning("openrouter balance check failed: %s", e)
+        return None
 
 
 @router.callback_query(F.data == "admin:chan_posts")

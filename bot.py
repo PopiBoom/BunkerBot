@@ -63,6 +63,7 @@ async def main() -> None:
     await db.init()
     import ai
     ai.set_usage_sink(db.add_ai_usage)  # учёт токенов и стоимости запросов к ИИ
+    ai.set_openrouter_key(await db.get_setting("openrouter_key", ""))  # ключ, присланный боту через /setkey
 
     dp = Dispatcher(storage=MemoryStorage())
     # Прокидываем зависимости в обработчики (aiogram подставит по имени параметра)
