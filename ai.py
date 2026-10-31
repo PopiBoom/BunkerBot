@@ -1,0 +1,148 @@
+"""«Мозг» ведущего на базе Claude (Anthropic API).
+
+Генерирует сценарий «Бункера», абсурдные карточки игроков, вступительную речь,
+короткие шутки по ходу и эпилог. Если ключа нет или запрос не удался —
+вызывающий код использует запасной генератор, так что игра не ломается.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+
+from anthropic import AsyncAnthropic
+
+# Модель можно поменять через переменную AI_MODEL (например, claude-haiku-5-5 — дешевле).
+MODEL = os.getenv("AI_MODEL", "claude-opus-5-5").strip() or "claude-opus-5-5"
+
+_client: AsyncAnthropic | None = None
+
+
+class AIUnavailable(RuntimeError):
+    """Ведущий не настроен или недоступен."""
+
+
+def _get_client() -> AsyncAnthropic:
+    global _client
+    if _client is None:
+        api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+        if not api_key:
+            raise AIUnavailable("ANTHROPIC_API_KEY не задан")
+        _client = AsyncAnthropic(api_key=api_key)
+    return _client
+
+
+def available() -> bool:
+    return bool(os.getenv("ANTHROPIC_API_KEY", "").strip())
+
+
+def _extract_json(text: str) -> dict:
+    text = text.strip()
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence:
+        return json.loads(fence.group(1))
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return json.loads(text[start : end + 1])
+    return json.loads(text)
+
+
+async def _complete(system: str, user: str, max_tokens: int = 2000) -> str:
+    client = _get_client()
+    resp = await client.messages.create(
+        model=MODEL,
+        max_tokens=max_tokens,
+        system=system,
+        output_config={"effort": "low"},
+        messages=[{"role": "user", "content": user}],
+    )
+    return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+
+# ---------- генерация партии ----------
+
+SETUP_SYSTEM = (
+    "Ты — дерзкий и остроумный ведущий игры «Бункер». Сочиняешь абсурдные, "
+    "чёрно-юморные карточки с лёгким 18+: сюрреалистичные, неожиданные, смешные "
+    "(например, профессия «профессиональный дождевой червь» или хобби «коллекционирует "
+    "чужие сны»). Без порнографии, жести, реальных оскорблений и политики. "
+    "Отвечаешь СТРОГО одним JSON-объектом без пояснений и без markdown."
+)
+
+
+async def generate_setup(player_names: list[str]) -> dict:
+    """Возвращает dict: catastrophe, bunker, cards (по игроку на имя)."""
+    names_json = json.dumps(player_names, ensure_ascii=False)
+    user = (
+        f"Игроки (по именам): {names_json}.\n"
+        "Сгенерируй партию «Бункера» с абсурдным чёрным юмором. Верни JSON вида:\n"
+        "{\n"
+        '  "catastrophe": "2-3 предложения: абсурдная, но мрачная катастрофа",\n'
+        '  "bunker": "2-3 предложения: странный бункер, запасы, условия",\n'
+        '  "cards": [\n'
+        "    {\n"
+        '      "name": "<имя игрока ровно как в списке>",\n'
+        '      "profession": "абсурдная профессия со стажем",\n'
+        '      "bio": "пол, возраст, странная деталь телосложения",\n'
+        '      "health": "неожиданное состояние здоровья",\n'
+        '      "hobby": "дикое хобби",\n'
+        '      "phobia": "абсурдная фобия",\n'
+        '      "baggage": "странный предмет в багаже",\n'
+        '      "fact": "шокирующий или нелепый факт",\n'
+        '      "ability": "сюрреалистичное умение или условие"\n'
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "Ровно один объект cards на каждого игрока, name — точно из списка. "
+        "Каждое поле — коротко (2-7 слов), смешно и абсурдно. Лёгкое 18+ допустимо, "
+        "но без пошлятины и чернухи."
+    )
+    text = await _complete(SETUP_SYSTEM, user, max_tokens=4000)
+    return _extract_json(text)
+
+
+# ---------- комментарии ведущего ----------
+
+HOST_SYSTEM = (
+    "Ты — харизматичный ведущий игры «Бункер» с чёрным юмором. Пишешь коротко, "
+    "атмосферно и смешно, на русском. Лёгкое 18+ допустимо, без пошлятины, жести "
+    "и оскорблений конкретных людей. Без markdown-заголовков."
+)
+
+
+async def narrate_intro(catastrophe: str, bunker: str) -> str:
+    user = (
+        f"Катастрофа: {catastrophe}\nБункер: {bunker}\n"
+        "Скажи вступительное слово как ведущий (2-3 предложения): задай настроение, "
+        "подколи игроков, объясни что сейчас будут раскрывать карты и голосовать."
+    )
+    return await _complete(HOST_SYSTEM, user, max_tokens=350)
+
+
+async def narrate_quip(name: str, label: str, value: str) -> str:
+    user = (
+        f"Игрок «{name}» только что открыл характеристику — {label}: «{value}».\n"
+        "Отреагируй ОДНОЙ короткой смешной фразой ведущего (до 20 слов)."
+    )
+    return await _complete(HOST_SYSTEM, user, max_tokens=120)
+
+
+async def narrate_elimination(catastrophe: str, card: dict, round_no: int) -> str:
+    user = (
+        f"Катастрофа: {catastrophe}\n"
+        f"Раунд {round_no}. Группа проголосовала и НЕ пускает в бункер этого человека:\n"
+        f"{json.dumps(card, ensure_ascii=False)}\n"
+        "Опиши коротко и с чёрным юмором (2-3 предложения), как он уходит от бункера."
+    )
+    return await _complete(HOST_SYSTEM, user, max_tokens=400)
+
+
+async def narrate_epilogue(catastrophe: str, bunker: str, survivors: list[dict]) -> str:
+    user = (
+        f"Катастрофа: {catastrophe}\nБункер: {bunker}\n"
+        f"В бункер попали эти выжившие:\n{json.dumps(survivors, ensure_ascii=False)}\n"
+        "Напиши эпилог (4-6 предложений): смогут ли они ужиться, с чёрным юмором "
+        "и неожиданным поворотом."
+    )
+    return await _complete(HOST_SYSTEM, user, max_tokens=700)
