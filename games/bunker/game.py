@@ -779,7 +779,8 @@ async def _run_game(bot: Bot, game: Game) -> None:
     status = await _send(bot, game.chat_id, "🎙 Ведущий готовит сценарий… (до минуты)")
 
     try:
-        setup = await ai.generate_setup(names) if ai.available() else C.fallback_setup(names)
+        setup = (await ai.generate_setup(names, C.style_examples()) if ai.available()
+                 else C.fallback_setup(names))
     except Exception as e:
         logger.warning("AI setup failed: %s", e)
         setup = C.fallback_setup(names)

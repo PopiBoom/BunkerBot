@@ -93,7 +93,7 @@ SETUP_SYSTEM = (
 )
 
 
-async def generate_setup(player_names: list[str]) -> dict:
+async def generate_setup(player_names: list[str], examples: dict | None = None) -> dict:
     """Возвращает dict: catastrophe, bunker, bunker_secrets, cards (по игроку на имя)."""
     names_json = json.dumps(player_names, ensure_ascii=False)
     user = (
@@ -131,6 +131,11 @@ async def generate_setup(player_names: list[str]) -> dict:
         "с бесполезным и вредным, чтобы карточки сталкивались между собой и с бункером "
         "и было о чём спорить. Лёгкое 18+ допустимо, но без пошлятины и чернухи."
     )
+    if examples:
+        user += (
+            "\nПримеры нужного стиля по полям (НЕ копируй, придумай свои, не хуже):\n"
+            + json.dumps(examples, ensure_ascii=False)
+        )
     text = await _complete(SETUP_SYSTEM, user, max_tokens=16000)
     return _extract_json(text)
 
