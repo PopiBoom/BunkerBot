@@ -7,7 +7,9 @@
   * /week — итоги недели с номинациями; сам публикует их по воскресеньям вечером (МСК);
   * иногда сам подкалывает кого-то, когда в чате оживлённо;
   * отвечает, если к нему обращаются, и огрызается, если его посылают;
-  * /forget_me — удалить всё о себе и не попадать под стёб, /remember_me — вернуться.
+  * /forget_me — удалить всё о себе и не попадать под стёб, /remember_me — вернуться;
+  * комментирует посты канала бати (Memento Mori), запоминает стикеры чата и кидает их к месту;
+  * пока в чате идёт «Бункер» — молчит (только запоминает).
 Включается/выключается в /admin (настройка roast_enabled).
 """
 from __future__ import annotations
@@ -290,6 +292,64 @@ async def _say(bot: Bot, chat_id: int, text: str, reply_to: int | None = None) -
             logger.debug("save own message failed: %s", e)
 
 
+# ---------- посты канала бати ----------
+
+# Названия каналов бати через запятую (BOT_CHANNEL_NAMES в .env). Автопересылка из
+# привязанного к чату канала считается постом бати всегда.
+CHANNEL_NAMES = [n.strip().lower() for n in os.getenv("BOT_CHANNEL_NAMES", "Memento Mori").split(",") if n.strip()]
+CHANNEL_USER_ID = -1          # так посты канала подписаны в памяти чата (не человек и не бот)
+_seen_albums: set[tuple[int, str]] = set()
+
+
+def _is_father_channel_post(message: Message) -> bool:
+    sc = message.sender_chat
+    if sc is None or sc.type != "channel":
+        return False
+    title = (sc.title or "").lower()
+    return bool(message.is_automatic_forward) or any(n in title for n in CHANNEL_NAMES)
+
+
+@router.message(_is_father_channel_post)
+async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
+    chat_id = message.chat.id
+    if not _db_ref:
+        _db_ref.append(db)
+    if message.media_group_id:  # альбом приходит пачкой сообщений — комментируем один раз
+        key = (chat_id, message.media_group_id)
+        if key in _seen_albums:
+            return
+        _seen_albums.add(key)
+        if len(_seen_albums) > 300:
+            _seen_albums.clear()
+    channel = message.sender_chat.title or "канал бати"
+    text = message.text or message.caption or ""
+    media = ("фото" if message.photo else "видео" if message.video or message.animation else
+             "голосовое" if message.voice or message.video_note else "опрос" if message.poll else
+             "файл" if message.document else "")
+    if text or media:
+        await db.add_chat_message(chat_id, message.message_id, CHANNEL_USER_ID, f"📢 {channel} (пост бати)",
+                                  None, (f"[{media}] " if media else "") + text[:1000])
+    if not await _enabled(db) or not ai.available() or _bunker_active(chat_id):
+        return
+    if not text and not media:
+        return
+    image = None
+    try:
+        if message.photo:
+            sizes = sorted(message.photo, key=lambda p: p.width)
+            photo = next((p for p in reversed(sizes) if p.width <= 1280), sizes[0])
+            image = ((await bot.download(photo)).read(), "image/jpeg")
+        await asyncio.sleep(random.uniform(3.0, 6.0))  # «прочитал» пост
+        await bot.send_chat_action(chat_id, "typing")
+        await _remember_lines(db, chat_id)
+        answer = await ai.channel_comment(channel, text, media, image, await db.style_sample(chat_id))
+    except Exception as e:
+        logger.warning("channel comment failed: %s", e)
+        return
+    if answer:
+        await _say(bot, chat_id, answer, reply_to=message.message_id)
+
+
 # ---------- команды ----------
 
 
@@ -316,6 +376,9 @@ async def cmd_roast(message: Message, command: CommandObject, bot: Bot, db: Data
         return
     if not ai.available():
         await message.reply("Для прожарки нужен ключ ИИ.")
+        return
+    if _bunker_active(message.chat.id):
+        await message.reply("Идёт Бункер — прожарю после партии 😈")
         return
     chat_id = message.chat.id
     now = time.time()
@@ -362,7 +425,7 @@ async def _week_digest(bot: Bot, db: Database, chat_id: int) -> bool:
     rows = await db.recent_messages(chat_id, limit=2000, since=int(time.time()) - 7 * 86400)
     by_user: dict[str, list[str]] = {}
     for _mid, uid, name, text, _ts in rows:
-        if uid == 0:  # свои реплики не номинируем
+        if uid <= 0:  # свои реплики и посты канала не номинируем
             continue
         by_user.setdefault(name or "Аноним", []).append(text)
     active = sorted(by_user.items(), key=lambda kv: -len(kv[1]))[:10]
@@ -378,6 +441,9 @@ async def _week_digest(bot: Bot, db: Database, chat_id: int) -> bool:
 async def cmd_week(message: Message, bot: Bot, db: Database) -> None:
     if not await _enabled(db) or not ai.available():
         await message.reply("Стёб-бот сейчас выключен.")
+        return
+    if _bunker_active(message.chat.id):
+        await message.reply("Идёт Бункер — итоги недели после партии.")
         return
     now = time.time()
     if now - _last_week_cmd.get(message.chat.id, 0) < WEEK_COOLDOWN:
@@ -415,6 +481,10 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     # Обещание с датой? Запомним и в срок напомним (в фоне, ответ не задерживает)
     if not optout and _PROMISE_HINT.search(message.text):
         _spawn(_check_promise(db, message))
+
+    # Пока идёт Бункер — бот только запоминает, не встревает и не ставит реакции
+    if _bunker_active(chat_id):
+        return
 
     # Защита бати: если кого-то обзывают — реагируем сразу, раньше всего остального
     if await _maybe_defend(message, bot, db, config):
@@ -496,8 +566,9 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
         if empty and n >= 1:
             chance = min(chance, 0.3)
         if random.random() > chance:
-            await _react(bot, chat_id, last_msg.message_id,
-                         "🖕" if rude else random.choice(COOL_REACTIONS), force=True)
+            if random.random() < STICKER_INSTEAD or not await _send_sticker(bot, db, chat_id, text, last_msg.message_id):
+                await _react(bot, chat_id, last_msg.message_id,
+                             "🖕" if rude else random.choice(COOL_REACTIONS), force=True)
             return
     dossier = await db.get_dossier(chat_id, who.id) if who else ""
 
@@ -539,6 +610,79 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
         await _say(bot, chat_id, answer, reply_to=last_msg.message_id)
         if who:
             _thread.setdefault((chat_id, who.id), []).append(time.time())
+        if random.random() < STICKER_AFTER:
+            await asyncio.sleep(random.uniform(1.0, 2.5))
+            await _send_sticker(bot, db, chat_id, f"{text}\nОтвет бота: {answer}")
+
+
+# ---------- стикеры ----------
+
+STICKER_AFTER = 0.2     # иногда после ответа бот докидывает стикер
+STICKER_INSTEAD = 0.5   # когда лень отвечать словами: доля случаев, где хватит реакции, а не стикера
+STICKER_REPLY = 0.7     # на стикер в ответ боту — стикером
+STICKER_RANDOM = 0.04   # на чужой стикер — иногда своим
+MIN_STICKERS = 3        # пока чат не накидал хотя бы столько разных — стикерами не отвечаем
+_sticker_last: dict[int, float] = {}
+STICKER_GAP = 20        # сек между стикерами бота в одном чате
+
+
+async def _send_sticker(bot: Bot, db: Database, chat_id: int, situation: str,
+                        reply_to: int | None = None) -> bool:
+    """Кидает подходящий по смыслу стикер из тех, что кидали в этом чате. True — кинул."""
+    if not ai.available() or _bunker_active(chat_id):
+        return False
+    if time.time() - _sticker_last.get(chat_id, 0) < STICKER_GAP:
+        return False
+    rows = await db.chat_stickers(chat_id)
+    if len(rows) < MIN_STICKERS:
+        return False
+    try:
+        n = await ai.pick_sticker(situation, [(r[1], r[2]) for r in rows])
+    except Exception as e:
+        logger.debug("pick sticker failed: %s", e)
+        return False
+    if not n:
+        return False
+    kwargs = {}
+    if reply_to:
+        kwargs["reply_parameters"] = ReplyParameters(message_id=reply_to, allow_sending_without_reply=True)
+    try:
+        await bot.send_sticker(chat_id, rows[n - 1][0], **kwargs)
+    except Exception as e:
+        logger.debug("send sticker failed: %s", e)
+        return False
+    _sticker_last[chat_id] = time.time()
+    _last_bot_msg[chat_id] = time.time()
+    if _db_ref:
+        try:
+            await _db_ref[0].add_chat_message(chat_id, 0, 0, BOT_SELF, None, f"[стикер {rows[n - 1][1] or ''}]")
+        except Exception:
+            pass
+    return True
+
+
+@router.message(F.sticker)
+async def on_group_sticker(message: Message, bot: Bot, db: Database) -> None:
+    user, st = message.from_user, message.sticker
+    if user is None or user.is_bot or st is None:
+        return
+    chat_id = message.chat.id
+    if not _db_ref:
+        _db_ref.append(db)
+    if not await _enabled(db) or await db.is_optout(chat_id, user.id):
+        return
+    await db.add_sticker(chat_id, st.file_unique_id, st.file_id, st.emoji, st.set_name)
+    await db.add_chat_message(chat_id, message.message_id, user.id, _name(message), user.username,
+                              f"[стикер {st.emoji or ''}]".strip())
+    if _bunker_active(chat_id):
+        return
+    reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user
+                        and message.reply_to_message.from_user.id == bot.id)
+    if random.random() < (STICKER_REPLY if reply_to_bot else STICKER_RANDOM):
+        ctx = _as_dicts(await db.recent_messages(chat_id, limit=6))
+        situation = "\n".join(f"{m['name']}: {m['text']}" for m in ctx)
+        await asyncio.sleep(random.uniform(1.0, 3.0))
+        await _send_sticker(bot, db, chat_id, situation, reply_to=message.message_id)
 
 
 # ---------- ловушка на обещания ----------
@@ -587,7 +731,9 @@ async def _check_promise(db: Database, message: Message) -> None:
 
 
 async def _remind_promises(bot: Bot, db: Database) -> None:
-    for pid, chat_id, user_id, name, msg_id, text, what, _due in await db.due_promises(int(time.time())):
+    for pid, chat_id, user_id, name, msg_id, text, what, _due in await db.due_promises(int(time.time()), limit=20):
+        if _bunker_active(chat_id):  # напомним после партии
+            continue
         await db.mark_promise(pid)
         try:
             await _remember_lines(db, chat_id)
@@ -670,20 +816,37 @@ async def _clown_of_day(bot: Bot, db: Database, chat_id: int) -> bool:
     rows = await db.recent_messages(chat_id, limit=1500, since=day_start)
     by_user: dict[int, tuple[str, list[str]]] = {}
     for _mid, uid, name, text, _ts in rows:
-        if uid == 0:
+        if uid <= 0:  # бот и посты канала
             continue
-        by_user.setdefault(uid, (name, []))[1].append(text)
+        by_user.setdefault(uid, (name or "Аноним", []))[1].append(text)
     active = {uid: v for uid, v in by_user.items() if len(v[1]) >= 3}
     if len(active) < 2:
         return False
-    samples = {name: msgs[-25:] for name, msgs in active.values()}
-    result = await ai.clown_of_day(samples, await db.chat_dossiers(chat_id))
-    winner = next((uid for uid, (name, _) in active.items() if name == result["name"]), None)
+    # У ИИ каждое имя должно быть уникальным: двух «Саш» различаем по @нику или номеру
+    label_of: dict[int, str] = {}
+    counts: dict[str, int] = {}
+    for _uid, (name, _m) in active.items():
+        counts[name] = counts.get(name, 0) + 1
+    seen: dict[str, int] = {}
+    for uid, (name, _m) in active.items():
+        if counts[name] == 1:
+            label_of[uid] = name
+            continue
+        uname = await db.last_username(chat_id, uid)
+        seen[name] = seen.get(name, 0) + 1
+        label = f"{name} (@{uname})" if uname else f"{name} #{seen[name]}"
+        while label in label_of.values():
+            label += "'"
+        label_of[uid] = label
+    samples = {label_of[uid]: msgs[-25:] for uid, (_n, msgs) in active.items()}
+    dossiers = {label_of[uid]: await db.get_dossier(chat_id, uid) for uid in active}
+    result = await ai.clown_of_day(samples, dossiers)
+    winner = next((uid for uid, label in label_of.items() if label == result["name"]), None)
     if winner is None or not result["reason"]:
         return False
-    await db.add_clown(chat_id, winner, result["name"])
-    total = dict((n, c) for n, c in await db.clown_top(chat_id, 50)).get(result["name"], 1)
-    await _say(bot, chat_id, f"🤡 КЛОУН ДНЯ — {result['name']}\n\n{result['reason']}\n\n"
+    await db.add_clown(chat_id, winner, active[winner][0])
+    total = next((c for uid, c in await db.clown_counts(chat_id) if uid == winner), 1)
+    await _say(bot, chat_id, f"🤡 КЛОУН ДНЯ — {label_of[winner]}\n\n{result['reason']}\n\n"
                              f"Клоун уже {total}-й раз. Таблица позора: /clowns")
     return True
 
@@ -722,7 +885,7 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int, interval: int) -> No
     rows = await db.recent_messages(chat_id, limit=30)
     answered = _answered.get(chat_id, set())
     since = max(int(last), int(_last_bot_msg.get(chat_id, 0)))
-    new_ids = {r[0] for r in rows if r[4] >= since and r[0] not in answered and r[1] != 0}
+    new_ids = {r[0] for r in rows if r[4] >= since and r[0] not in answered and r[1] > 0}
     if not new_ids:
         return
     await _remember_lines(db, chat_id)
@@ -760,7 +923,7 @@ async def _heavy(bot: Bot, db: Database) -> None:
         today = now_msk.strftime("%Y-%m-%d")
         for chat_id in await db.active_chats(int(time.time()) - 86400):
             key = f"roast_clown:{chat_id}"
-            if await db.get_setting(key, "") == today:
+            if await db.get_setting(key, "") == today or _bunker_active(chat_id):
                 continue
             await db.set_setting(key, today)
             try:
@@ -771,7 +934,7 @@ async def _heavy(bot: Bot, db: Database) -> None:
         for chat_id in await db.active_chats(int(time.time()) - 7 * 86400):
             key = f"roast_week:{chat_id}"
             last = float(await db.get_setting(key, "0") or 0)
-            if time.time() - last > 6 * 86400:
+            if time.time() - last > 6 * 86400 and not _bunker_active(chat_id):
                 await db.set_setting(key, str(time.time()))
                 try:
                     await _week_digest(bot, db, chat_id)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import re
 
 # key, подпись, эмодзи для чата, значок для картинки (глиф из DejaVu Sans)
 ATTRS = [
@@ -370,6 +371,36 @@ def clean_bio(bio: str) -> str:
     if len(parts) >= 2 and any(ch.isdigit() for ch in parts[1]):
         return f"{parts[0]}, {parts[1]}"
     return parts[0]
+
+
+_HUMAN_BIO = re.compile(
+    r"^(мужчина|женщина|парень|девушка|бабушка|дедушка|бабуля|дед|мальчик|девочка|подросток|"
+    r"старик|старушка|человек|студент\w*|пенсионер\w*|мужик|тётя|дядя)\b", re.IGNORECASE)
+
+
+def is_human_bio(bio: str) -> bool:
+    return bool(_HUMAN_BIO.match(str(bio).strip()))
+
+
+# Нелюди из запасного списка — ими добиваем партию, если ИИ выдал одних людей
+CREATURE_BIOS = [b for b in FALLBACK["bio"] if not is_human_bio(b)]
+
+
+def ensure_creatures(cards: list[dict], share: float = 1 / 3) -> None:
+    """Примерно треть карточек — нелюди (камень, инопланетянин…), даже если ИИ дал одних людей."""
+    if len(cards) < 2:
+        return
+    need = max(1, round(len(cards) * share))
+    have = sum(1 for c in cards if not is_human_bio(c.get("bio", "")))
+    humans = [c for c in cards if is_human_bio(c.get("bio", ""))]
+    random.shuffle(humans)
+    used = {c.get("bio") for c in cards}
+    pool = [b for b in CREATURE_BIOS if b not in used]
+    random.shuffle(pool)
+    for c in humans[: max(0, need - have)]:
+        if not pool:
+            break
+        c["bio"] = pool.pop()
 
 
 def fallback_card(name: str) -> dict:

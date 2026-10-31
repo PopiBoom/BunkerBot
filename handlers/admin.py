@@ -250,7 +250,7 @@ async def admin_react_set(call: CallbackQuery, db: Database, config: Config) -> 
 
 # --- Бэкап и восстановление базы (для переезда на сервер) ---
 
-_DB_TABLES = {"users", "settings", "chat_messages", "dossiers", "bunker_stats"}
+_DB_TABLES = {"users", "settings", "chat_messages", "dossiers", "bunker_stats"}  # stickers досоздаст init()
 
 
 @router.message(Command("backup"))

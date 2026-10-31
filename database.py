@@ -119,7 +119,52 @@ class Database:
                 )
                 """
             )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS stickers (
+                    chat_id   INTEGER NOT NULL,
+                    unique_id TEXT NOT NULL,
+                    file_id   TEXT NOT NULL,
+                    emoji     TEXT,
+                    set_name  TEXT,
+                    uses      INTEGER NOT NULL DEFAULT 1,
+                    last_ts   INTEGER NOT NULL,
+                    PRIMARY KEY (chat_id, unique_id)
+                )
+                """
+            )
             await db.commit()
+
+    # --- стикеры чата (бот запоминает и кидает по ситуации) ---
+
+    async def add_sticker(self, chat_id: int, unique_id: str, file_id: str, emoji: str | None,
+                          set_name: str | None) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO stickers (chat_id, unique_id, file_id, emoji, set_name, uses, last_ts) "
+                "VALUES (?, ?, ?, ?, ?, 1, ?) ON CONFLICT(chat_id, unique_id) DO UPDATE SET "
+                "file_id = excluded.file_id, uses = uses + 1, last_ts = excluded.last_ts",
+                (chat_id, unique_id, file_id, emoji, set_name, int(time.time())),
+            )
+            await db.commit()
+
+    async def chat_stickers(self, chat_id: int, limit: int = 30) -> list[tuple]:
+        """[(file_id, emoji, set_name, uses)] — самые ходовые стикеры чата."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT file_id, emoji, set_name, uses FROM stickers WHERE chat_id = ? "
+                "ORDER BY uses DESC, last_ts DESC LIMIT ?", (chat_id, limit),
+            )
+            return list(await cur.fetchall())
+
+    async def last_username(self, chat_id: int, user_id: int) -> str | None:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT username FROM chat_messages WHERE chat_id = ? AND user_id = ? AND username IS NOT NULL "
+                "ORDER BY ts DESC LIMIT 1", (chat_id, user_id),
+            )
+            row = await cur.fetchone()
+            return row[0] if row else None
 
     # --- обещания (ловушка на обещания) ---
 
@@ -177,6 +222,12 @@ class Database:
             )
             await db.commit()
 
+    async def clown_counts(self, chat_id: int) -> list[tuple]:
+        """[(user_id, count)] — сколько раз каждый был клоуном дня."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT user_id, count FROM clown_stats WHERE chat_id = ?", (chat_id,))
+            return list(await cur.fetchall())
+
     async def clown_top(self, chat_id: int, limit: int = 10) -> list[tuple]:
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
@@ -220,7 +271,8 @@ class Database:
         """Случайные живые фразы из чата — образец манеры общения для бота."""
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
-                "SELECT text FROM chat_messages WHERE chat_id = ? AND user_id != 0 AND length(text) BETWEEN 3 AND 160 "
+                "SELECT text FROM chat_messages WHERE chat_id = ? AND user_id > 0 AND length(text) BETWEEN 3 AND 160 "
+                "AND text NOT LIKE '[%' "
                 "ORDER BY RANDOM() LIMIT ?", (chat_id, n),
             )
             return [r[0] for r in await cur.fetchall()]
@@ -250,7 +302,7 @@ class Database:
     async def count_messages_since(self, chat_id: int, since: int) -> int:
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
-                "SELECT COUNT(*) FROM chat_messages WHERE chat_id = ? AND ts >= ? AND user_id != 0",
+                "SELECT COUNT(*) FROM chat_messages WHERE chat_id = ? AND ts >= ? AND user_id > 0",
                 (chat_id, since)
             )
             row = await cur.fetchone()
@@ -281,7 +333,7 @@ class Database:
                        COALESCE(d.updated, 0) AS upd
                 FROM chat_messages m
                 LEFT JOIN dossiers d ON d.chat_id = m.chat_id AND d.user_id = m.user_id
-                WHERE m.ts > COALESCE(d.updated, 0) AND m.user_id != 0
+                WHERE m.ts > COALESCE(d.updated, 0) AND m.user_id > 0
                   AND NOT EXISTS (SELECT 1 FROM roast_optout o
                                   WHERE o.chat_id = m.chat_id AND o.user_id = m.user_id)
                 GROUP BY m.chat_id, m.user_id

@@ -5,8 +5,9 @@
   ИИ генерирует катастрофу, бункер, факты о бункере и карточки → каждому в ЛС
   приходит карточка-картинка и карта действия → закреплённое «табло» →
   раунды: новый факт о бункере, игроки по очереди открывают характеристику (таймер
-  в сообщении), одна реплика ведущего на раунд → голосование (полоски,
-  последнее слово двух лидеров, при ничьей — переголосование) → изгнание с картинкой «ОТКАЗАНО» →
+  в сообщении), одна реплика ведущего на раунд → голосование (в маленьких партиях первые
+  раунды — разогрев без голосования; полоски; при ничьей лидеров — их последнее слово, и если
+  ничья осталась — переголосование только между ними) → изгнание с картинкой «ОТКАЗАНО» →
   финал: эпилог, вердикт «выжила ли колония», альбом выживших, рейтинг.
 
 Состояние игр хранится в памяти процесса (по одному на чат).
@@ -56,9 +57,20 @@ MAX_TEXT = 3800           # запас до лимита Telegram в 4096 сим
 MAX_CAPTION = 1000        # лимит подписи к фото — 1024
 STEP_DELAY = float(os.getenv("BUNKER_DELAY", "20") or 20)  # пауза после сюжетных сообщений, чтобы все дочитали
 REVEAL_DELAY = 4          # сек: пауза после открытия одной характеристики
-THREAT_VOTE = 45          # сек на голосование «кого отправить устранять угрозу»
+HOST_DELAY = STEP_DELAY * 1.5         # пауза после реплики ведущего — её надо дочитать
+SPEECH_NOTE_DELAY = REVEAL_DELAY * 1.5  # пауза после оценки речей перед итогом
+THREAT_VOTE = 90          # сек на голосование «кого отправить устранять угрозу»
 THREAT_MIN_PLAYERS = 4    # угроза бывает в партиях от стольких игроков
 REFRESH_DELAY = 1.2       # сек: склеиваем частые правки табло/голосования в одну
+
+
+def warmup_rounds(players: int) -> int:
+    """Сколько первых раундов без голосования: в маленькой партии иначе выгоняют вслепую."""
+    if players <= 4:
+        return 2
+    if players <= 8:
+        return 1
+    return 0
 
 HR = "━━━━━━━━━━━━━━━"
 
@@ -117,6 +129,9 @@ class Game:
     vote_msg_id: int | None = None
     turn_msg_id: int | None = None
     bot_username: str = ""
+    warmup: int = 0        # первые раунды без голосования
+    outsider_warned: bool = False  # уже сказали посторонним, что во время игры пишут только игроки
+    cant_delete: bool = False      # у бота нет права удалять сообщения
     current_picker: int | None = None
     pick_event: asyncio.Event | None = None
     pending: set[str] = field(default_factory=set)
@@ -542,6 +557,52 @@ async def _refresh_vote(bot: Bot, game: Game) -> None:
         await _edit(bot, game.chat_id, game.vote_msg_id, _vote_text(game), _vote_kb(game))
 
 
+# ---------- посторонние во время партии ----------
+
+
+def _is_outsider(message: Message) -> bool:
+    """Сообщение в группе от того, кто не играет в идущей партии."""
+    game = games.get(message.chat.id)
+    if not game or game.phase in ("lobby", "ended") or game.cant_delete:
+        return False
+    if message.chat.type not in ("group", "supergroup"):
+        return False
+    if message.sender_chat or message.is_automatic_forward:  # посты канала и анонимные админы
+        return False
+    u = message.from_user
+    return bool(u and not u.is_bot and u.id not in game.players)
+
+
+@router.message(_is_outsider)
+async def on_outsider(message: Message) -> None:
+    game = games.get(message.chat.id)
+    if not game:
+        return
+    try:
+        await message.delete()
+    except Exception as e:  # нет права «удалять сообщения» — больше не пытаемся в этой партии
+        game.cant_delete = True
+        logger.info("can't delete outsider message in %s: %s", message.chat.id, e)
+        return
+    if not game.outsider_warned:
+        game.outsider_warned = True
+        try:
+            note = await _send(message.bot, game.chat_id,
+                               "🤫 Идёт игра в Бункер — пишут только игроки. "
+                               "Сообщения остальных удаляю до конца партии.")
+        except Exception:
+            return
+
+        async def drop() -> None:
+            await asyncio.sleep(30)
+            try:
+                await note.delete()
+            except Exception:
+                pass
+
+        _launch(message.bot, game, drop(), fatal=False)
+
+
 # ---------- команды ----------
 
 
@@ -861,6 +922,8 @@ def _assign_cards(players: list[Player], cards: list) -> None:
         if not rel or rel.startswith("ни с кем"):  # пусто — иногда придумаем связь сами
             others = [o.name for o in players if o is not p]
             p.card["relation"] = C.make_relation(others) if random.random() < 0.5 else random.choice(C.SOLO_RELATIONS)
+    # ИИ любит раздавать одних «мужчин» и «женщин» — треть партии отдаём нелюдям
+    C.ensure_creatures([p.card for p in players])
 
 
 async def _run_game(bot: Bot, game: Game) -> None:
@@ -902,9 +965,10 @@ async def _run_game(bot: Bot, game: Game) -> None:
         p.serial = random.randint(1, 9999)
 
     game.spots = max(1, len(players) // 2)
+    game.warmup = warmup_rounds(len(players))
     rounds = len(players) - game.spots
     if len(players) >= THREAT_MIN_PLAYERS and rounds >= 2:
-        game.threat_round = max(1, (rounds + 1) // 2)  # где-то в середине партии
+        game.threat_round = game.warmup + max(1, (rounds + 1) // 2)  # где-то в середине партии
 
     # Карточки-картинки — в личку
     no_dm = []
@@ -974,6 +1038,13 @@ async def _run_game(bot: Bot, game: Game) -> None:
                     await _finish(bot, game)
                     return
                 continue
+        if game.round_no <= game.warmup:
+            left = game.warmup - game.round_no
+            await _say(bot, game.chat_id,
+                       f"☕ <b>Раунд {game.round_no} — разогрев, голосования нет.</b>\n"
+                       + ("Ещё один круг карт — и начнём выгонять." if left else
+                          "Со следующего раунда — голосуем, кого не пускать."), delay=REVEAL_DELAY)
+            continue
         await _voting(bot, game)
         if not _is_active(game):
             return
@@ -1040,7 +1111,7 @@ async def _reveal_round(bot: Bot, game: Game) -> None:
     await _say(bot, game.chat_id, _round_summary(game), delay=0)
     note = await note_task if note_task else None
     if note and _is_active(game):
-        await _say(bot, game.chat_id, _host(game, note))
+        await _say(bot, game.chat_id, _host(game, note), delay=HOST_DELAY)
 
 
 def _turn_text(p: Player, left: int) -> str:
@@ -1393,7 +1464,7 @@ async def _threat(bot: Bot, game: Game) -> bool:
             caption += f"\n\n{voice}\n<blockquote expandable>{_e(_cut(story, room))}</blockquote>"
         await _send_exile_card(bot, game, p, "dead", caption)
         await _refresh_board(bot, game)
-        await asyncio.sleep(STEP_DELAY)
+        await asyncio.sleep(HOST_DELAY if story else STEP_DELAY)
         return True
 
     game.hero = p.user_id
@@ -1401,7 +1472,7 @@ async def _threat(bot: Bot, game: Game) -> bool:
     if story:
         text += f"\n\n{_host(game, story)}"
     text += "\n\n🛡 Награда: иммунитет в ближайшем голосовании."
-    await _say(bot, game.chat_id, text)
+    await _say(bot, game.chat_id, text, delay=HOST_DELAY if story else STEP_DELAY)
     return False
 
 
@@ -1487,11 +1558,14 @@ async def _voting(bot: Bot, game: Game) -> None:
                                     reply_markup=kb.as_markup())
                     except Exception:
                         pass
-            # Голосуем до «последнего слова» (или пока все не проголосуют), после речей — сразу итог
+            # Голосуем SPEECH_AT сек (или пока все не проголосуют). Последнее слово — только если
+            # у лидеров поровну голосов; если после речей ничья осталась — переголосование между ними.
             if not await wait(SPEECH_AT):
-                await _start_speech(bot, game)
-                if game.stage == "speech" and not await wait(SPEECH_LEN):
-                    await _end_speech(bot, game)
+                tied, tied_top = _pick_loser(game)
+                if tied_top > 0 and len(tied) >= 2:
+                    await _start_speech(bot, game, tied)
+                    if game.stage == "speech" and not await wait(SPEECH_LEN):
+                        await _end_speech(bot, game)
         else:
             await wait(REVOTE_TIMEOUT)  # закрывается сразу, как только все проголосовали
 
@@ -1533,27 +1607,23 @@ async def _voting(bot: Bot, game: Game) -> None:
         await _tally(bot, game, game.players[random.choice(candidates)], note)
 
 
-async def _start_speech(bot: Bot, game: Game) -> None:
-    scores = _scores(game)
-    candidates = [u for u in scores if u not in game.immune] or list(scores)
-    if len(candidates) < 2:
-        game.stage = "after"
-        return
-    random.shuffle(candidates)  # при равенстве — случайный порядок
-    leaders = sorted(candidates, key=lambda u: -scores[u])[:2]
-    note = "" if any(scores[u] > 0 for u in leaders) else "Голосов пока нет — ведущий сам выбрал подозреваемых. "
+async def _start_speech(bot: Bot, game: Game, leaders: list[int]) -> None:
+    """Последнее слово для тех, у кого поровну больше всех голосов."""
+    leaders = list(leaders)
+    random.shuffle(leaders)
+    note = ""
     game.speakers = {u: [] for u in leaders}
     game.stage = "speech"
     for u in leaders:
         if game.players[u].is_bot:
             _launch(bot, game, _bot_speech(bot, game, game.players[u]), fatal=False)
-    who = " и ".join(_mention(game.players[u]) for u in leaders)
+    who = _names([_mention(game.players[u]) for u in leaders])
     await _send(bot, game.chat_id,
                 f"🎤 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n{HR}\n\n"
                 + (f"<i>{note.strip()}</i>\n\n" if note else "")
-                + f"{who} — у вас <b>{SPEECH_LEN} сек</b>.\n\n"
+                + f"⚖️ У {who} поровну голосов — у вас <b>{SPEECH_LEN} сек</b>.\n\n"
                 f"Напишите в чат, почему вас нельзя оставлять за дверью! "
-                f"Остальные ещё могут переголосовать — потом сразу итог.")
+                f"Остальные могут поменять голос. Если ничья останется — переголосуем только между вами.")
 
 
 async def _end_speech(bot: Bot, game: Game) -> None:
@@ -1564,7 +1634,7 @@ async def _end_speech(bot: Bot, game: Game) -> None:
         try:
             note = await ai.narrate_speeches(game.catastrophe, speeches, _style(game))
             if note:
-                await _say(bot, game.chat_id, _host(game, note), delay=REVEAL_DELAY)
+                await _say(bot, game.chat_id, _host(game, note), delay=SPEECH_NOTE_DELAY)
                 return
         except Exception as e:
             logger.warning("AI speech note failed: %s", e)
@@ -1665,7 +1735,7 @@ async def _tally(bot: Bot, game: Game, loser: Player, note: str = "") -> None:
         caption += f"\n\n{voice}\n<blockquote expandable>{_e(_cut(story, room))}</blockquote>"
     await _send_exile_card(bot, game, loser, "out", caption)
     await _refresh_board(bot, game)
-    await asyncio.sleep(STEP_DELAY)
+    await asyncio.sleep(HOST_DELAY if story else STEP_DELAY)
 
 
 # ---------- финал ----------
