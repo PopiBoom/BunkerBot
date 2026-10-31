@@ -1674,7 +1674,9 @@ async def _finish(bot: Bot, game: Game) -> None:
     # Вердикт ИИ пишет, пока все смотрят на пропуска выживших
     verdict_task = _ai_task(ai.final_verdict(
         game.catastrophe, game.bunker, game.bunker_known,
-        [p.card or {"name": p.name} for p in survivors], [p.name for p in exiled], _style(game),
+        # без «Связей»: там имена выбывших, а в эпилоге должны быть только выжившие
+        [{k: v for k, v in (p.card or {"name": p.name}).items() if k != "relation"} for p in survivors],
+        [p.name for p in exiled], _style(game),
     )) if ai.available() else None
 
     names = ", ".join(_e(p.name) for p in survivors)
