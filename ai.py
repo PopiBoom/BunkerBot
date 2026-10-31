@@ -463,27 +463,54 @@ def _voice(samples: list[str] | None) -> str:
 
 
 def _clean_reply(raw: str) -> str:
-    """Достаёт из ответа модели только саму реплику: JSON {"text"}, без тегов и рассуждений."""
+    """Достаёт из ответа модели только саму реплику: JSON {"text"}, без тегов и рассуждений.
+
+    Модель иногда пишет пояснение перед JSON, переносит строку внутри текста или обрывает
+    JSON — поэтому сначала ищем значение "text" регуляркой где угодно в ответе.
+    """
     raw = (raw or "").strip()
-    try:
-        data = _extract_json(raw)
-        if isinstance(data, dict) and "text" in data:
-            raw = str(data.get("text") or "").strip()  # пустой text = «ничего не отправлять»
-            if not raw:
-                return ""
-    except Exception:
-        pass
-    if raw.lstrip().startswith("{") and '"text"' in raw:  # недобитый JSON — лучше промолчать
-        return ""
+    if "{" in raw:  # сначала честно разбираем JSON
+        try:
+            data = _extract_json(raw)
+            if isinstance(data, dict) and "text" in data:
+                raw = str(data.get("text") or "").strip()
+                if not raw:
+                    return ""
+        except Exception:
+            pass
+    m = re.search(r'"text"\s*:\s*"((?:[^"\\]|\\.)*)("|$)', raw, flags=re.DOTALL)
+    if m:
+        val = m.group(1)
+        try:
+            val = json.loads(f'"{val}"')  # раскодировать \n, \" и т.п.
+        except Exception:
+            val = val.replace("\\n", "\n").replace('\\"', '"')
+        raw = val.strip()
+        if not raw:
+            return ""  # пустой text = «ничего не отправлять»
+    elif raw.lstrip().startswith("{"):
+        try:
+            data = _extract_json(raw)
+            if isinstance(data, dict) and "text" in data:
+                raw = str(data.get("text") or "").strip()
+                if not raw:
+                    return ""
+        except Exception:
+            return ""
     tags = re.findall(r"<msg[^>]*>(.*?)</msg>", raw, flags=re.DOTALL)
     if tags:
         raw = tags[-1]
     raw = re.sub(r"</?\w+[^>]*>", "", raw)
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-    meta = re.compile(r"^(ответ|реплика|вариант|добивка|фраза)\b|должен быть|до \d+ слов|бей по|в манере чата",
+    meta = re.compile(r"^(ответ|реплика|вариант|добивка|фраза|черновик)\b|должен быть|до \d+ слов|бей по|в манере чата",
                       re.IGNORECASE)
     lines = [ln for ln in lines if not meta.search(ln) and not ln.endswith(":")]
-    return "\n".join(lines).strip().strip("«»\"").strip()
+    out = "\n".join(lines).strip()
+    if len(out) > 1 and out[0] in "«\"" and out[-1] in "»\"":  # обёрнута в кавычки целиком
+        out = out[1:-1].strip()
+    if re.search(r'[{}]|"text"', out):  # остатки служебной разметки — такое не отправляем
+        return ""
+    return out
 
 
 async def polish(reply: str, trigger: str, context: list[dict] | None = None,
