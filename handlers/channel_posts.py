@@ -31,7 +31,6 @@ POSTS_KEY = "chan_post_texts"      # прошлые тексты — чтобы 
 
 TEST_EVERY = 120        # сек между постами в тесте
 TEST_FOR = 30 * 60      # тест сам выключается через 30 минут
-SIGN = "\n\n🤖 Пиздюк"
 
 
 async def channel_id(bot: Bot, db: Database) -> int | None:
@@ -134,7 +133,7 @@ async def tick(bot: Bot, db: Database) -> None:
     if not text:
         return
     try:
-        msg = await bot.send_message(chan, text + SIGN)
+        msg = await bot.send_message(chan, text)
     except Exception as e:
         await stop(db)
         await _tell_admin(bot, db, "📢 Не могу писать в канал — сделай бота админом канала с правом "
