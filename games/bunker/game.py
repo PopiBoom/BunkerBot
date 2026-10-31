@@ -37,6 +37,7 @@ import ai
 from database import Database
 
 from . import content as C
+from . import render as R
 from .render import render_card
 
 logger = logging.getLogger("bunker")
@@ -54,6 +55,8 @@ MAX_TEXT = 3800           # запас до лимита Telegram в 4096 сим
 MAX_CAPTION = 1000        # лимит подписи к фото — 1024
 STEP_DELAY = float(os.getenv("BUNKER_DELAY", "20") or 20)  # пауза после сюжетных сообщений, чтобы все дочитали
 REVEAL_DELAY = 4          # сек: пауза после открытия одной характеристики
+THREAT_VOTE = 45          # сек на голосование «кого отправить устранять угрозу»
+THREAT_MIN_PLAYERS = 4    # угроза бывает в партиях от стольких игроков
 REFRESH_DELAY = 1.2       # сек: склеиваем частые правки табло/голосования в одну
 
 HR = "━━━━━━━━━━━━━━━"
@@ -77,6 +80,7 @@ class Player:
     goal: dict | None = None
     serial: int = 0
     out_round: int | None = None
+    died: bool = False  # погиб на угрозе, а не изгнан голосованием
 
 
 @dataclass
@@ -115,6 +119,15 @@ class Game:
     pick_event: asyncio.Event | None = None
     pending: set[str] = field(default_factory=set)
     first_out: int | None = None
+    serial: int = 0
+    title: str = ""
+    # угроза в середине игры
+    threat: dict = field(default_factory=dict)
+    threat_round: int = 0
+    threat_votes: dict[int, int] = field(default_factory=dict)
+    threat_chances: dict[int, dict] = field(default_factory=dict)
+    threat_msg_id: int | None = None
+    hero: int | None = None
 
 
 games: dict[int, Game] = {}  # chat_id -> Game
@@ -255,6 +268,26 @@ async def _render(p: Player, game: Game, **kwargs) -> bytes:
     return await asyncio.to_thread(render_card, p.name, p.card or {}, p.serial, **kwargs)
 
 
+async def _send_exile_card(bot: Bot, game: Game, p: Player, stamp: str, caption: str) -> None:
+    """Досье выбывшего: анимация с печатью, при сбое — картинка, при сбое — текст."""
+    try:
+        def make() -> bytes:
+            img = R.render_card_image(p.name, p.card or {}, p.serial, revealed=set(p.revealed))
+            return R.animate_stamp(img, stamp)
+        gif = await asyncio.to_thread(make)
+        await _retry(bot.send_animation, game.chat_id, BufferedInputFile(gif, filename="stamp.gif"),
+                     caption=caption[:MAX_CAPTION])
+        return
+    except Exception as e:
+        logger.warning("exile animation failed: %s", e)
+    try:
+        png = await _render(p, game, stamp=stamp, revealed=set(p.revealed))
+        await _send_photo(bot, game.chat_id, png, caption)
+    except Exception as e:
+        logger.warning("exile card failed: %s", e)
+        await _send(bot, game.chat_id, caption[:MAX_TEXT])
+
+
 # ---------- форматирование ----------
 
 
@@ -387,8 +420,10 @@ def _board_text(game: Game, short: bool = False) -> str:
     parts.append(f"{title} ({len(alive)})\n\n{blocks}")
 
     if out_players:
-        gone = "\n".join(f"<s>{_e(p.name)}</s> — раунд {p.out_round}" for p in out_players)
-        parts.append(f"💀 <b>ИЗГНАНЫ</b> ({len(out_players)})\n{gone}")
+        gone = "\n".join(
+            f"<s>{_e(p.name)}</s> — {'☠️ погиб(ла)' if p.died else 'изгнан(а)'}, раунд {p.out_round}"
+            for p in out_players)
+        parts.append(f"💀 <b>ВЫБЫЛИ</b> ({len(out_players)})\n{gone}")
 
     text = f"\n{HR}\n".join(parts)
     if len(text) > MAX_TEXT and not short:
@@ -746,6 +781,10 @@ def _assign_cards(players: list[Player], cards: list) -> None:
         extra = {k: str(v).strip() for k, v in (card or {}).items()
                  if k in C.ATTR_MAP and v is not None and str(v).strip()}
         p.card = {**base, **extra, "name": p.name}
+        others = [o.name for o in players if o is not p]
+        rel = p.card.get("relation", "")
+        if not any(o in rel for o in others):
+            p.card["relation"] = C.make_relation(others)
 
 
 async def _run_game(bot: Bot, game: Game) -> None:
@@ -761,6 +800,12 @@ async def _run_game(bot: Bot, game: Game) -> None:
 
     game.catastrophe = str(setup.get("catastrophe", "")).strip() or C.FALLBACK_CATASTROPHE
     game.bunker = str(setup.get("bunker", "")).strip() or C.FALLBACK_BUNKER
+    game.title = str(setup.get("title", "")).strip()[:60] or "Конец света"
+    threat = setup.get("threat")
+    if not (isinstance(threat, dict) and threat.get("title") and threat.get("text")):
+        threat = random.choice(C.FALLBACK_THREATS)
+    game.threat = {"title": str(threat["title"]).strip(), "text": str(threat["text"]).strip()}
+    game.serial = random.randint(1, 9999)
     secrets = [str(s).strip() for s in (setup.get("bunker_secrets") or []) if str(s).strip()]
     extra = [s for s in random.sample(C.FALLBACK_BUNKER_SECRETS, len(C.FALLBACK_BUNKER_SECRETS))
              if s not in secrets]
@@ -775,6 +820,9 @@ async def _run_game(bot: Bot, game: Game) -> None:
         p.serial = random.randint(1, 9999)
 
     game.spots = max(1, len(players) // 2)
+    rounds = len(players) - game.spots
+    if len(players) >= THREAT_MIN_PLAYERS and rounds >= 2:
+        game.threat_round = max(1, (rounds + 1) // 2)  # где-то в середине партии
 
     # Карточки-картинки — в личку
     no_dm = []
@@ -799,9 +847,20 @@ async def _run_game(bot: Bot, game: Game) -> None:
 
     intro_task = _ai_task(ai.narrate_intro(game.catastrophe, game.bunker, _style(game))) \
         if ai.available() else None
-    await _say(bot, game.chat_id,
-               f"☢️ <b>КАТАСТРОФА</b>\n{_quote(game.catastrophe)}\n\n"
-               f"🏚 <b>БУНКЕР</b>\n{_quote(game.bunker)}")
+    intro_text = (f"☢️ <b>КАТАСТРОФА</b>\n{_quote(game.catastrophe)}\n\n"
+                  f"🏚 <b>БУНКЕР</b>\n{_quote(game.bunker)}")
+    try:
+        cover = await asyncio.to_thread(R.render_cover, game.title, game.catastrophe,
+                                        len(players), game.spots, game.serial)
+        if len(intro_text) <= MAX_CAPTION:
+            await _send_photo(bot, game.chat_id, cover, intro_text)
+        else:
+            await _send_photo(bot, game.chat_id, cover)
+            await _send(bot, game.chat_id, intro_text)
+        await asyncio.sleep(STEP_DELAY)
+    except Exception as e:
+        logger.warning("cover failed: %s", e)
+        await _say(bot, game.chat_id, intro_text)
 
     intro = await intro_task if intro_task else None
     if intro:
@@ -837,6 +896,15 @@ async def _run_game(bot: Bot, game: Game) -> None:
         await _reveal_round(bot, game)
         if not _is_active(game):
             return
+        if game.round_no == game.threat_round:
+            died = await _threat(bot, game)
+            if not _is_active(game):
+                return
+            if died:  # угроза уже забрала одного — обычного голосования в этом раунде нет
+                if len(_alive(game)) <= game.spots:
+                    await _finish(bot, game)
+                    return
+                continue
         await _voting(bot, game)
         if not _is_active(game):
             return
@@ -1137,6 +1205,151 @@ async def _play_action(bot: Bot, game: Game, p: Player, target: Player | None) -
     _schedule(bot, game, "vote", lambda: _refresh_vote(bot, game))
 
 
+# ---------- угроза ----------
+
+
+def _threat_scores(game: Game) -> dict[int, float]:
+    scores = {p.user_id: 0.0 for p in _alive(game)}
+    for voter, target in game.threat_votes.items():
+        if target in scores:
+            player = game.players.get(voter)
+            scores[target] += 1.0 if player and player.alive else SPECTATOR_WEIGHT
+    return scores
+
+
+def _threat_text(game: Game, closed: bool = False) -> str:
+    scores = _threat_scores(game)
+    lines = [f"⚠️ <b>УГРОЗА: {_e(game.threat.get('title', '').upper())}</b>", HR, "",
+             f"<blockquote>{_e(game.threat.get('text', ''))}</blockquote>", ""]
+    lines.append("🗳 Голосование закрыто." if closed else
+                 "Кого отправим разбираться? Рядом — шанс погибнуть по тому, что о нём известно:")
+    lines.append("")
+    alive = sorted(_alive(game), key=lambda p: game.threat_chances.get(p.user_id, {}).get("chance", 50))
+    for p in alive:
+        ch = game.threat_chances.get(p.user_id, {})
+        why = f" <i>({_e(ch['why'])})</i>" if ch.get("why") else ""
+        votes = f" · 🗳 {_num(scores[p.user_id])}" if scores.get(p.user_id) else ""
+        lines.append(f"<b>{_e(p.name)}</b> — ☠️ {ch.get('chance', 50)}%{why}{votes}")
+    if not closed:
+        lines += ["", f"⏳ {THREAT_VOTE} сек. Голосуют все, голос зрителя = {_num(SPECTATOR_WEIGHT)}."]
+    return "\n".join(lines)
+
+
+def _threat_kb(game: Game) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for p in _alive(game):
+        b.button(text=f"🔦 {p.name}", callback_data=f"bk:tv:{p.user_id}")
+    b.adjust(2)
+    return b.as_markup()
+
+
+async def _threat_chances(game: Game) -> dict[int, dict]:
+    alive = _alive(game)
+    res: dict = {}
+    if ai.available():
+        public = [{"name": p.name,
+                   "known": {C.ATTR_MAP[k][0]: (p.card or {}).get(k, "") for k in C.ATTR_KEYS if k in p.revealed}}
+                  for p in alive]
+        try:
+            res = await ai.threat_chances(game.threat.get("text", ""), public)
+        except Exception as e:
+            logger.warning("AI threat chances failed: %s", e)
+    out = {}
+    for p in alive:
+        r = res.get(p.name)
+        if not r:
+            known = " ".join(str((p.card or {}).get(k, "")) for k in p.revealed)
+            chance, why = C.fallback_chance(known)
+            r = {"chance": chance, "why": why}
+        out[p.user_id] = r
+    return out
+
+
+async def _threat(bot: Bot, game: Game) -> bool:
+    """Угроза посреди игры. True — отправленный погиб."""
+    game.phase = "threat"
+    game.threat_votes = {}
+    game.advance = asyncio.Event()
+    game.threat_chances = await _threat_chances(game)
+    msg = await _send(bot, game.chat_id, _threat_text(game), reply_markup=_threat_kb(game))
+    game.threat_msg_id = msg.message_id
+    try:
+        await asyncio.wait_for(game.advance.wait(), timeout=THREAT_VOTE)
+    except asyncio.TimeoutError:
+        pass
+    if not _is_active(game):
+        return False
+
+    game.phase = "counting"
+    scores = _threat_scores(game)
+    top = max(scores.values(), default=0)
+    if top > 0:
+        candidates = [u for u, sc in scores.items() if sc == top]
+        note = " (жребий среди равных)" if len(candidates) > 1 else ""
+    else:
+        candidates = list(scores)
+        note = " (никто не проголосовал — решил жребий)"
+    p = game.players[random.choice(candidates)]
+    chance = int(game.threat_chances.get(p.user_id, {}).get("chance", 50))
+    died = random.randint(1, 100) <= chance
+    await _edit(bot, game.chat_id, game.threat_msg_id, _threat_text(game, closed=True))
+
+    story_task = _ai_task(ai.threat_outcome(game.threat.get("text", ""), p.card or {}, chance, died,
+                                            _style(game))) if ai.available() else None
+    await _say(bot, game.chat_id,
+               f"🔦 Разбираться с угрозой идёт <b>{_e(p.name)}</b>{note}.\n\n"
+               f"🎲 Шанс погибнуть: <b>{chance}%</b>. Бросаем кости…")
+    story = (await story_task if story_task else None) or ""
+    voice = C.MODE_VOICE.get(game.mode, C.MODE_VOICE["classic"])
+
+    if died:
+        p.alive = False
+        p.died = True
+        p.out_round = game.round_no
+        if game.first_out is None:
+            game.first_out = p.user_id
+        caption = f"☠️ <b>{_e(p.name)} не вернулся(ась)</b>"
+        if story:
+            room = MAX_CAPTION - len(caption) - len(voice) - 60
+            caption += f"\n\n{voice}\n<blockquote expandable>{_e(_cut(story, room))}</blockquote>"
+        await _send_exile_card(bot, game, p, "dead", caption)
+        await _refresh_board(bot, game)
+        await asyncio.sleep(STEP_DELAY)
+        return True
+
+    game.hero = p.user_id
+    text = f"🦸 <b>{_e(p.name)} справился(ась) и вернулся(ась)!</b>"
+    if story:
+        text += f"\n\n{_host(game, story)}"
+    text += "\n\n🛡 Награда: иммунитет в ближайшем голосовании."
+    await _say(bot, game.chat_id, text)
+    return False
+
+
+@router.callback_query(F.data.startswith("bk:tv:"))
+async def cb_threat_vote(call: CallbackQuery) -> None:
+    game = games.get(call.message.chat.id) if call.message else None
+    if not game or game.phase != "threat":
+        await call.answer("Сейчас не время.", show_alert=True)
+        return
+    try:
+        target = int((call.data or "").split(":")[2])
+    except (ValueError, IndexError):
+        await call.answer()
+        return
+    if target not in game.players or not game.players[target].alive:
+        await call.answer("Этого игрока уже нет.", show_alert=True)
+        return
+    game.threat_votes[call.from_user.id] = target
+    await call.answer(f"Отправляем: {game.players[target].name}")
+    _schedule(call.bot, game, "threat",
+              lambda: _edit(call.bot, game.chat_id, game.threat_msg_id, _threat_text(game), _threat_kb(game))
+              if game.phase == "threat" else asyncio.sleep(0))
+    voted = sum(1 for v in game.threat_votes if v in game.players and game.players[v].alive)
+    if voted >= len(_alive(game)) and game.advance:
+        game.advance.set()
+
+
 # ---------- голосование ----------
 
 
@@ -1149,6 +1362,9 @@ async def _voting(bot: Bot, game: Game) -> None:
     game.force_tally = False
     game.stage = "open"
     game.advance = asyncio.Event()
+    if game.hero and game.hero in game.players and game.players[game.hero].alive:
+        game.immune.add(game.hero)  # награда за устранённую угрозу
+    game.hero = None
 
     msg = await _say(bot, game.chat_id, _vote_text(game), delay=0, reply_markup=_vote_kb(game))
     game.vote_msg_id = msg.message_id
@@ -1326,13 +1542,7 @@ async def _tally(bot: Bot, game: Game) -> None:
     if story:
         room = MAX_CAPTION - len(caption) - len(voice) - 60
         caption += f"\n\n{voice}\n<blockquote expandable>{_e(_cut(story, room))}</blockquote>"
-    try:
-        png = await _render(loser, game, stamp="out", revealed=set(loser.revealed))
-        await _send_photo(bot, game.chat_id, png, caption)
-    except Exception as e:
-        logger.warning("exile card failed: %s", e)
-        if story:
-            await _send(bot, game.chat_id, _host(game, story))
+    await _send_exile_card(bot, game, loser, "out", caption)
     await _refresh_board(bot, game)
     await asyncio.sleep(STEP_DELAY)
 
@@ -1351,8 +1561,15 @@ async def _finish(bot: Bot, game: Game) -> None:
     )) if ai.available() else None
 
     names = ", ".join(_e(p.name) for p in survivors)
-    await _say(bot, game.chat_id,
-               f"{HR}\n🚪🔒 <b>ЛЮК ЗАДРАЕН</b>\n{HR}\n\nВ бункере остаются:\n<b>{names}</b>", delay=3)
+    hatch_text = f"🚪🔒 <b>ЛЮК ЗАДРАЕН</b>\n\nВ бункере остаются:\n<b>{names}</b>"
+    try:
+        gif = await asyncio.to_thread(R.animate_hatch)
+        await _retry(bot.send_animation, game.chat_id, BufferedInputFile(gif, filename="hatch.gif"),
+                     caption=hatch_text)
+        await asyncio.sleep(5)
+    except Exception as e:
+        logger.warning("hatch animation failed: %s", e)
+        await _say(bot, game.chat_id, f"{HR}\n{hatch_text}", delay=3)
 
     # Альбом выживших с печатью «ДОПУЩЕН» — до эпилога
     try:
@@ -1380,7 +1597,17 @@ async def _finish(bot: Bot, game: Game) -> None:
         )}
     result = "✅ <b>КОЛОНИЯ ВЫЖИЛА!</b>" if verdict["survived"] else "☠️ <b>КОЛОНИЯ ПОГИБЛА.</b>"
     await _say(bot, game.chat_id,
-               f"📖 <b>ЭПИЛОГ</b>\n{HR}\n\n{_quote(verdict['story'])}\n\n🏁 Вердикт: {result}")
+               f"📖 <b>ЭПИЛОГ</b>\n{HR}\n\n{_quote(verdict['story'])}\n\n🏁 Вердикт: {result}", delay=5)
+
+    try:
+        from datetime import date
+        card = await asyncio.to_thread(
+            R.render_postcard, game.title, [p.name for p in survivors], [p.name for p in exiled],
+            bool(verdict["survived"]), game.serial, date.today().strftime("%d.%m.%Y"))
+        await _send_photo(bot, game.chat_id, card, "🖼 <b>Итоговая открытка партии</b> — можно переслать в канал")
+        await asyncio.sleep(3)
+    except Exception as e:
+        logger.warning("postcard failed: %s", e)
 
     alive_ids = {p.user_id for p in survivors}
     results = []

@@ -101,6 +101,9 @@ async def generate_setup(player_names: list[str]) -> dict:
         f"Игроки (по именам): {names_json}.\n"
         "Сгенерируй партию «Бункера» с чёрным юмором. Верни JSON вида:\n"
         "{\n"
+        '  "title": "название катастрофы, 2-4 слова, для обложки",\n'
+        '  "threat": {"title": "2-4 слова", "text": "1-2 предложения: ЧП посреди игры в бункере, '
+        'устранять которое должен пойти один человек, рискуя жизнью"},\n'
         '  "catastrophe": "2-3 предложения: мрачная катастрофа в духе реальных угроз '
         '(пандемия, война, климат, авария), с одной нелепой, но возможной деталью",\n'
         '  "bunker": "2-3 предложения: реалистичный бункер — площадь, запасы, срок, '
@@ -119,7 +122,9 @@ async def generate_setup(player_names: list[str]) -> dict:
         '      "fact": "неловкий или шокирующий, но возможный факт биографии",\n'
         '      "ability": "реальный навык (полезный, бесполезный или сомнительный)",\n'
         '      "attitude": "отношение к людям",\n'
-        '      "secret": "постыдный или опасный, но жизненный секрет"\n'
+        '      "secret": "постыдный или опасный, но жизненный секрет",\n'
+        '      "relation": "простая жизненная связь с ДРУГИМ игроком из списка, по имени: '
+        'встречался, должен денег, бывшие коллеги, соседи, родственники и т.п."\n'
         "    }\n"
         "  ]\n"
         "}\n"
@@ -209,3 +214,46 @@ async def final_verdict(
     text = await _complete(_host(style) + " Отвечаешь строго JSON.", user, max_tokens=4000)
     data = _extract_json(text)
     return {"survived": bool(data.get("survived")), "story": str(data.get("story", "")).strip()}
+
+
+# ---------- угроза ----------
+
+
+async def threat_chances(threat: str, players: list[dict]) -> dict[str, dict]:
+    """Шанс погибнуть для каждого игрока. players — [{name, known: {характеристика: значение}}].
+
+    Возвращает {имя: {"chance": 5..95, "why": "до 6 слов"}}.
+    """
+    user = (
+        f"ЧП в бункере: {threat}\n"
+        f"Игроки и то, что о них уже известно:\n{json.dumps(players, ensure_ascii=False)}\n"
+        "Для каждого игрока оцени шанс ПОГИБНУТЬ, если отправить его устранять ЧП: "
+        "профессия и навыки по делу снижают риск, болезни, страхи и возраст повышают. "
+        "Если о человеке мало известно — около 40-50%. Верни СТРОГО JSON: "
+        '{"<имя>": {"chance": число от 5 до 95, "why": "причина до 6 слов"}, ...}'
+    )
+    text = await _complete(
+        "Ты — беспристрастный судья игры «Бункер». Отвечаешь строго JSON.", user, max_tokens=4000
+    )
+    data = _extract_json(text)
+    out: dict[str, dict] = {}
+    for name, v in data.items():
+        if isinstance(v, dict):
+            try:
+                chance = max(5, min(95, int(v.get("chance", 50))))
+            except (TypeError, ValueError):
+                chance = 50
+            out[str(name)] = {"chance": chance, "why": str(v.get("why", "")).strip()}
+    return out
+
+
+async def threat_outcome(threat: str, card: dict, chance: int, died: bool, style: str = "") -> str:
+    result = "ПОГИБ(ЛА)" if died else "СПРАВИЛСЯ(АСЬ) И ВЕРНУЛСЯ(АСЬ)"
+    user = (
+        f"ЧП в бункере: {threat}\n"
+        f"Устранять отправили этого человека:\n{json.dumps(card, ensure_ascii=False)}\n"
+        f"Шанс погибнуть был {chance}%. Итог: {result}.\n"
+        "Опиши, как всё прошло (2-3 предложения, до 60 слов), с чёрным юмором, "
+        "опираясь на его карточку."
+    )
+    return await _complete(_host(style), user, max_tokens=2000)

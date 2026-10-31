@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import io
+import math
 import random
 from functools import lru_cache
 from pathlib import Path
@@ -89,7 +90,7 @@ def _noise(img: Image.Image, seed: int) -> Image.Image:
     return Image.blend(img, grain, 0.035)
 
 
-def _stamp(img: Image.Image, text: str, color: tuple[int, int, int]) -> Image.Image:
+def _stamp_layer(text: str, color: tuple[int, int, int]) -> Image.Image:
     font = _mono(118)
     tmp = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     tw = int(tmp.textlength(text, font=font))
@@ -110,7 +111,15 @@ def _stamp(img: Image.Image, text: str, color: tuple[int, int, int]) -> Image.Im
         r = rnd.randrange(2, 7)
         hd.ellipse([x - r, y - r, x + r, y + r], fill=rnd.randrange(0, 140))
     layer.putalpha(Image.composite(mask, Image.new("L", layer.size, 0), holes))
-    layer = layer.rotate(17, expand=True, resample=Image.BICUBIC)
+    return layer.rotate(17, expand=True, resample=Image.BICUBIC)
+
+
+STAMPS = {"in": ("ДОПУЩЕН", (52, 199, 89)), "out": ("ОТКАЗАНО", (226, 54, 54)),
+          "dead": ("ПОГИБ", (226, 54, 54))}
+
+
+def _stamp(img: Image.Image, text: str, color: tuple[int, int, int]) -> Image.Image:
+    layer = _stamp_layer(text, color)
     out = img.convert("RGBA")
     x = (out.width - layer.width) // 2
     y = int(out.height * 0.40) - layer.height // 2
@@ -118,7 +127,17 @@ def _stamp(img: Image.Image, text: str, color: tuple[int, int, int]) -> Image.Im
     return out.convert("RGB")
 
 
-def render_card(
+def render_card(*args, **kwargs) -> bytes:
+    return _png(render_card_image(*args, **kwargs))
+
+
+def _png(img: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def render_card_image(
     name: str,
     card: dict,
     serial: int,
@@ -127,7 +146,7 @@ def render_card(
     stamp: str | None = None,          # "in" | "out" | None
     revealed: set[str] | None = None,  # None — показать всё; иначе скрытые поля помечаются
     subtitle: str = "ПРОПУСК В БУНКЕР",
-) -> bytes:
+) -> Image.Image:
     probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     label_f, value_f, icon_f = _bold(22), _regular(32), _regular(40)
     text_x = PAD + 92
@@ -200,11 +219,182 @@ def render_card(
 
     d.text((W // 2, height - 72), "ДЕЙСТВИТЕЛЕН ДО КОНЦА СВЕТА", font=_mono(22), fill=MUTED, anchor="mm")
 
-    if stamp == "in":
-        img = _stamp(img, "ДОПУЩЕН", GREEN)
-    elif stamp == "out":
-        img = _stamp(img, "ОТКАЗАНО", RED)
+    if stamp in STAMPS:
+        img = _stamp(img, *STAMPS[stamp])
+    return img
 
+
+# ---------- обложка партии ----------
+
+
+def _canvas(w: int, h: int, seed: int) -> Image.Image:
+    img = _noise(Image.new("RGB", (w, h), BG), seed)
+    band = Image.new("RGB", (w, 34), ACCENT)
+    d = ImageDraw.Draw(band)
+    for x in range(-34, w + 34, 46):
+        d.polygon([(x, 34), (x + 34, 0), (x + 57, 0), (x + 23, 34)], fill=(20, 20, 20))
+    img.paste(band, (0, 0))
+    img.paste(band, (0, h - 34))
+    return img
+
+
+def render_cover(title: str, catastrophe: str, players: int, spots: int, serial: int) -> bytes:
+    w, h = 1000, 1100
+    img = _canvas(w, h, serial)
+    d = ImageDraw.Draw(img)
+    d.text((PAD, 74), f"БУНКЕР · ПАРТИЯ № {serial:04d}", font=_mono(30), fill=ACCENT)
+
+    # знак радиации
+    cx, cy, r = w // 2, 300, 120
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=PANEL, outline=ACCENT, width=6)
+    d.text((cx, cy + 6), "☢", font=_regular(190), fill=ACCENT, anchor="mm")
+
+    y = 470
+    for line in _wrap(d, title.upper(), _bold(68), w - 2 * PAD, 2):
+        d.text((w // 2, y), line, font=_bold(68), fill=TEXT, anchor="ma")
+        y += 82
+    y += 20
+    d.line([(PAD, y), (w - PAD, y)], fill=LINE, width=3)
+    y += 36
+    for line in _wrap(d, catastrophe, _regular(32), w - 2 * PAD, 6):
+        d.text((PAD, y), line, font=_regular(32), fill=(205, 205, 200))
+        y += 44
+
+    box_y = h - 190
+    d.rounded_rectangle([PAD, box_y, w - PAD, box_y + 100], radius=18, fill=PANEL, outline=ACCENT, width=3)
+    d.text((w // 4 + 10, box_y + 50), f"ИГРОКОВ: {players}", font=_mono(36), fill=TEXT, anchor="mm")
+    d.text((3 * w // 4 - 10, box_y + 50), f"МЕСТ: {spots}", font=_mono(36), fill=ACCENT, anchor="mm")
+    return _png(img)
+
+
+# ---------- итоговая открытка ----------
+
+
+def render_postcard(title: str, survivors: list[str], exiled: list[str], survived: bool,
+                    serial: int, date: str) -> bytes:
+    w = 1000
+    probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    name_f = _bold(40)
+    out_f = _regular(30)
+    surv_lines = sum(len(_wrap(probe, n, name_f, w - 2 * PAD - 60, 1)) for n in survivors)
+    out_text = ", ".join(exiled) or "—"
+    out_lines = _wrap(probe, out_text, out_f, w - 2 * PAD, 4)
+    h = 420 + 56 * surv_lines + 60 + 40 * len(out_lines) + 260
+    img = _canvas(w, h, serial + 1)
+    d = ImageDraw.Draw(img)
+
+    d.text((PAD, 74), f"БУНКЕР № {serial:04d}", font=_mono(30), fill=ACCENT)
+    d.text((w - PAD, 74), date, font=_mono(30), fill=MUTED, anchor="ra")
+    y = 130
+    for line in _wrap(d, title.upper(), _bold(58), w - 2 * PAD, 2):
+        d.text((PAD, y), line, font=_bold(58), fill=TEXT)
+        y += 70
+    y += 20
+    d.line([(PAD, y), (w - PAD, y)], fill=LINE, width=3)
+    y += 40
+
+    d.text((PAD, y), "В БУНКЕРЕ", font=_mono(30), fill=(52, 199, 89))
+    y += 56
+    for n in survivors:
+        d.ellipse([PAD + 6, y + 14, PAD + 26, y + 34], fill=(52, 199, 89))
+        d.text((PAD + 50, y), _wrap(probe, n, name_f, w - 2 * PAD - 60, 1)[0], font=name_f, fill=TEXT)
+        y += 56
+    y += 30
+    d.text((PAD, y), "ЗА ДВЕРЬЮ", font=_mono(30), fill=RED)
+    y += 50
+    for line in out_lines:
+        d.text((PAD, y), line, font=out_f, fill=MUTED)
+        y += 40
+
+    verdict = ("ВЫЖИЛИ", (52, 199, 89)) if survived else ("ПОГИБЛИ", RED)
+    layer = _stamp_layer(*verdict)
+    layer = layer.resize((int(layer.width * 0.8), int(layer.height * 0.8)), Image.LANCZOS)
+    out = img.convert("RGBA")
+    out.alpha_composite(layer, (w - layer.width - 20, h - layer.height - 50))
+    return _png(out.convert("RGB"))
+
+
+# ---------- анимации (GIF) ----------
+
+
+def _gif(frames: list[Image.Image], durations: list[int]) -> bytes:
+    pal = [f.convert("P", palette=Image.ADAPTIVE, colors=128) for f in frames]
     buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
+    pal[0].save(buf, format="GIF", save_all=True, append_images=pal[1:],
+                duration=durations, loop=0, optimize=True, disposal=1)
     return buf.getvalue()
+
+
+def animate_stamp(card: Image.Image, stamp: str) -> bytes:
+    """Карточка, на которую с размаху опускается печать."""
+    text, color = STAMPS[stamp]
+    width = 480
+    base = card.resize((width, int(card.height * width / card.width)), Image.LANCZOS).convert("RGBA")
+    layer0 = _stamp_layer(text, color)
+    k = width / card.width
+    frames, durs = [base.convert("RGB")], [700]
+    for i, scale in enumerate([2.4, 1.9, 1.5, 1.2, 1.0]):
+        sw, sh = int(layer0.width * k * scale), int(layer0.height * k * scale)
+        layer = layer0.resize((sw, sh), Image.LANCZOS)
+        alpha = layer.getchannel("A").point(lambda a, f=(i + 1) / 5: int(a * f))
+        layer.putalpha(alpha)
+        f = base.copy()
+        f.alpha_composite(layer, ((width - sw) // 2, int(base.height * 0.40) - sh // 2))
+        frames.append(f.convert("RGB"))
+        durs.append(60)
+    final = frames[-1]
+    for dx, dy in [(8, -6), (-6, 5), (3, -2), (0, 0)]:  # тряска от удара
+        f = Image.new("RGB", final.size, BG)
+        f.paste(final, (dx, dy))
+        frames.append(f)
+        durs.append(50)
+    durs[-1] = 3000
+    return _gif(frames, durs)
+
+
+def animate_hatch(text: str = "ЛЮК ЗАДРАЕН") -> bytes:
+    """Створки гермодвери съезжаются, крутится штурвал."""
+    w = h = 480
+    inside = _canvas(w, h, 7)
+    d = ImageDraw.Draw(inside)
+    d.ellipse([w // 2 - 160, h // 2 - 160, w // 2 + 160, h // 2 + 160], fill=(40, 34, 18))
+    d.text((w // 2, h // 2), "☢", font=_regular(170), fill=ACCENT, anchor="mm")
+
+    def door(width: int, left: bool) -> Image.Image:
+        dimg = Image.new("RGB", (max(1, width), h), (70, 74, 82))
+        dd = ImageDraw.Draw(dimg)
+        for y in range(40, h, 60):
+            for x in (20, width - 20):
+                dd.ellipse([x - 5, y - 5, x + 5, y + 5], fill=(110, 114, 122))
+        edge = width - 18 if left else 0
+        for y in range(-18, h, 36):
+            dd.polygon([(edge, y), (edge + 18, y + 18), (edge + 18, y + 36), (edge, y + 18)], fill=ACCENT)
+        return dimg
+
+    frames, durs = [inside.copy()], [500]
+    steps = 10
+    for i in range(1, steps + 1):
+        half = int((w // 2) * (i / steps) ** 1.6)
+        f = inside.copy()
+        f.paste(door(half, True), (0, 0))
+        right = door(half, False)
+        f.paste(right, (w - half, 0))
+        frames.append(f)
+        durs.append(55)
+    closed = frames[-1]
+    for i, angle in enumerate([0, 30, 60, 90, 120]):
+        f = closed.copy()
+        fd = ImageDraw.Draw(f)
+        cx, cy, r = w // 2, h // 2 - 20, 70
+        fd.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(200, 200, 200), width=10)
+        for k in range(4):
+            a = math.radians(angle + k * 90)
+            fd.line([(cx, cy), (cx + r * math.cos(a), cy + r * math.sin(a))], fill=(200, 200, 200), width=8)
+        fd.ellipse([cx - 14, cy - 14, cx + 14, cy + 14], fill=ACCENT)
+        if i == 4:
+            fd.rounded_rectangle([40, h - 140, w - 40, h - 70], radius=12, fill=(20, 20, 20), outline=ACCENT, width=3)
+            fd.text((w // 2, h - 105), text, font=_mono(40), fill=ACCENT, anchor="mm")
+        frames.append(f)
+        durs.append(120)
+    durs[-1] = 3000
+    return _gif(frames, durs)
