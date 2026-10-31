@@ -87,6 +87,26 @@ async def admin_roast_toggle(call: CallbackQuery, db: Database, config: Config) 
         )
 
 
+@router.callback_query(F.data == "admin:quiet_kick")
+async def admin_quiet_kick(call: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    from handlers.fun import DAY_FROM, DAY_TO, QUIET_HOURS, QUIET_KEY
+
+    on = (await db.get_setting(QUIET_KEY, "1")) == "1"
+    await db.set_setting(QUIET_KEY, "0" if on else "1")
+    state = "выключен ⛔" if on else "включён 🤔"
+    await call.answer(f"Вопрос дня {state}", show_alert=True)
+    if call.message:
+        await call.message.answer(
+            f"🤔 Вопрос дня {state}\n\n"
+            f"Когда включён: если в чате {QUIET_HOURS} часа никто не пишет (с {DAY_FROM}:00 до {DAY_TO}:00 МСК), "
+            "бот подкидывает провокационный вопрос по темам чата или опрос «Кто из нас…». "
+            "Не чаще раза в сутки; в чат, который молчит больше 3 дней, не пишет."
+        )
+
+
 @router.callback_query(F.data == "admin:roast_freq")
 async def admin_roast_freq(call: CallbackQuery, db: Database, config: Config) -> None:
     if not _is_admin(call.from_user.id, config):

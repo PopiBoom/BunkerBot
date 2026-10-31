@@ -20,7 +20,7 @@ from commands import ADMIN_SECTION, GROUP_SECTIONS, PRIVATE_SECTIONS, menu
 from config import load_config
 from database import Database
 from games import bunker_router
-from handlers import admin_router, help_router, quotes_router, roast_router, stats_router, user_router
+from handlers import admin_router, fun_router, help_router, quotes_router, roast_router, stats_router, user_router
 from handlers.admin import auto_backup_loop
 from handlers.roast import background as roast_background
 
@@ -75,6 +75,7 @@ async def main() -> None:
     dp.include_router(help_router)
     dp.include_router(quotes_router)
     dp.include_router(stats_router)
+    dp.include_router(fun_router)
     # Стёб-бот последним: ловит все остальные сообщения групп
     dp.include_router(roast_router)
 

@@ -1417,6 +1417,14 @@ async def background(bot: Bot, db: Database) -> None:
                             await _auto_roast(bot, db, chat_id, interval)
                         except Exception as e:
                             logger.warning("auto roast failed in %s: %s", chat_id, e)
+                # Опросы «Кто из нас…»: закрыть просроченные; тишина в чате — «вопрос дня»
+                try:
+                    from handlers import fun
+                    await fun.finish_polls(bot, db)
+                    for chat_id in await db.active_chats(int(time.time()) - fun.DEAD_AFTER):
+                        await fun.quiet_kick(bot, db, chat_id)
+                except Exception as e:
+                    logger.warning("fun tick failed: %s", e)
         except Exception:
             logger.exception("roast background tick failed")
         # Проверяем чаще, чем интервал, но не реже раза в минуту

@@ -173,6 +173,19 @@ class Database:
                 )
                 """
             )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS polls (
+                    chat_id  INTEGER NOT NULL,
+                    msg_id   INTEGER NOT NULL,
+                    question TEXT NOT NULL,
+                    options  TEXT NOT NULL,
+                    end_ts   INTEGER NOT NULL,
+                    done     INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (chat_id, msg_id)
+                )
+                """
+            )
             # Миграция: статистика Бункера для званий (серии, голоса против, угроза)
             cur = await db.execute("PRAGMA table_info(bunker_stats)")
             bcols = {r[1] for r in await cur.fetchall()}
@@ -298,6 +311,36 @@ class Database:
                 + ("score >= 2 ORDER BY score DESC, ts DESC" if good else "score <= -1 ORDER BY score ASC, ts DESC")
                 + " LIMIT ?", (chat_id, since, limit))
             return [r[0] for r in await cur.fetchall()]
+
+    # --- опросы «Кто из нас…» ---
+
+    async def add_poll(self, chat_id: int, msg_id: int, question: str, options: list, end_ts: int) -> None:
+        import json
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO polls (chat_id, msg_id, question, options, end_ts, done) VALUES (?, ?, ?, ?, ?, 0)",
+                (chat_id, msg_id, question, json.dumps(options, ensure_ascii=False), end_ts))
+            await db.commit()
+
+    async def due_polls(self, now: int) -> list[tuple]:
+        """[(chat_id, msg_id, question, options[[user_id, имя], …])] — пора закрывать."""
+        import json
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT chat_id, msg_id, question, options FROM polls WHERE done = 0 AND end_ts <= ?",
+                                   (now,))
+            return [(r[0], r[1], r[2], json.loads(r[3])) for r in await cur.fetchall()]
+
+    async def mark_poll_done(self, chat_id: int, msg_id: int) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("UPDATE polls SET done = 1 WHERE chat_id = ? AND msg_id = ?", (chat_id, msg_id))
+            await db.commit()
+
+    async def last_activity(self, chat_id: int) -> int:
+        """Когда в чате последний раз писал живой человек (ts) — для «вопроса дня» в тишину."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT MAX(ts) FROM chat_messages WHERE chat_id = ? AND user_id > 0", (chat_id,))
+            row = await cur.fetchone()
+            return int(row[0]) if row and row[0] else 0
 
     # --- цитатник («золотой фонд») ---
 
