@@ -6,14 +6,15 @@
   НОЧЬ: чат закрыт — все сообщения удаляются; ходы кнопками в ЛС: мафия голосует за жертву (голос
   можно менять, семья видит голоса друг друга; при равенстве решает Дон), Дон ищет Комиссара,
   Комиссар проверяет «мафия или нет», Доктор лечит (себя — раз за игру, одного — не две ночи подряд) →
-  УТРО: сводка ведущего, роль убитого открывается, у убитого — последнее слово →
+  УТРО: сводка ведущего, роль убитого открывается; убитому бот пишет в ЛС — может прислать одно
+  сообщение «последнего слова», бот перешлёт его в чат (игра его не ждёт) →
   ДЕНЬ: обсуждение с таймером, посреди — подкол ведущего (он видит только чат, ролей не знает) →
-  открытое голосование кнопками («никого» тоже можно); ничья — оправдания и переголосование между
-  равными, снова ничья — никого не казнят; у казнённого — последнее слово → …
+  тайное голосование кнопками, как в Бункере («никого» тоже можно); ничья — оправдания и
+  переголосование между равными, снова ничья — никого не казнят; у казнённого — последнее слово в ЛС → …
   ФИНАЛ: мафии не меньше, чем мирных, — победа мафии; мафии нет — победа города; несколько кругов
   без смертей — ничья. Роли всех, эпилог, титры с номинациями, статистика для /mafia_top.
 
-Мёртвые и не-игроки днём молчат (их сообщения удаляются), кроме последнего слова.
+Мёртвые и не-игроки днём молчат (их сообщения молча удаляются); последнее слово — только через бота.
 Состояние партий — в памяти процесса (одна на чат; Бункер и Мафия в одном чате одновременно не идут).
 """
 from __future__ import annotations
@@ -22,6 +23,7 @@ import asyncio
 import html
 import logging
 import random
+import re
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -46,8 +48,8 @@ MIN_PLAYERS = 4
 MAX_PLAYERS = 16
 LOBBY_TIMEOUT = 15 * 60   # брошенное лобби закрывается само
 NIGHT_TIME = 60           # сек на ночные ходы (раньше — если все сходили)
-LAST_WORD = 30            # сек на последнее слово убитого / казнённого
 VOTE_TIME = 60            # сек на дневное голосование (раньше — если все проголосовали)
+LAST_WORD_MAX = 500       # символов в последнем слове
 SPEECH_TIME = 30          # сек на оправдания при ничьей
 REVOTE_TIME = 30          # сек на переголосование между равными
 MAX_IDLE = 2              # столько кругов «ночь + день» подряд без смертей — ничья
@@ -116,7 +118,8 @@ class Game:
     vote_stage: str = ""          # open | speech | revote | closed
     vote_msg_id: int | None = None
     vote_ends: float = 0.0
-    speakers: set[int] = field(default_factory=set)           # мёртвые с правом последнего слова сейчас
+    last_word: set[int] = field(default_factory=set)          # мёртвые, кто ещё может прислать последнее слово
+    edit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # правки сообщений чата — по очереди
     # итоги
     timeline: list[str] = field(default_factory=list)
     first_victim: int | None = None
@@ -126,7 +129,6 @@ class Game:
     votes_right: dict[int, int] = field(default_factory=dict)  # мирный голосовал против мафии
     votes_wrong: dict[int, int] = field(default_factory=dict)  # мирный голосовал против своего
     cant_delete: bool = False
-    warned: bool = False
     pending: set[str] = field(default_factory=set)
 
 
@@ -186,9 +188,30 @@ def _names(names: list[str], last: str = " и ") -> str:
     return names[0] if len(names) == 1 else ", ".join(names[:-1]) + last + names[-1]
 
 
+_SENT = re.compile(r"(?<=[.!?…])\s+(?=[А-ЯЁA-Z«\"—–-])")
+
+
+def _paras(text: str) -> str:
+    """Текст ведущего абзацами: если ИИ написал сплошняком — бьём по 2 предложения."""
+    text = re.sub(r"\n{3,}", "\n\n", str(text).strip())
+    if "\n" in text:
+        return text
+    sents = [x for x in _SENT.split(text) if x.strip()]
+    if len(sents) < 3 and len(text) < 220:
+        return text
+    return "\n\n".join(" ".join(sents[i:i + 2]) for i in range(0, len(sents), 2))
+
+
 def _host(game: Game, text: str) -> str:
     voice = C.MODE_VOICE.get(game.mode, C.MODE_VOICE["classic"])
-    return f"{voice}\n<blockquote>{_e(text.strip())}</blockquote>"
+    return f"{voice}\n<blockquote>{_e(_paras(text))}</blockquote>"
+
+
+def _bar(value: float, top: float, width: int = 8) -> str:
+    filled = 0 if top <= 0 else round(width * value / top)
+    if value > 0:
+        filled = max(1, filled)
+    return "▓" * filled + "░" * (width - filled)
 
 
 def _fate(p: Player) -> str:
@@ -300,17 +323,33 @@ async def _say(bot: Bot, game: Game, text: str, reply_markup: InlineKeyboardMark
 
 
 async def _edit(bot: Bot, chat_id: int, message_id: int | None, text: str,
-                reply_markup: InlineKeyboardMarkup | None = None) -> bool:
+                reply_markup: InlineKeyboardMarkup | None = None, retry: bool = True) -> bool:
+    """retry=False — для необязательных правок (таймер, счётчик голосов): при флуд-лимите просто пропускаем."""
     if message_id is None:
         return False
     try:
-        await _retry(bot.edit_message_text, text, chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
+        if retry:
+            await _retry(bot.edit_message_text, text, chat_id=chat_id, message_id=message_id,
+                         reply_markup=reply_markup)
+        else:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
         return True
     except TelegramBadRequest as e:
         return "not modified" in str(e)
     except Exception as e:
         logger.debug("edit failed: %s", e)
         return False
+
+
+async def _chat_edit(bot: Bot, game: Game, message_id: int | None, text, reply_markup=None,
+                     ok=None, retry: bool = True) -> None:
+    """Правка сообщения в чате под замком партии: правки идут строго по очереди, и устаревшая
+    (например, голосование с кнопками) не может лечь поверх закрытого. ok() проверяется уже под замком."""
+    async with game.edit_lock:
+        if ok is not None and not ok():
+            return
+        await _edit(bot, game.chat_id, message_id, text() if callable(text) else text,
+                    reply_markup() if callable(reply_markup) else reply_markup, retry=retry)
 
 
 async def _dm(bot: Bot, p: Player, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> Message | None:
@@ -372,7 +411,7 @@ def must_delete(message: Message) -> bool:
     if game.phase == "night":
         return True
     p = game.players.get(u.id)
-    return not (p and (p.alive or u.id in game.speakers))
+    return not (p and p.alive)
 
 
 # ---------- лобби ----------
@@ -393,7 +432,7 @@ def _lobby_text(game: Game) -> str:
         "",
         "🎮 Жми «Вступить в игру» — откроется бот, нажми Start, и ты в игре. Роль придёт в личку.",
         "",
-        "🌙 Ночью чат закрыт: все сообщения удаляю. Мёртвые молчат — кроме последнего слова.",
+        "🌙 Ночью чат закрыт: все сообщения удаляю. Мёртвые молчат — последнее слово можно передать через бота.",
         "",
         "👑 Ведущий тоже жмёт «Вступить», потом «Начать».",
     ]
@@ -858,18 +897,19 @@ async def _run_game(bot: Bot, game: Game) -> None:
 def _night_text(game: Game, left: float | None = None, over: bool = False) -> str:
     if over:
         return f"🌙 <b>Ночь {game.no}</b> закончилась. Город просыпается…"
-    lines = [f"🌙 <b>НОЧЬ {game.no}</b>", HR, "",
-             "Город засыпает. До утра чат закрыт — все сообщения удаляю 🤫", "",
-             "🔪 Мафия выбирает жертву"]
+    acts = ["🔪 Мафия выбирает жертву"]
     if _role_alive(game, "don"):
-        lines.append("🎩 Дон ищет Комиссара")
+        acts.append("🎩 Дон ищет Комиссара")
     if _role_alive(game, "sheriff"):
-        lines.append("⭐ Комиссар проверяет")
+        acts.append("⭐ Комиссар проверяет")
     if _role_alive(game, "doctor"):
-        lines.append("💉 Доктор лечит")
-    lines += ["", "📬 Ходы — в личке с ботом."]
+        acts.append("💉 Доктор лечит")
+    lines = [f"🌙 <b>НОЧЬ {game.no}</b>", HR, "",
+             "Город засыпает. До утра чат закрыт — всё, что напишете, удалю 🤫", "",
+             "<blockquote>" + "\n".join(acts) + "</blockquote>", "",
+             "📬 Ходы — в личке с ботом"]
     if left is not None:
-        lines.append(f"⏳ {_clock(left)}")
+        lines.append(f"⏳ <b>{_clock(left)}</b>")
     return "\n".join(lines)
 
 
@@ -993,11 +1033,12 @@ async def _night(bot: Bot, game: Game) -> None:
             break
         left = ends - _now()
         if left > 1 and _is_active(game):
-            await _edit(bot, game.chat_id, game.night_msg_id, _night_text(game, left), _night_kb(game))
+            await _chat_edit(bot, game, game.night_msg_id, _night_text(game, left), _night_kb(game),
+                             ok=lambda: game.phase == "night", retry=False)
     if not _is_active(game):
         return
     game.phase = "morning"  # ночные кнопки больше не работают
-    await _edit(bot, game.chat_id, game.night_msg_id, _night_text(game, over=True))
+    await _chat_edit(bot, game, game.night_msg_id, _night_text(game, over=True))
     for p in game.players.values():
         for mid, kind in p.night_msgs.items():
             text = _kill_text(game, p, over=True) if kind == "kill" else "🌅 Ночь закончилась — ход пропущен."
@@ -1194,23 +1235,42 @@ async def _send_card(bot: Bot, game: Game, p: Player, stamp: str, caption: str) 
     await _pause(game, 3)
 
 
-async def _last_word(bot: Bot, game: Game, p: Player) -> None:
-    """Последнее слово убитого или казнённого: LAST_WORD секунд ему можно писать в чат."""
+async def _offer_last_word(bot: Bot, game: Game, p: Player, how: str) -> None:
+    """Последнее слово — по желанию и без паузы в игре: бот пишет мёртвому в ЛС, тот присылает одно
+    сообщение, бот пересылает его в чат. Тестовые боты «говорят» сами."""
+    if p.is_bot:
+        _launch(bot, game, _bot_line(bot, game, p, C.BOT_LAST_WORDS, last=True), fatal=False)
+        return
+    game.last_word.add(p.user_id)
+    msg = await _dm(bot, p, f"{how}\n\n🕯 <b>Последнее слово</b> — по желанию: напиши его сюда одним сообщением, "
+                            "и я перешлю его в чат. Только одно сообщение.\n\n"
+                            "👻 Дальше ты призрак: читать чат можно, писать — нет.")
+    if msg is None:
+        game.last_word.discard(p.user_id)
+
+
+def _last_word_game(message: Message) -> Game | None:
+    if message.chat.type != "private" or message.from_user is None or not message.text \
+            or message.text.startswith("/"):
+        return None
+    uid = message.from_user.id
+    return next((g for g in games.values() if uid in g.last_word and g.phase != "ended"), None)
+
+
+def _is_last_word(message: Message) -> bool:
+    return _last_word_game(message) is not None
+
+
+async def _bot_line(bot: Bot, game: Game, p: Player, lines: list[str], last: bool = False) -> None:
+    await asyncio.sleep(random.uniform(2, 5) * TIME_SCALE)
     if not _is_active(game):
         return
-    game.speakers = {p.user_id}
-    await _send(bot, game.chat_id, f"🕯 <b>Последнее слово — {_mention(p)}</b>\n"
-                                   f"У тебя {LAST_WORD} сек. Потом — только тишина.")
-    if p.is_bot:
-        _launch(bot, game, _bot_line(bot, game, p, C.BOT_LAST_WORDS), fatal=False)
-    await _pause(game, LAST_WORD)
-    game.speakers = set()
-
-
-async def _bot_line(bot: Bot, game: Game, p: Player, lines: list[str]) -> None:
-    await asyncio.sleep(random.uniform(2, 5) * TIME_SCALE)
-    if _is_active(game):
-        await _send(bot, game.chat_id, f"🗣 <b>{_e(p.name)}:</b> «{_e(random.choice(lines))}»")
+    line = _e(random.choice(lines))
+    if last:
+        await _send(bot, game.chat_id, f"🕯 <b>Последнее слово — {_e(p.name)}</b> "
+                                       f"({_e(C.title(p.role))} {C.emoji(p.role)})\n<blockquote>{line}</blockquote>")
+    else:
+        await _send(bot, game.chat_id, f"🗣 <b>{_e(p.name)}:</b> «{line}»")
 
 
 async def _morning(bot: Bot, game: Game) -> None:
@@ -1232,10 +1292,9 @@ async def _morning(bot: Bot, game: Game) -> None:
     if not victim or not _is_active(game):
         return
     await _send_card(bot, game, victim, "killed",
-                     f"☠️ Этой ночью убит(а) <b>{_e(victim.name)}</b>\n🎭 Роль: <b>{_e(role)}</b>")
-    await _dm(bot, victim, f"☠️ Тебя убили этой ночью. Скажи последнее слово в чате — у тебя {LAST_WORD} сек.\n"
-                           "Дальше ты призрак: читать можно, писать нельзя.")
-    await _last_word(bot, game, victim)
+                     f"☠️ <b>Этой ночью убит(а): {_e(victim.name)}</b>\n\n🎭 Роль: <b>{_e(role)}</b>")
+    if _winner(game) is None:  # партия на этом кончилась — последнее слово уже не к месту
+        await _offer_last_word(bot, game, victim, "☠️ <b>Тебя убили этой ночью.</b>")
 
 
 # ---------- день ----------
@@ -1244,11 +1303,11 @@ async def _morning(bot: Bot, game: Game) -> None:
 def _day_text(game: Game, left: float | None = None) -> str:
     alive = _alive(game)
     lines = [f"☀️ <b>ДЕНЬ {game.no} · ОБСУЖДЕНИЕ</b>", HR, "",
-             f"👥 В живых {len(alive)}: " + ", ".join(_e(p.name) for p in alive), "",
-             "Кто из них мафия? Спорьте, обвиняйте, оправдывайтесь.",
-             "💀 Мёртвые молчат — их сообщения удаляю."]
+             f"👥 <b>В живых: {len(alive)}</b>",
+             "<blockquote>" + ", ".join(_e(p.name) for p in alive) + "</blockquote>", "",
+             "🕵️ Кто из них мафия? Спорьте, обвиняйте, оправдывайтесь."]
     if left is not None:
-        lines += ["", f"⏳ До голосования: {_clock(left)}"]
+        lines += ["", f"⏳ До голосования: <b>{_clock(left)}</b>"]
     return "\n".join(lines)
 
 
@@ -1303,11 +1362,12 @@ async def _day(bot: Bot, game: Game) -> None:
             _launch(bot, game, _day_quip(bot, game, since), fatal=False)
         left = ends - _now()
         if left > 1 and _is_active(game):
-            await _edit(bot, game.chat_id, game.day_msg_id, _day_text(game, left), _day_kb(game))
+            await _chat_edit(bot, game, game.day_msg_id, _day_text(game, left), _day_kb(game),
+                             ok=lambda: game.phase == "day", retry=False)
     if not _is_active(game):
         return
-    await _edit(bot, game.chat_id, game.day_msg_id,
-                f"☀️ <b>День {game.no}</b> — обсуждение окончено. Голосуем 👇")
+    game.phase = "vote"  # кнопка «к голосованию» и таймер больше не оживут
+    await _chat_edit(bot, game, game.day_msg_id, f"☀️ <b>День {game.no}</b> — обсуждение окончено. Голосуем 👇")
     await _vote(bot, game)
 
 
@@ -1323,31 +1383,46 @@ def _tally(game: Game) -> tuple[list[int], int, int]:
     return ([t for t, c in counts.items() if c == top] if top else []), top, skip
 
 
-def _vote_text(game: Game, closed: bool = False) -> str:
-    revote = len(game.vote_targets) < len(_alive(game))
-    title = f"🗳 <b>ГОЛОСОВАНИЕ · ДЕНЬ {game.no}</b>" + (" · переголосование" if revote else "")
-    lines = [title + (" — закрыто" if closed else ""), HR, ""]
-    if not closed:
-        lines += ["Между ними 👇 (или «никого»)" if revote else
-                  "Кого казним? Голоса открытые — все видят, кто за кого.", ""]
-    by: dict[int, list[str]] = {}
+def _vote_counts(game: Game) -> tuple[dict[int, int], int]:
+    """(голоса против каждого из кандидатов, голоса за «никого») — только живые голосующие."""
+    scores = {u: 0 for u in game.vote_targets if game.players[u].alive}
+    skip = 0
     for v, t in game.votes.items():
-        by.setdefault(t, []).append(game.players[v].name)
-    # в основном голосовании — только те, за кого уже голосуют; в переголосовании — все равные
-    shown = [u for u in game.vote_targets if game.players[u].alive and (by.get(u) or revote)]
-    shown.sort(key=lambda u: -len(by.get(u, [])))
-    for u in shown + ([0] if by.get(0) else []):
-        voters = by.get(u, [])
-        name = "🙅 Никого" if u == 0 else f"<b>{_e(game.players[u].name)}</b>"
-        lines.append(f"{name} — {len(voters)}" + (f" · {_e(', '.join(voters))}" if voters else ""))
-    if not shown and not by.get(0):
-        lines.append("<i>Никто не проголосовал.</i>" if closed else "<i>Пока никто не проголосовал.</i>")
-    if not closed:
-        waiting = [p.name for p in _alive(game) if p.user_id not in game.votes]
-        lines += ["", f"⏳ {_clock(max(0, game.vote_ends - _now()))} · проголосовали "
-                      f"{len(game.votes)}/{len(_alive(game))}"]
-        if waiting and len(waiting) <= 8:
-            lines.append("🤐 Ждём: " + _e(", ".join(waiting)))
+        if v not in game.players or not game.players[v].alive:
+            continue
+        if t == 0:
+            skip += 1
+        elif t in scores:
+            scores[t] += 1
+    return scores, skip
+
+
+def _bars(game: Game) -> str:
+    scores, skip = _vote_counts(game)
+    rows = sorted(scores.items(), key=lambda kv: -kv[1])
+    top = max([skip] + list(scores.values()))
+    names = [game.players[u].name[:14] for u, _ in rows] + ["никого"]
+    width = min(14, max(len(n) for n in names))
+    lines = [f"{_e(game.players[u].name[:14].ljust(width))} {_bar(n, top)} {n}" for u, n in rows]
+    lines.append(f"{'никого'.ljust(width)} {_bar(skip, top)} {skip}")
+    return "<code>" + "\n".join(lines) + "</code>"
+
+
+def _vote_text(game: Game, closed: bool = False) -> str:
+    alive = _alive(game)
+    revote = len(game.vote_targets) < len(alive)
+    if closed:
+        head = "Переголосование" if revote else "Голосование"
+        return f"🗳 <b>{head} · день {game.no} — закрыто</b>\n\n{_bars(game)}"
+    if revote:
+        names = _names([f"<b>{_e(game.players[u].name)}</b>" for u in game.vote_targets], " или ")
+        lines = [f"⚖️ <b>ПЕРЕГОЛОСОВАНИЕ · ДЕНЬ {game.no}</b>", HR, "",
+                 f"Ничья! Выбираем только между: {names}", ""]
+    else:
+        lines = [f"🗳 <b>ГОЛОСОВАНИЕ · ДЕНЬ {game.no}</b>", HR, "", f"👥 В живых: {len(alive)}", ""]
+    lines += [f"✋ Проголосовали: {len(game.votes)}/{len(alive)}", "", _bars(game), "",
+              "❓ Кого казним? Голосование тайное, голос можно менять.",
+              f"⏳ {REVOTE_TIME if revote else VOTE_TIME} сек — или пока все не проголосуют."]
     return "\n".join(lines)
 
 
@@ -1355,7 +1430,7 @@ def _vote_kb(game: Game) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for u in sorted(game.vote_targets, key=lambda x: game.players[x].name):
         if game.players[u].alive:
-            b.button(text=f"⚖️ {game.players[u].name}", callback_data=f"mf:v:{game.no}:{u}")
+            b.button(text=f"🔪 {game.players[u].name}", callback_data=f"mf:v:{game.no}:{u}")
     b.button(text="🙅 Никого", callback_data=f"mf:v:{game.no}:0")
     b.adjust(2)
     b.row(_btn("🎭 Моя роль", "mf:role"))
@@ -1363,8 +1438,12 @@ def _vote_kb(game: Game) -> InlineKeyboardMarkup:
 
 
 async def _refresh_vote(bot: Bot, game: Game) -> None:
-    if game.phase == "vote" and game.vote_stage in ("open", "revote"):
-        await _edit(bot, game.chat_id, game.vote_msg_id, _vote_text(game), _vote_kb(game))
+    """Обновить счётчик голосов. Под замком и с проверкой стадии — устаревшая правка с кнопками
+    не ляжет поверх закрытого голосования (иначе у всех снова появлялись бы кнопки)."""
+    msg_id, stage = game.vote_msg_id, game.vote_stage
+    await _chat_edit(bot, game, msg_id, lambda: _vote_text(game), lambda: _vote_kb(game),
+                     ok=lambda: (game.phase == "vote" and game.vote_stage == stage and stage in ("open", "revote")
+                                 and game.vote_msg_id == msg_id), retry=False)
 
 
 @router.callback_query(F.data.startswith("mf:v:"))
@@ -1429,9 +1508,9 @@ async def _bots_vote(bot: Bot, game: Game) -> None:
 async def _speech(bot: Bot, game: Game, cands: list[int]) -> None:
     game.vote_stage = "speech"
     who = _names([_mention(game.players[u]) for u in cands])
-    await _send(bot, game.chat_id, f"⚖️ <b>Ничья!</b> Поровну голосов у {who}.\n\n"
-                                   f"🎤 У вас {SPEECH_TIME} сек на оправдания — потом переголосуем только между вами. "
-                                   "Снова ничья — сегодня никого не казнят.")
+    await _send(bot, game.chat_id, f"⚖️ <b>НИЧЬЯ</b>\n{HR}\n\nПоровну голосов у {who}.\n\n"
+                                   f"🎤 У вас <b>{SPEECH_TIME} сек</b> на оправдания — потом переголосуем только "
+                                   "между вами.\n\nСнова ничья — сегодня никого не казнят.")
     for u in cands:
         if game.players[u].is_bot:
             _launch(bot, game, _bot_line(bot, game, game.players[u], C.BOT_SPEECHES), fatal=False)
@@ -1451,20 +1530,14 @@ async def _vote(bot: Bot, game: Game) -> None:
         game.vote_msg_id = msg.message_id
         if any(p.is_bot for p in _alive(game)):
             _launch(bot, game, _bots_vote(bot, game), fatal=False)
-        while _is_active(game):
-            left = game.vote_ends - _now()
-            if left <= 0.05:
-                break
-            marks = [m for m in (30, 10) if m < left - 1]
-            if await _wait(game.advance, left - (marks[0] if marks else 0)):
-                break
-            await _refresh_vote(bot, game)
+        await _wait(game.advance, game.vote_ends - _now())  # до конца времени или пока все не проголосуют
         if not _is_active(game):
             return
-        game.vote_stage = "closed"
+        async with game.edit_lock:  # закрываем после всех начатых правок — кнопки уже не вернутся
+            game.vote_stage = "closed"
+            await _edit(bot, game.chat_id, game.vote_msg_id, _vote_text(game, closed=True))
         if attempt == 0:
             _score_votes(game, game.votes)
-        await _edit(bot, game.chat_id, game.vote_msg_id, _vote_text(game, closed=True))
         cands, top, skip = _tally(game)
         logger.info("mafia vote chat=%s day=%s attempt=%s votes=%s -> %s top=%s skip=%s", game.chat_id, game.no,
                     attempt, {game.players[v].name: (game.players[t].name if t else "-") for v, t in game.votes.items()},
@@ -1489,7 +1562,7 @@ async def _vote(bot: Bot, game: Game) -> None:
         await _execute(bot, game, game.players[executed])
     else:
         game.timeline.append(f"День {game.no}: никого не казнили ({note})")
-        await _say(bot, game, f"🤷 <b>Сегодня никого не казнят</b> — {note}.\n"
+        await _say(bot, game, f"🤷 <b>Сегодня никого не казнят</b>\n\n<i>{_e(note.capitalize())}.</i> "
                               "Город расходится по домам, косо поглядывая друг на друга.")
 
 
@@ -1504,15 +1577,14 @@ async def _execute(bot: Bot, game: Game, p: Player) -> None:
         story = await _ai(ai.mafia_execution(game.city, game.no, p.name, C.title(p.role), right,
                                              await _dossier(game, p), _style(game)), "execution")
     story = story or C.executed_fallback(p.name, role, right)
-    await _say(bot, game, f"⚖️ <b>Приговор города — {_e(p.name)}.</b>\n\n{_host(game, story)}")
+    await _say(bot, game, f"⚖️ <b>ПРИГОВОР</b>\n{HR}\n\nГород казнит: <b>{_e(p.name)}</b>\n\n{_host(game, story)}")
     if not _is_active(game):
         return
     await _send_card(bot, game, p, "executed",
-                     f"🪦 <b>{_e(p.name)}</b> — {_e(role)}\n"
+                     f"🪦 <b>{_e(p.name)}</b> — {_e(role)}\n\n"
                      + ("🎯 Город попал: это мафия!" if right else "🤡 Город ошибся: казнили своего."))
-    await _dm(bot, p, f"⚖️ Тебя казнили. Скажи последнее слово в чате — у тебя {LAST_WORD} сек.\n"
-                      "Дальше ты призрак: читать можно, писать нельзя.")
-    await _last_word(bot, game, p)
+    if _winner(game) is None:
+        await _offer_last_word(bot, game, p, "⚖️ <b>Город тебя казнил.</b>")
 
 
 # ---------- финал ----------
@@ -1559,31 +1631,28 @@ async def _nominations(game: Game) -> list[tuple[str, str, str]]:
 async def _finish(bot: Bot, game: Game, winner: str) -> None:
     game.phase = "ended"  # чат снова открыт
     players = sorted(game.players.values(), key=lambda p: (C.ROLE_ORDER.index(p.role), p.name))
-    head = {"mafia": "🔫 <b>ПОБЕДА МАФИИ</b>", "town": "🏙 <b>ПОБЕДА ГОРОДА</b>"}.get(winner, "🤷 <b>НИЧЬЯ</b>")
-    why = {"mafia": "Мафии стало не меньше, чем мирных, — город сдался.",
-           "town": "Вся мафия казнена — город может спать спокойно. Пока.",
-           }.get(winner, "Несколько кругов без единой смерти — город уснул от скуки.")
     epi_task = asyncio.create_task(_ai(ai.mafia_epilogue(
         game.city, winner, [{"name": p.name, "role": C.title(p.role), "fate": _fate(p)} for p in players],
         game.timeline, _style(game)), "epilogue")) if ai.available() else None
-    lines = [HR, head, HR, "", why, "", "🎭 <b>Кто был кем:</b>"]
-    lines += [f"{C.emoji(p.role)} <b>{_e(p.name)}</b> — {C.title(p.role)} · {_fate(p)}" for p in players]
-    await _send(bot, game.chat_id, "\n".join(lines))
-    await asyncio.sleep(3 * TIME_SCALE)
-
-    epi = (await epi_task if epi_task else None) or C.EPILOGUE.get(winner, C.EPILOGUE["draw"]).format(city=game.city)
-    await _send(bot, game.chat_id, f"📖 <b>ЭПИЛОГ</b>\n\n{_host(game, epi)}")
-    await asyncio.sleep(_read(epi) * TIME_SCALE)
+    head = {"mafia": "🔫 Победила <b>мафия</b> — её стало не меньше, чем мирных.",
+            "town": "🏙 Победил <b>город</b> — вся мафия казнена.",
+            }.get(winner, "🤷 <b>Ничья</b> — несколько кругов без единой смерти, город уснул от скуки.")
+    await _send(bot, game.chat_id, f"🏁 <b>ПАРТИЯ ОКОНЧЕНА</b>\n{HR}\n\n{head}")
 
     noms = await _nominations(game)
-    try:
+    try:  # роли всех и судьбы — на картинке
         png = await asyncio.to_thread(
             R.render_credits, game.city, winner, [{"name": p.name, "role": p.role, "fate": _fate(p)} for p in players],
             noms, game.serial, date.today().strftime("%d.%m.%Y"))
         await _retry(bot.send_photo, game.chat_id, BufferedInputFile(png, filename="credits.png"),
-                     caption="🎬 <b>Титры партии</b>")
+                     caption="🎬 <b>Титры партии</b>\n\n🔁 /mafia — сыграть ещё · 🏆 /mafia_top — рейтинг")
     except Exception as e:
         logger.warning("mafia credits failed: %s", e)
+        await _send(bot, game.chat_id, "🎭 <b>Кто был кем</b>\n\n" + "\n".join(
+            f"{C.emoji(p.role)} <b>{_e(p.name)}</b> — {C.title(p.role)} · {_fate(p)}" for p in players))
+
+    epi = (await epi_task if epi_task else None) or C.EPILOGUE.get(winner, C.EPILOGUE["draw"]).format(city=game.city)
+    await _send(bot, game.chat_id, f"📖 <b>ЭПИЛОГ</b>\n\n{_host(game, epi)}")
 
     if game.db:
         results = []
@@ -1605,9 +1674,29 @@ async def _finish(bot: Bot, game: Game, winner: str) -> None:
             await game.db.record_mafia_game(results)
         except Exception as e:
             logger.warning("mafia stats save failed: %s", e)
-    await _send(bot, game.chat_id, "🖤 <b>Игра окончена!</b> Чат снова открыт.\n\n"
-                                   "🔁 /mafia — сыграть ещё\n🏆 /mafia_top — рейтинг")
     _end_game(game)
+
+
+# ---------- последнее слово: мёртвый пишет боту в ЛС одно сообщение ----------
+
+
+@router.message(_is_last_word)
+async def on_last_word(message: Message) -> None:
+    game = _last_word_game(message)
+    if game is None or message.from_user is None:
+        return
+    uid = message.from_user.id
+    game.last_word.discard(uid)  # только одно сообщение
+    p = game.players[uid]
+    text = (message.text or "").strip()[:LAST_WORD_MAX]
+    try:
+        await _send(message.bot, game.chat_id,
+                    f"🕯 <b>Последнее слово — {_e(p.name)}</b> ({_e(C.title(p.role))} {C.emoji(p.role)})\n"
+                    f"<blockquote>{_e(text)}</blockquote>")
+        await message.answer("🕯 Передал в чат. Покойся с миром 👻")
+    except Exception as e:
+        logger.warning("last word failed: %s", e)
+        await message.answer("Не смог передать в чат 😔")
 
 
 # ---------- удаление: ночь, мёртвые, не-игроки (последним — после команд) ----------
@@ -1629,20 +1718,3 @@ async def on_hush(message: Message) -> None:
         except Exception:
             pass
         return
-    if game.phase == "night" or game.warned:
-        return
-    game.warned = True
-    try:
-        note = await _send(message.bot, game.chat_id, "🤫 Идёт Мафия — днём пишут только живые игроки. "
-                                                      "Остальных удаляю до конца партии.")
-    except Exception:
-        return
-
-    async def drop() -> None:
-        await asyncio.sleep(30)
-        try:
-            await note.delete()
-        except Exception:
-            pass
-
-    _launch(message.bot, game, drop(), fatal=False)
