@@ -482,6 +482,15 @@ class Database:
             )
             return list(await cur.fetchall())
 
+    async def promises_due_between(self, chat_id: int, since: int, until: int) -> list[dict]:
+        """Обещания, срок которых вышел в [since, until] (для «слитых обещаний недели»), без «забытых»."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT p.id, p.name, p.what, p.due_ts FROM promises p WHERE p.chat_id = ? AND p.due_ts BETWEEN ? AND ? "
+                "AND NOT EXISTS (SELECT 1 FROM roast_optout o WHERE o.chat_id = p.chat_id AND o.user_id = p.user_id) "
+                "ORDER BY p.due_ts LIMIT 10", (chat_id, since, until))
+            return [{"id": r[0], "name": r[1] or "Аноним", "what": r[2], "due": r[3]} for r in await cur.fetchall()]
+
     async def has_similar_promise(self, chat_id: int, user_id: int, what: str) -> bool:
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(

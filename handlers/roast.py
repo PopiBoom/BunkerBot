@@ -29,9 +29,10 @@ from datetime import datetime, timedelta, timezone
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Message, MessageReactionUpdated, ReactionTypeEmoji, ReplyParameters
+from aiogram.types import BufferedInputFile, Message, MessageReactionUpdated, ReactionTypeEmoji, ReplyParameters
 
 import ai
+import cards
 import frames
 import links
 import rhymes
@@ -715,19 +716,84 @@ async def cmd_roast(message: Message, command: CommandObject, bot: Bot, db: Data
                reply_to=rt.message_id if rt and rt.from_user and rt.from_user.id == target_id else None)
 
 
+async def _send_card(bot: Bot, chat_id: int, png: bytes, caption: str, memory: str) -> None:
+    """Картинка в чат (подпись — HTML, уже экранированная) + запись в память бота, что он это сказал."""
+    sent = await bot.send_photo(chat_id, BufferedInputFile(png, filename="card.png"), caption=caption[:1024])
+    _last_bot_msg[chat_id] = time.time()
+    try:
+        await db_add_own(chat_id, getattr(sent, "message_id", 0) or 0, memory)
+    except Exception as e:
+        logger.debug("save own card failed: %s", e)
+
+
+async def db_add_own(chat_id: int, msg_id: int, text: str) -> None:
+    if _db_ref:
+        await _db_ref[0].add_chat_message(chat_id, msg_id, 0, BOT_SELF, None, text[:1000])
+
+
 async def _week_digest(bot: Bot, db: Database, chat_id: int) -> bool:
-    rows = await db.recent_messages(chat_id, limit=2000, since=int(time.time()) - 7 * 86400)
-    by_user: dict[str, list[str]] = {}
-    for _mid, uid, name, text, _ts in rows:
+    """Итоги недели: постер «Оскар позора» (5 номинаций с цитатами), потом новости чата, слитые обещания
+    и гороскоп на следующую неделю — одним сообщением. Всё пишет ИИ одним запросом (ai.week_show)."""
+    if not _db_ref:
+        _db_ref.append(db)
+    now = int(time.time())
+    since = now - 7 * 86400
+    rows = await db.recent_messages(chat_id, limit=2000, since=since)
+    by_user: dict[str, list[tuple[int, str]]] = {}
+    said: dict[int, tuple[str, str]] = {}  # id сообщения -> (имя, текст) — цитаты берём отсюда, а не со слов ИИ
+    for mid, uid, name, text, _ts in rows:
         if uid <= 0:  # свои реплики и посты канала не номинируем
             continue
-        by_user.setdefault(name or "Аноним", []).append(text)
+        by_user.setdefault(name or "Аноним", []).append((mid, text))
+        said[mid] = (name or "Аноним", str(text))
     active = sorted(by_user.items(), key=lambda kv: -len(kv[1]))[:10]
     if len(active) < 2:
         return False
     samples = {name: msgs[-25:] for name, msgs in active}
-    text = await ai.weekly_digest(await db.chat_dossiers(chat_id), samples)
-    await _say(bot, chat_id, f"📅 ИТОГИ НЕДЕЛИ\n\n{text}")
+    dossiers = await db.chat_dossiers(chat_id)
+    promises = await db.promises_due_between(chat_id, since, now)
+    data = await ai.week_show(samples, dossiers, promises)
+    if not data["nominations"]:
+        return False
+    noms = []
+    for n in data["nominations"]:
+        who, text = said.get(n["msg_id"] or -1, ("", ""))
+        quote = text if who == n["name"] and text and not text.startswith("[") else ""
+        noms.append((n["title"], n["name"], quote[:200], n["why"]))
+    period = (f"{datetime.fromtimestamp(since, MSK):%d.%m}-{datetime.fromtimestamp(now, MSK):%d.%m}")
+    caption = f"🏆 <b>ОСКАР ПОЗОРА</b> · неделя {period}\n\n" + "\n".join(
+        f"<b>{html.escape(t)}</b> - {html.escape(nm)}" + (f": {html.escape(why)}" if why else "")
+        for t, nm, _q, why in noms)
+    memory = "[итоги недели] " + "; ".join(f"{t} - {nm}: {why}" for t, nm, _q, why in noms)
+    try:
+        png = await asyncio.to_thread(cards.render_week_poster, period, [(t, nm, q) for t, nm, q, _w in noms])
+        await _send_card(bot, chat_id, png, caption, memory)
+    except Exception as e:
+        logger.warning("week poster failed: %s", e)
+        await bot.send_message(chat_id, caption)
+    parts = []
+    if data["news"]:
+        parts.append("📺 <b>НОВОСТИ ЧАТА ЗА НЕДЕЛЮ</b>\n" + "\n\n".join(
+            f"<b>{html.escape(x['headline'])}</b>" + (f"\n{html.escape(x['text'])}" if x["text"] else "")
+            for x in data["news"]))
+    if promises:
+        lines = []
+        for p in promises:
+            due = datetime.fromtimestamp(p["due"], MSK).strftime("%d.%m")
+            jab = data["jabs"].get(p["id"], "")
+            lines.append(f"• <b>{html.escape(p['name'])}</b> - «{html.escape(p['what'])}» (срок {due})"
+                         + (f": {html.escape(jab)}" if jab else ""))
+        parts.append("💀 <b>СЛИТЫЕ ОБЕЩАНИЯ</b>\n" + "\n".join(lines))
+    if data["horoscope"]:
+        parts.append("🔮 <b>ГОРОСКОП НА СЛЕДУЮЩУЮ НЕДЕЛЮ</b>\n" + "\n".join(
+            f"<b>{html.escape(x['name'])}</b> - {html.escape(x['text'])}" for x in data["horoscope"]))
+    if parts:
+        await asyncio.sleep(2)
+        text = "\n\n".join(parts)
+        sent = await bot.send_message(chat_id, text[:4000])
+        _last_bot_msg[chat_id] = time.time()
+        await db_add_own(chat_id, getattr(sent, "message_id", 0) or 0, "[итоги недели] " + html.unescape(
+            re.sub(r"<[^>]+>", "", text)))
     return True
 
 
@@ -1297,6 +1363,42 @@ async def _video_frame(bot: Bot, media) -> bytes | None:
         return None
 
 
+DEMOT_CHANCE = 0.1   # фото (кадр видео/кружка) в чате — 1 из 10: бот сам делает из него демотиватор (вместо коммента)
+DEMOT_GAP = 10 * 60  # сек: сам — не чаще раза в 10 минут в чате
+_last_demot: dict[int, float] = {}
+
+
+async def send_demotivator(bot: Bot, chat_id: int, reply_to: int, data: bytes, title: str, subtitle: str) -> None:
+    """Рисует демотиватор и шлёт ответом на исходное фото; в память бота — что он сказал."""
+    jpg = await asyncio.to_thread(cards.render_demotivator, data, title, subtitle)
+    sent = await bot.send_photo(chat_id, BufferedInputFile(jpg, filename="demotivator.jpg"),
+                                reply_parameters=ReplyParameters(message_id=reply_to, allow_sending_without_reply=True))
+    _last_bot_msg[chat_id] = time.time()
+    await db_add_own(chat_id, getattr(sent, "message_id", 0) or 0, f"[демотиватор: {title} - {subtitle}]")
+
+
+async def _maybe_auto_demot(message: Message, bot: Bot, img: bytes, mime: str, caption: str) -> bool:
+    """Иногда (1 из 10 фото, не чаще раза в 10 мин) бот сам отвечает демотиватором по теме фото. True — ответил."""
+    chat_id = message.chat.id
+    now = time.time()
+    if random.random() >= DEMOT_CHANCE or now - _last_demot.get(chat_id, 0) < DEMOT_GAP:
+        return False
+    if now - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
+        return False
+    _last_demot[chat_id] = now
+    try:
+        await bot.send_chat_action(chat_id, "upload_photo")
+        text = await ai.demotivator(img, mime, caption)
+        if not text["title"]:
+            return False
+        await send_demotivator(bot, chat_id, message.message_id, img, text["title"], text["subtitle"])
+        logger.info("сам демотиватор в %s: %s - %s", chat_id, text["title"], text["subtitle"])
+        return True
+    except Exception as e:
+        logger.warning("auto demotivator failed: %s", e)
+        return False
+
+
 async def _visual(message: Message, bot: Bot, db: Database, config, src_file, label: str, kind: str,
                   caption: str, count: int, data: bytes | None = None) -> None:
     """Общее для фото, кружков и видео: рассмотреть, запомнить, иногда прокомментировать."""
@@ -1324,6 +1426,8 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
     reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user
                         and message.reply_to_message.from_user.id == bot.id)
     addressed = reply_to_bot or bool(_BOT_NAME.search(caption) or _BOT_WORD.search(caption))
+    if not addressed and await _maybe_auto_demot(message, bot, img, mime, caption):
+        return
     if not addressed:
         if random.random() > PHOTO_CHANCE or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
             return
@@ -1355,13 +1459,17 @@ CLOWN_HOUR = 21  # МСК: в это время (и позже) бот выби�
 
 
 async def _clown_of_day(bot: Bot, db: Database, chat_id: int) -> bool:
+    """Клоун дня: карточка-картинка (имя, «клоун ×N», дословная цитата, прозвище на сутки), 🤡 на его самое
+    клоунское сообщение дня — и оно же в золотой фонд."""
+    if not _db_ref:
+        _db_ref.append(db)
     day_start = int(datetime.now(MSK).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     rows = await db.recent_messages(chat_id, limit=1500, since=day_start)
-    by_user: dict[int, tuple[str, list[str]]] = {}
-    for _mid, uid, name, text, _ts in rows:
+    by_user: dict[int, tuple[str, list[tuple[int, str, int]]]] = {}
+    for mid, uid, name, text, ts in rows:
         if uid <= 0:  # бот и посты канала
             continue
-        by_user.setdefault(uid, (name or "Аноним", []))[1].append(text)
+        by_user.setdefault(uid, (name or "Аноним", []))[1].append((mid, str(text), ts))
     active = {uid: v for uid, v in by_user.items() if len(v[1]) >= 3}
     if len(active) < 2:
         return False
@@ -1381,16 +1489,36 @@ async def _clown_of_day(bot: Bot, db: Database, chat_id: int) -> bool:
         while label in label_of.values():
             label += "'"
         label_of[uid] = label
-    samples = {label_of[uid]: msgs[-25:] for uid, (_n, msgs) in active.items()}
+    samples = {label_of[uid]: [(m, t) for m, t, _ts in msgs[-25:]] for uid, (_n, msgs) in active.items()}
     dossiers = {label_of[uid]: await db.get_dossier(chat_id, uid) for uid in active}
     result = await ai.clown_of_day(samples, dossiers)
     winner = next((uid for uid, label in label_of.items() if label == result["name"]), None)
     if winner is None or not result["reason"]:
         return False
-    await db.add_clown(chat_id, winner, active[winner][0])
+    name = active[winner][0]
+    await db.add_clown(chat_id, winner, name)
     total = next((c for uid, c in await db.clown_counts(chat_id) if uid == winner), 1)
-    await _say(bot, chat_id, f"🤡 КЛОУН ДНЯ — {label_of[winner]}\n\n{result['reason']}\n\n"
-                             f"Клоун уже {total}-й раз. Таблица позора: /clowns")
+    # «Состав преступления» — дословно из его сообщений (ИИ называет только id)
+    pick = next(((m, t, ts) for m, t, ts in active[winner][1] if m == result["msg_id"]), None)
+    quote = pick[1] if pick and not pick[1].startswith("[") else ""
+    label = label_of[winner]
+    caption = (f"🤡 <b>КЛОУН ДНЯ - {html.escape(label)}</b>\n\n{html.escape(result['reason'])}\n\n"
+               f"Клоун уже {total}-й раз. Таблица позора: /clowns")
+    try:
+        png = await asyncio.to_thread(cards.render_clown_day, label, quote[:300], total, result["nickname"],
+                                      datetime.now(MSK).strftime("%d.%m.%Y"))
+        await _send_card(bot, chat_id, png, caption, f"[клоун дня] {label}: {result['reason']}")
+    except Exception as e:
+        logger.warning("clown card failed: %s", e)
+        await _say(bot, chat_id, f"🤡 КЛОУН ДНЯ - {label}\n\n{result['reason']}\n\n"
+                                 f"Клоун уже {total}-й раз. Таблица позора: /clowns")
+    if pick and pick[0]:
+        await _react(bot, chat_id, pick[0], "🤡", force=True)  # клеймо на самом сообщении
+        if quote and 8 <= len(quote) <= 600:  # и оно — в золотой фонд
+            try:
+                await db.add_quote(chat_id, pick[0], winner, name, quote, pick[2], None)
+            except Exception as e:
+                logger.debug("clown quote save failed: %s", e)
     return True
 
 

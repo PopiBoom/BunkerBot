@@ -1,4 +1,4 @@
-"""Развлечения чата: опрос «Кто из нас…» (/poll) и «вопрос дня», когда в чате тихо.
+"""Развлечения чата: опрос «Кто из нас…» (/poll), «вопрос дня», когда в чате тихо, и демотиватор (/demot).
 
   * /poll — ИИ придумывает вопрос по досье и переписке («Кто из нас первым сольётся с зала?»),
     варианты — самые активные участники за неделю, опрос открытый (видно, кто за кого).
@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, ReplyParameters
 
 import ai
@@ -187,3 +187,70 @@ async def quiet_kick(bot: Bot, db: Database, chat_id: int) -> None:
     await _remember_question(db, chat_id, q)
     await R._say(bot, chat_id, f"🤔 {q}")
     logger.info("вопрос дня в %s: %s", chat_id, q)
+
+
+# ---------- демотиватор: /demot ответом на фото, видео, кружок, гифку или стикер ----------
+
+
+async def _media_bytes(bot: Bot, rt: Message) -> bytes | None:
+    """Картинка из сообщения: фото, кадр из середины видео/кружка, превью гифки, статичный стикер."""
+    if rt.photo:
+        sizes = sorted(rt.photo, key=lambda p: p.width)
+        photo = next((p for p in reversed(sizes) if p.width <= 1280), sizes[0])
+        return (await bot.download(photo)).read()
+    media = rt.video or rt.video_note
+    if media is not None:
+        frame = await R._video_frame(bot, media)
+        if frame:
+            return frame
+    if rt.sticker is not None and not (rt.sticker.is_animated or rt.sticker.is_video):
+        return (await bot.download(rt.sticker)).read()
+    thumb = getattr(rt.video or rt.video_note or rt.animation or rt.sticker, "thumbnail", None)
+    if thumb is not None:
+        return (await bot.download(thumb)).read()
+    return None
+
+
+@router.message(Command("demot", "demotivator"))
+async def cmd_demot(message: Message, command: CommandObject, bot: Bot, db: Database) -> None:
+    """Ответом на фото — демотиватор: чёрная рамка, КРУПНЫЙ заголовок и злая подпись от ИИ.
+    /demot ЗАГОЛОВОК | подпись — своими словами (без ИИ)."""
+    chat_id = message.chat.id
+    rt = message.reply_to_message
+    if rt is None or not (rt.photo or rt.video or rt.video_note or rt.animation or rt.sticker):
+        await temp_reply(message, "Ответь /demot на фото (или видео, кружок, гифку, стикер).")
+        return
+    if R._bunker_active(chat_id):
+        await temp_reply(message, "Идёт игра - демотиваторы после партии.")
+        return
+    try:
+        data = await _media_bytes(bot, rt)
+    except Exception as e:
+        logger.warning("demot download failed: %s", e)
+        data = None
+    if not data:
+        await temp_reply(message, "Не смог достать картинку из этого сообщения.")
+        return
+    own = (command.args or "").strip()
+    if own:  # своими словами: «заголовок | подпись»
+        title, _, sub = own.partition("|")
+        text = {"title": title.strip(), "subtitle": sub.strip()}
+    elif ai.available():
+        try:
+            await bot.send_chat_action(chat_id, "upload_photo")
+            text = await ai.demotivator(data, ai.image_mime(data) or "image/jpeg", rt.caption or "")
+        except Exception as e:
+            logger.warning("demot text failed: %s", e)
+            text = {"title": "", "subtitle": ""}
+    else:
+        text = {"title": "", "subtitle": ""}
+    if not text["title"]:
+        await temp_reply(message, "Не придумалось. Попробуй ещё раз или напиши сам: /demot ЗАГОЛОВОК | подпись")
+        return
+    if not R._db_ref:
+        R._db_ref.append(db)
+    try:
+        await R.send_demotivator(bot, chat_id, rt.message_id, data, text["title"], text["subtitle"])
+    except Exception as e:
+        logger.warning("demot failed: %s", e)
+        await temp_reply(message, "Картинка не открылась - пришли обычное фото.")
