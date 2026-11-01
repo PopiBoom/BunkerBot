@@ -678,13 +678,17 @@ def _version() -> str:
         return "?"
 
 
-SHIP_FALLBACK = [
-    "Да потрахайтесь вы уже, а то весь чат за вас переживает.",
-    "Снимите комнату, тут вообще-то люди.",
-    "Напряжение между вами видно из космоса. Ебитесь уже.",
-    "Опять флиртуете при детях. Идите в личку и не позорьтесь.",
-    "Ссоритесь как женатые, а ещё даже не ебались. Исправляйте.",
-    "Весь чат уже ставки делает, когда вы наконец потрахаетесь.",
+SHIP_FALLBACK = [  # {a} — кому отвечаем, {b} — его «половинка»
+    "Да потрахайтесь вы уже, {a} и {b}, а то весь чат за вас переживает.",
+    "{a}, {b}, снимите комнату, тут вообще-то люди.",
+    "Напряжение между вами видно из космоса. Ебитесь уже, {a} и {b}.",
+    "Опять флиртуете при детях. {a}, забирай {b} в личку и не позорьтесь.",
+    "Ссоритесь как женатые, а ещё даже не ебались. Исправляйте, {a} и {b}.",
+    "Весь чат уже ставки делает, когда {a} и {b} наконец потрахаются.",
+    "{a}, хватит строить из себя недотрогу, {b} же видно, что хочет. Ебитесь уже.",
+    "{a} и {b}, когда свадьба? Чат уже скинулся на презервативы.",
+    "Вы двое переписываетесь как перед первым перепихоном. Давайте уже, {a} и {b}.",
+    "{a}, ты каждое сообщение {b} ждёшь, как нюдсы. Потрахайтесь и успокойтесь.",
 ]
 
 
@@ -699,18 +703,29 @@ async def _ship_partner(db: Database, chat_id: int, uid: int | None) -> tuple[st
 
 async def _ship_line(db: Database, chat_id: int, me: str, partner: str, text: str,
                      replied: str | None = None) -> str:
-    """Реплика кому-то из пары — всегда жёсткий шиппинг; ИИ упал или редактор зарубил — запасная фраза."""
+    """Реплика кому-то из пары — всегда жёсткий шиппинг; ИИ упал или редактор зарубил — запасная фраза.
+
+    Редактор раньше переписывал шиппинг в обычный подкол «за слова» — теперь он видит ship_note,
+    а здесь ещё и проверяем: итог не похож на шиппинг — берём черновик, и он не похож — запасную фразу.
+    """
     out = ""
+    # и автор, и редактор знают: шутка про парочку — так надо; после — снимаем, чтобы не утекло
+    token = ai.ship_note.set(ai.ship_text(me, partner))
     try:
         await _remember_lines(db, chat_id)
         ctx = _as_dicts(await db.recent_messages(chat_id, limit=15))
-        ai.ship_note.set(ai.ship_text(me, partner))  # и автор, и редактор знают: шутка про парочку — так надо
         draft = await ai.ship_comment(me, text, partner, replied, ctx)
         if draft:
-            out = await ai.polish(draft, text, ctx, author=me) or draft
+            out = await ai.polish(draft, text, ctx, author=me)
+            if not ai.shippy(out, partner):
+                logger.info("ship: editor lost the shipping (%r), draft: %r", out, draft)
+                safe = ai.scrub(draft)
+                out = safe if ai.shippy(safe, partner) and not ai.about_looks(safe) else ""
     except Exception as e:
         logger.warning("ship line failed: %s", e)
-    return out or random.choice(SHIP_FALLBACK)
+    finally:
+        ai.ship_note.reset(token)
+    return out or random.choice(SHIP_FALLBACK).format(a=me, b=partner)
 
 
 async def _maybe_ship(message: Message, bot: Bot, db: Database) -> bool:
@@ -1047,6 +1062,8 @@ async def _maybe_laugh(message: Message, bot: Bot, db: Database, config) -> bool
         return False
     chat_id = message.chat.id
     await db.score_bot_line(chat_id, rt.message_id, 1)  # шутка зашла — пусть бот запомнит
+    if message.from_user and await _ship_partner(db, chat_id, message.from_user.id):
+        return False  # смеётся кто-то из пары /ship — ответ ему тоже шиппинг (дальше, как обращение к боту)
     is_father = bool(message.from_user and message.from_user.id == _father_id(config))
     if random.random() < 0.45:
         await _react(bot, chat_id, message.message_id, random.choice(["😎", "🔥", "🤝"]), force=True)
@@ -1527,7 +1544,10 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
         # пересказ фото («X, Y и Z — …») редактор ловит и переписывает сам (retells/drop_retell внутри polish)
     except Exception as e:
         logger.warning("%s roast failed: %s", label, e)
-        return
+        answer = ""
+    shipped = await _ship_partner(db, chat_id, user.id)
+    if shipped and not ai.shippy(answer, shipped[1]):  # пара /ship: и на фото — шиппинг, а не обычный подкол
+        answer = await _ship_line(db, chat_id, shipped[0], shipped[1], f"{what} {caption}".strip())
     if answer:
         await _say_human(bot, chat_id, ai.vary_father(answer) if is_father else answer, reply_to=message.message_id)
 
@@ -1737,15 +1757,15 @@ async def background(bot: Bot, db: Database) -> None:
             if await _enabled(db) and ai.available():
                 if time.time() - last_heavy >= HEAVY_EVERY:
                     last_heavy = time.time()
-                    await _heavy(bot, db)
+                    await asyncio.create_task(_heavy(bot, db))  # контекст (ship_note и т.п.) не утекает
                 try:
                     await _remind_promises(bot, db)
                 except Exception as e:
                     logger.warning("promise reminders failed: %s", e)
                 if interval > 0:
                     for chat_id in await db.active_chats(int(time.time()) - 86400):
-                        try:
-                            await _auto_roast(bot, db, chat_id, interval)
+                        try:  # в своей задаче: ship_note/father_rude одного подкола не утекают в следующий
+                            await asyncio.create_task(_auto_roast(bot, db, chat_id, interval))
                         except Exception as e:
                             logger.warning("auto roast failed in %s: %s", chat_id, e)
                 # Посты бота в канал (пока тестовый режим из /admin)
