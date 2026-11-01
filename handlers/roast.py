@@ -640,7 +640,7 @@ async def _ship_pair(db: Database, chat_id: int) -> list[tuple[int, str]]:
 
 
 async def _set_ship(db: Database, chat_id: int, *user_ids: int | None) -> None:
-    """Перед ответом: если ответ касается кого-то из пары — иногда (SHIP_CHANCE) просим ИИ их пошипперить."""
+    """Перед ответом (фото и т.п.): если ответ касается кого-то из пары — просим ИИ их пошипперить (SHIP_CHANCE)."""
     note = ""
     pair = await _ship_pair(db, chat_id)
     if len(pair) == 2 and any(u in {pid for pid, _ in pair} for u in user_ids if u):
@@ -676,13 +676,41 @@ def _version() -> str:
         return head[:7]
     except OSError:
         return "?"
+
+
 SHIP_FALLBACK = [
     "Да потрахайтесь вы уже, а то весь чат за вас переживает.",
     "Снимите комнату, тут вообще-то люди.",
-    "Напряжение между вами видно из космоса. Решайте уже.",
+    "Напряжение между вами видно из космоса. Ебитесь уже.",
     "Опять флиртуете при детях. Идите в личку и не позорьтесь.",
     "Ссоритесь как женатые, а ещё даже не ебались. Исправляйте.",
+    "Весь чат уже ставки делает, когда вы наконец потрахаетесь.",
 ]
+
+
+async def _ship_partner(db: Database, chat_id: int, uid: int | None) -> tuple[str, str] | None:
+    """(имя этого человека, имя его «половинки»), если он в паре /ship; иначе None."""
+    pair = await _ship_pair(db, chat_id)
+    names = dict(pair)
+    if len(pair) != 2 or uid not in names:
+        return None
+    return names[uid], next(n for u, n in pair if u != uid)
+
+
+async def _ship_line(db: Database, chat_id: int, me: str, partner: str, text: str,
+                     replied: str | None = None) -> str:
+    """Реплика кому-то из пары — всегда жёсткий шиппинг; ИИ упал или редактор зарубил — запасная фраза."""
+    out = ""
+    try:
+        await _remember_lines(db, chat_id)
+        ctx = _as_dicts(await db.recent_messages(chat_id, limit=15))
+        ai.ship_note.set(ai.ship_text(me, partner))  # и автор, и редактор знают: шутка про парочку — так надо
+        draft = await ai.ship_comment(me, text, partner, replied, ctx)
+        if draft:
+            out = await ai.polish(draft, text, ctx, author=me) or draft
+    except Exception as e:
+        logger.warning("ship line failed: %s", e)
+    return out or random.choice(SHIP_FALLBACK)
 
 
 async def _maybe_ship(message: Message, bot: Bot, db: Database) -> bool:
@@ -731,18 +759,7 @@ async def _maybe_ship(message: Message, bot: Bot, db: Database) -> bool:
 
     async def run() -> None:
         await asyncio.sleep(random.uniform(2.0, 4.0))
-        text = ""
-        try:
-            await _remember_lines(db, chat_id)
-            ctx = _as_dicts(await db.recent_messages(chat_id, limit=15))
-            ai.ship_note.set(ai.ship_text(a_name, b_name))  # и автор, и редактор знают: шутка про парочку — так надо
-            draft = await ai.ship_comment(a_name, message.text or "", b_name, b_text, ctx)
-            if draft:  # редактор может зарубить «не по теме» — тогда шлём черновик как есть
-                text = await ai.polish(draft, message.text or "", ctx, author=a_name) or draft
-        except Exception as e:
-            logger.warning("ship comment failed: %s", e)
-        if not text:  # ИИ упал или промолчал — «каждый раз» всё равно: запасная фраза
-            text = random.choice(SHIP_FALLBACK)
+        text = await _ship_line(db, chat_id, a_name, b_name, message.text or "", b_text)
         logger.info("ship: %s -> %s in %s", a_name, b_name, chat_id)
         try:
             await _say_human(bot, chat_id, text, reply_to=message.message_id)
@@ -803,7 +820,7 @@ async def cmd_ship(message: Message, command: CommandObject, db: Database) -> No
     await db.set_setting(_ship_key(chat_id), json.dumps([[a_id, a_name], [b_id, b_name]], ensure_ascii=False))
     _ship_state.pop(chat_id, None)  # новая пара — счёт и пауза заново
     await message.answer(f"💞 Окей: {html.escape(a_name)} + {html.escape(b_name)} теперь парочка чата. "
-                         "Буду иногда подкалывать. /ship off - выключить.")
+                         "Теперь шипперю жёстко, всегда. /ship off - выключить.")
 
 
 @router.message(Command("roast"))
@@ -963,7 +980,8 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
         return
 
     # Рифма-отговорка: «и чё?» — «хуй через плечо», «ну» — «баранки гну» (тех, кто сделал /forget_me, не трогаем)
-    if not optout and await _maybe_rhyme(message, bot, config):
+    in_pair = user.id in {u for u, _ in await _ship_pair(db, chat_id)}
+    if not optout and not in_pair and await _maybe_rhyme(message, bot, config):
         return
 
     # Обращаются ли к боту?
@@ -1128,6 +1146,12 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     if is_father:  # бате иногда (≈1 из 3) можно нагрубить по-сыновьи, остальное — подъёб по-доброму
         ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)
     await _set_ship(db, chat_id, who.id if who else None)
+    shipped = await _ship_partner(db, chat_id, who.id if who else None)
+    if shipped:  # пара /ship: любой ответ бота кому-то из них — жёсткий шиппинг (правило бати)
+        answer = await _ship_line(db, chat_id, shipped[0], shipped[1], text)
+        _ship_debug[chat_id] = f"{_msk_time()} {shipped[0]} (обратился к боту): шиппинг отправлен"
+        await _say_human(bot, chat_id, answer, reply_to=last_msg.message_id)
+        return
 
     # Как человек: в затянувшейся перепалке отвечает всё реже, на пустое «да/и че» — реакцией
     if who and not is_father:
@@ -1618,6 +1642,18 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int, interval: int) -> No
                and _replyable(r[3])}
     if not new_ids:
         return
+    pair_ids = {u for u, _ in await _ship_pair(db, chat_id)}
+    from_pair = [r for r in rows if r[0] in new_ids and r[1] in pair_ids]
+    if len(pair_ids) == 2 and from_pair:  # кто-то из пары /ship писал — подкол ему, и это жёсткий шиппинг
+        target = from_pair[-1]
+        shipped = await _ship_partner(db, chat_id, target[1])
+        if shipped:
+            text = await _ship_line(db, chat_id, shipped[0], shipped[1], target[3])
+            if chat_id in _pending or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
+                return
+            _ship_debug[chat_id] = f"{_msk_time()} {shipped[0]} (фоновый подкол): шиппинг отправлен"
+            await _say_human(bot, chat_id, text, reply_to=target[0])
+            return
     await _remember_lines(db, chat_id)
     names = {r[2] for r in rows}
     dossiers = {n: d for n, d in (await db.chat_dossiers(chat_id)).items() if n in names}
