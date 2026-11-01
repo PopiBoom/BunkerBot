@@ -186,6 +186,12 @@ class Database:
                 )
                 """
             )
+            # Миграция: у «забытых» помним имя и @ник — чтобы админ мог вернуть их через /remember_me @ник
+            cur = await db.execute("PRAGMA table_info(roast_optout)")
+            ocols = {r[1] for r in await cur.fetchall()}
+            for col in ("name", "username"):
+                if col not in ocols:
+                    await db.execute(f"ALTER TABLE roast_optout ADD COLUMN {col} TEXT")
             # Миграция: статистика Бункера для званий (серии, голоса против, угроза)
             cur = await db.execute("PRAGMA table_info(bunker_stats)")
             bcols = {r[1] for r in await cur.fetchall()}
@@ -637,15 +643,33 @@ class Database:
             )
             return await cur.fetchone() is not None
 
-    async def forget_user(self, chat_id: int, user_id: int) -> None:
-        """Удаляет всё о человеке в этом чате и больше его не запоминает."""
+    async def forget_user(self, chat_id: int, user_id: int, name: str | None = None,
+                          username: str | None = None) -> None:
+        """Удаляет всё о человеке в этом чате и больше его не запоминает (имя и @ник — только чтобы вернуть)."""
         async with aiosqlite.connect(self.path) as db:
+            if username is None:  # возьмём из памяти чата, пока она не стёрта
+                cur = await db.execute(
+                    "SELECT username, name FROM chat_messages WHERE chat_id = ? AND user_id = ? "
+                    "ORDER BY (username IS NULL), ts DESC LIMIT 1", (chat_id, user_id))
+                row = await cur.fetchone()
+                if row:
+                    username, name = row[0], name or row[1]
             await db.execute("DELETE FROM chat_messages WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
             await db.execute("DELETE FROM dossiers WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
             await db.execute("DELETE FROM quotes WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
-            await db.execute("INSERT OR IGNORE INTO roast_optout (chat_id, user_id) VALUES (?, ?)",
-                             (chat_id, user_id))
+            await db.execute(
+                "INSERT INTO roast_optout (chat_id, user_id, name, username) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(chat_id, user_id) DO UPDATE SET name = excluded.name, username = excluded.username",
+                (chat_id, user_id, name, username))
             await db.commit()
+
+    async def find_optout(self, chat_id: int, username: str) -> tuple | None:
+        """(user_id, name) «забытого» по @нику — для /remember_me @ник."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT user_id, name FROM roast_optout WHERE chat_id = ? AND lower(username) = lower(?)",
+                (chat_id, username.lstrip("@")))
+            return await cur.fetchone()
 
     async def unforget_user(self, chat_id: int, user_id: int) -> None:
         async with aiosqlite.connect(self.path) as db:

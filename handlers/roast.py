@@ -572,20 +572,53 @@ async def on_bot_line_reaction(event: MessageReactionUpdated, db: Database) -> N
 # ---------- команды ----------
 
 
+async def _target(message: Message, command: CommandObject, db: Database) -> tuple[int, str] | None:
+    """Кого касается /forget_me и /remember_me: ответом — автор того сообщения, «@ник» — он, иначе — сам.
+    (Команды только у админа — так он может «забыть» любого, кто попросит.)"""
+    rt = message.reply_to_message
+    if rt and rt.from_user and not rt.from_user.is_bot:
+        return rt.from_user.id, rt.from_user.first_name or rt.from_user.username or "Аноним"
+    arg = (command.args or "").strip()
+    if arg.startswith("@"):
+        nick = arg.split()[0]
+        found = await db.find_user(message.chat.id, nick) or await db.find_optout(message.chat.id, nick)
+        return (found[0], found[1] or arg) if found else None
+    if message.from_user:
+        return message.from_user.id, _name(message)
+    return None
+
+
 @router.message(Command("forget_me"))
-async def cmd_forget_me(message: Message, db: Database) -> None:
-    if not message.from_user:
+async def cmd_forget_me(message: Message, command: CommandObject, db: Database) -> None:
+    target = await _target(message, command, db)
+    if target is None:
+        await message.reply("Не знаю такого. Ответь командой на его сообщение или напиши /forget_me @ник.")
         return
-    await db.forget_user(message.chat.id, message.from_user.id)
-    await message.reply("🧹 Всё о тебе удалено. Больше не запоминаю и не трогаю. Вернуться: /remember_me")
+    uid, name = target
+    rt = message.reply_to_message
+    username = rt.from_user.username if rt and rt.from_user and rt.from_user.id == uid else None
+    if username is None and message.from_user and message.from_user.id == uid:
+        username = message.from_user.username
+    await db.forget_user(message.chat.id, uid, name, username)
+    if message.from_user and uid == message.from_user.id:
+        await message.reply("🧹 Всё о тебе удалено. Больше не запоминаю и не трогаю. Вернуться: /remember_me")
+    else:
+        await message.reply(f"🧹 {html.escape(name)}: всё удалено, больше не запоминаю и не трогаю. "
+                            "Вернуть — /remember_me ответом на его сообщение или с @ником.")
 
 
 @router.message(Command("remember_me"))
-async def cmd_remember_me(message: Message, db: Database) -> None:
-    if not message.from_user:
+async def cmd_remember_me(message: Message, command: CommandObject, db: Database) -> None:
+    target = await _target(message, command, db)
+    if target is None:
+        await message.reply("Не знаю такого. Ответь командой на его сообщение или напиши /remember_me @ник.")
         return
-    await db.unforget_user(message.chat.id, message.from_user.id)
-    await message.reply("😈 С возвращением. Снова слежу за каждым твоим словом.")
+    uid, name = target
+    await db.unforget_user(message.chat.id, uid)
+    if message.from_user and uid == message.from_user.id:
+        await message.reply("😈 С возвращением. Снова слежу за каждым твоим словом.")
+    else:
+        await message.reply(f"😈 {html.escape(name)} снова под наблюдением.")
 
 
 @router.message(Command("roast"))

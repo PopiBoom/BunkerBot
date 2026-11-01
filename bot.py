@@ -45,7 +45,10 @@ async def set_commands(bot: Bot, config, db: Database) -> None:
     admin_group = cmds(GROUP_SECTIONS)
     try:
         await bot.set_my_commands(cmds(PUBLIC_PRIVATE_SECTIONS), scope=BotCommandScopeAllPrivateChats())
-        await bot.set_my_commands(cmds(PUBLIC_GROUP_SECTIONS), scope=BotCommandScopeAllGroupChats())
+        if PUBLIC_GROUP_SECTIONS:
+            await bot.set_my_commands(cmds(PUBLIC_GROUP_SECTIONS), scope=BotCommandScopeAllGroupChats())
+        else:  # участникам в группах команд нет — меню «/» у них пустое
+            await bot.delete_my_commands(scope=BotCommandScopeAllGroupChats())
         for admin_id in config.admin_ids:
             await bot.set_my_commands(admin_private, scope=BotCommandScopeChat(chat_id=admin_id))
     except Exception as e:  # меню — не критично, бот работает и без него
