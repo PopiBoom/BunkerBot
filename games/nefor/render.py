@@ -32,10 +32,13 @@ SPECIAL = {"start": ("СТАРТ", ACID), "rumor": ("СЛУХ", (90, 200, 255)),
            "pps": ("ППС", (110, 140, 255)), "jail": ("СИЗО", (255, 150, 40))}
 _EMOJI = re.compile("[\U0001F000-\U0001FFFF☀-➿️‍⬀-⯿]+")
 
-SIDE = 8                      # клеток на сторону (28 по периметру)
-CELL = 160
-M = 24                        # поля вокруг поля
-BOARD_W = SIDE * CELL + 2 * M
+COLS, ROWS = 11, 5             # поле — вытянутое кольцо: 11 × 5 клеток, 28 по периметру
+CELL = 140
+PAD_X = 40                    # поля слева и справа
+HEAD = 196                    # шапка: название, круг, силуэт города
+FOOT = 92                     # подвал: памятка по особым клеткам
+IMG_W = COLS * CELL + 2 * PAD_X
+IMG_H = HEAD + ROWS * CELL + FOOT + 28
 
 
 def _plain(text) -> str:
@@ -128,16 +131,85 @@ def _roof(d: ImageDraw.ImageDraw, x: int, y: int, color) -> None:
 
 def cell_xy(i: int) -> tuple[int, int]:
     """Левый верхний угол клетки i: по часовой стрелке от левого верхнего угла поля."""
-    s = SIDE - 1
-    if i < s:
+    w, h = COLS - 1, ROWS - 1
+    if i <= w:
         gx, gy = i, 0
-    elif i < 2 * s:
-        gx, gy = s, i - s
-    elif i < 3 * s:
-        gx, gy = s - (i - 2 * s), s
+    elif i <= w + h:
+        gx, gy = w, i - w
+    elif i <= 2 * w + h:
+        gx, gy = w - (i - w - h), h
     else:
-        gx, gy = 0, s - (i - 3 * s)
-    return M + gx * CELL, M + gy * CELL
+        gx, gy = 0, h - (i - 2 * w - h)
+    return PAD_X + gx * CELL, HEAD + gy * CELL
+
+
+def _skyline(img: Image.Image, base: int, seed: int) -> None:
+    """Силуэт города по низу шапки: дома с окнами, мост с вантами, Волга."""
+    import random as _r
+
+    rnd = _r.Random(seed)
+    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    x = 0
+    while x < IMG_W:
+        bw, bh = rnd.randint(40, 110), rnd.randint(30, 96)
+        if 0.6 * IMG_W < x < 0.84 * IMG_W:  # место для моста
+            x += bw
+            continue
+        d.rectangle([x, base - bh, x + bw - 6, base], fill=(22, 14, 36, 235))
+        for wy in range(base - bh + 10, base - 8, 16):
+            for wx in range(x + 8, x + bw - 14, 14):
+                if rnd.random() < 0.28:
+                    d.rectangle([wx, wy, wx + 5, wy + 7], fill=(*rnd.choice([ACID, PINK, GOLD]), 190))
+        x += bw
+    bx0, bx1 = int(0.6 * IMG_W), int(0.84 * IMG_W)
+    d.rectangle([bx0, base - 26, bx1, base - 20], fill=(30, 20, 48, 255))  # полотно моста
+    for px in (bx0 + (bx1 - bx0) // 3, bx0 + 2 * (bx1 - bx0) // 3):
+        d.rectangle([px - 4, base - 92, px + 4, base - 20], fill=(30, 20, 48, 255))
+        for k in range(1, 6):  # ванты
+            d.line([(px, base - 90), (px - k * 22, base - 24)], fill=(*PINK, 120), width=2)
+            d.line([(px, base - 90), (px + k * 22, base - 24)], fill=(*PINK, 120), width=2)
+    for k in range(3):  # Волга
+        d.line([(bx0 - 30, base - 8 + k * 3), (bx1 + 30, base - 8 + k * 3)], fill=(70, 120, 220, 120 - k * 30),
+               width=2)
+    img.alpha_composite(layer)
+
+
+def _cell(img: Image.Image, i: int, owner: dict | None, roofs: int, rent: int | None) -> None:
+    x, y = cell_xy(i)
+    box = [x + 4, y + 4, x + CELL - 5, y + CELL - 5]
+    kind = C.BOARD[i][0]
+    _shadow_box(img, box, 18, blur=6, alpha=120)
+    d = ImageDraw.Draw(img)
+    if kind != "spot":
+        label, col = SPECIAL[kind]
+        d.rounded_rectangle(box, radius=18, fill=PANEL, outline=col, width=3)
+        _tint(img, box, 18, col, 40)
+        _paste_icon(img, C.cell_icon(i), x + CELL // 2, y + 58, 66)
+        ImageDraw.Draw(img).text((x + CELL // 2, y + 110), label, font=_bold(22 if len(label) <= 5 else 17),
+                                 fill=col, anchor="mm")
+        return
+    d.rounded_rectangle(box, radius=18, fill=PANEL, outline=LINE, width=2)
+    d.rounded_rectangle([box[0] + 2, box[1] + 2, box[2] - 2, box[1] + 34], radius=16, fill=PANEL_HI)
+    if owner:
+        _tint(img, box, 18, owner["color"], 70)
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle(box, radius=18, outline=tuple(owner["color"]), width=5)
+    _paste_icon(img, C.cell_icon(i), x + 34, y + 34, 42)
+    d = ImageDraw.Draw(img)
+    name = C.cell_name(i)
+    size = 18  # длинное слово («Красноармейский») не рвём — уменьшаем шрифт
+    while size > 9 and max(d.textlength(w_, font=_bold(size)) for w_ in name.split()) > CELL - 24:
+        size -= 1
+    for k, line in enumerate(_wrap(d, name, _bold(size), CELL - 24, 2)):
+        d.text((x + 13, y + 62 + k * (size + 3)), line, font=_bold(size), fill=TEXT)
+    label = f"{rent}₽" if owner and rent is not None else f"{C.price(i)}₽"  # у занятой — вход, цвет владельца
+    col = tuple(owner["color"]) if owner else ACID
+    tw = d.textlength(label, font=_mono(15))
+    d.rounded_rectangle([x + 12, y + CELL - 36, x + 22 + tw, y + CELL - 14], radius=11, fill=(14, 12, 22))
+    d.text((x + 17, y + CELL - 25), label, font=_mono(15), fill=col, anchor="lm")
+    for r in range(roofs):
+        _roof(d, x + CELL - 38 - r * 29, y + CELL - 40, col)
 
 
 def render_board(players: list[dict], owners: dict[int, int], roofs: dict[int, int], round_no: int,
@@ -146,45 +218,26 @@ def render_board(players: list[dict], owners: dict[int, int], roofs: dict[int, i
     roofs — клетка -> 0..2; rents — клетка -> текущий «вход» (для занятых)."""
     rents = rents or {}
     by_id = {p["id"]: p for p in players}
-    img = _background(BOARD_W, BOARD_W, 77 + round_no)
+    img = _background(IMG_W, IMG_H, 77 + round_no)
+    d = ImageDraw.Draw(img)
+    for x in range(0, IMG_W, 44):  # кислотная «изолента» сверху и снизу
+        col = ACID if (x // 44) % 2 == 0 else (16, 16, 20)
+        d.rectangle([x, 0, x + 44, 12], fill=col)
+        d.rectangle([x, IMG_H - 12, x + 44, IMG_H], fill=col)
+    # шапка
+    _skyline(img, HEAD - 14, 5)
+    _glow_text(img, (PAD_X, 30), "НЕФОРЫ", _bold(88), TEXT, PINK, radius=16)
+    w1 = ImageDraw.Draw(img).textlength("НЕФОРЫ", font=_bold(88))
+    _glow_text(img, (PAD_X + w1 + 24, 72), "В ВОЛГОГРАДЕ", _bold(44), ACID, ACID, radius=10)
+    d = ImageDraw.Draw(img)
+    chip = f"КРУГ {min(round_no, rounds)} / {rounds}"
+    cw = d.textlength(chip, font=_mono(30))
+    d.rounded_rectangle([IMG_W - PAD_X - cw - 48, 40, IMG_W - PAD_X, 96], radius=28, fill=(14, 12, 22),
+                        outline=ACID, width=3)
+    d.text((IMG_W - PAD_X - cw / 2 - 24, 68), chip, font=_mono(30), fill=ACID, anchor="mm")
+    # клетки и фишки
     for i in range(C.SIZE):
-        x, y = cell_xy(i)
-        box = [x + 5, y + 5, x + CELL - 6, y + CELL - 6]
-        kind = C.BOARD[i][0]
-        _shadow_box(img, box, 20, blur=6, alpha=120)
-        d = ImageDraw.Draw(img)
-        if kind == "spot":
-            owner = by_id.get(owners.get(i))
-            d.rounded_rectangle(box, radius=20, fill=PANEL, outline=LINE, width=2)
-            d.rounded_rectangle([box[0] + 2, box[1] + 2, box[2] - 2, box[1] + 40], radius=18, fill=PANEL_HI)
-            if owner:
-                _tint(img, box, 20, owner["color"], 70)
-                d = ImageDraw.Draw(img)
-                d.rounded_rectangle(box, radius=20, outline=tuple(owner["color"]), width=6)
-            _paste_icon(img, C.cell_icon(i), x + 40, y + 40, 50)
-            d = ImageDraw.Draw(img)
-            name = C.cell_name(i)
-            size = 20  # длинное слово («Красноармейский») не рвём — уменьшаем шрифт
-            while size > 10 and max(d.textlength(w_, font=_bold(size)) for w_ in name.split()) > CELL - 28:
-                size -= 1
-            for k, line in enumerate(_wrap(d, name, _bold(size), CELL - 28, 2)):
-                d.text((x + 16, y + 72 + k * (size + 4)), line, font=_bold(size), fill=TEXT)
-            label = f"{rents[i]}₽" if owner and i in rents else f"{C.price(i)}₽"  # у занятой — вход, цвет владельца
-            col = tuple(owner["color"]) if owner else ACID
-            tw = d.textlength(label, font=_mono(17))
-            d.rounded_rectangle([x + 14, y + CELL - 42, x + 26 + tw, y + CELL - 16], radius=12, fill=(14, 12, 22))
-            d.text((x + 20, y + CELL - 29), label, font=_mono(17), fill=col, anchor="lm")
-            for r in range(roofs.get(i, 0)):
-                _roof(d, x + CELL - 42 - r * 30, y + CELL - 43, col)
-        else:
-            label, col = SPECIAL[kind]
-            d.rounded_rectangle(box, radius=20, fill=PANEL, outline=col, width=3)
-            _tint(img, box, 20, col, 38)
-            _paste_icon(img, C.cell_icon(i), x + CELL // 2, y + 64, 74)
-            d = ImageDraw.Draw(img)
-            font = _bold(24 if len(label) <= 5 else 19)
-            d.text((x + CELL // 2, y + 124), label, font=font, fill=col, anchor="mm")
-    # фишки
+        _cell(img, i, by_id.get(owners.get(i)), roofs.get(i, 0), rents.get(i))
     here: dict[int, list[dict]] = {}
     for p in players:
         if not p.get("out"):
@@ -192,61 +245,61 @@ def render_board(players: list[dict], owners: dict[int, int], roofs: dict[int, i
     for cell, ps in here.items():
         x, y = cell_xy(cell)
         for k, p in enumerate(ps[:6]):  # фишки — в правом верхнем углу клетки, поверх значков
-            cx = x + CELL - 34 - (k % 3) * 38
-            cy = y + 34 + (k // 3) * 40
-            _token(img, cx, cy, 20, tuple(p["color"]), p.get("icon", ""), _plain(p["name"]))
-
-    # центр
-    x0, y0 = M + CELL + 40, M + CELL + 34
-    inner = BOARD_W - 2 * (M + CELL) - 80
-    _glow_text(img, (x0, y0), "НЕФОРЫ", _bold(104), TEXT, PINK, radius=18)
-    _glow_text(img, (x0 + 6, y0 + 118), "В ВОЛГОГРАДЕ", _bold(46), ACID, ACID, radius=12)
-    d = ImageDraw.Draw(img)
-    chip = f"КРУГ {min(round_no, rounds)} / {rounds}"
-    cw = d.textlength(chip, font=_mono(26))
-    d.rounded_rectangle([x0 + inner - cw - 40, y0 + 14, x0 + inner, y0 + 64], radius=25, outline=ACID, width=3)
-    d.text((x0 + inner - cw / 2 - 20, y0 + 39), chip, font=_mono(26), fill=ACID, anchor="mm")
-    y = y0 + 200
+            _token(img, x + CELL - 28 - (k % 2) * 34, y + 28 + (k // 2) * 34, 17, tuple(p["color"]),
+                   p.get("icon", ""), _plain(p["name"]))
+    # центр: игроки карточками в две колонки
+    cx0, cy0 = PAD_X + CELL + 26, HEAD + CELL + 18
+    cw_all, ch_all = (COLS - 2) * CELL - 52, (ROWS - 2) * CELL - 36
     order = sorted(players, key=lambda p: (p.get("out", False), -p["capital"]))
-    row_h = min(96, (BOARD_W - M - CELL - 30 - y) // max(1, len(order)))
-    for p in order:
-        box = [x0, y, x0 + inner, y + row_h - 12]
-        _shadow_box(img, box, 18, blur=8, alpha=110)
+    cols = 1 if len(order) <= 3 else 2
+    per_col = -(-len(order) // cols)
+    gap = 18
+    card_w = (cw_all - gap * (cols - 1)) // cols
+    card_h = min(118, (ch_all - gap * (per_col - 1)) // max(1, per_col))
+    for n, p in enumerate(order):
+        col_i, row_i = n // per_col, n % per_col
+        x = cx0 + col_i * (card_w + gap)
+        y = cy0 + row_i * (card_h + gap) + (ch_all - per_col * card_h - (per_col - 1) * gap) // 2
+        box = [x, y, x + card_w, y + card_h]
+        _shadow_box(img, box, 18, blur=8, alpha=120)
         d = ImageDraw.Draw(img)
         dim = p.get("out")
         d.rounded_rectangle(box, radius=18, fill=PANEL, outline=LINE, width=2)
-        d.rounded_rectangle([x0, y, x0 + 10, y + row_h - 12], radius=5, fill=tuple(p["color"]))
-        mid = y + (row_h - 12) // 2
-        _token(img, x0 + 50, mid, 24, tuple(p["color"]) if not dim else (80, 80, 90), p.get("icon", ""),
-               _plain(p["name"]))
+        d.rounded_rectangle([x, y, x + 10, y + card_h], radius=5, fill=tuple(p["color"]))
+        d.text((x + 30, y + card_h // 2), str(n + 1), font=_bold(30), fill=GOLD if n == 0 else MUTED, anchor="mm")
+        mid = y + card_h // 2
+        _token(img, x + 84, mid, min(32, card_h // 2 - 10), tuple(p["color"]) if not dim else (80, 80, 90),
+               p.get("icon", ""), _plain(p["name"]))
         d = ImageDraw.Draw(img)
         right = "БАНКРОТ" if dim else f"{p['capital']}₽"
-        d.text((x0 + inner - 22, mid - 12), right, font=_bold(32), fill=RED if dim else TEXT, anchor="rm")
-        rw = d.textlength(right, font=_bold(32))
-        nw = inner - 120 - rw - 40
-        d.text((x0 + 88, mid - 14), _wrap(d, _plain(p["name"]), _bold(28), nw, 1)[0], font=_bold(28),
+        d.text((x + card_w - 22, mid - 12), right, font=_bold(32), fill=RED if dim else TEXT, anchor="rm")
+        nw = card_w - 140 - d.textlength(right, font=_bold(32)) - 40
+        d.text((x + 128, mid - 14), _wrap(d, _plain(p["name"]), _bold(28), nw, 1)[0], font=_bold(28),
                fill=MUTED if dim else TEXT, anchor="lm")
-        sub = _plain(p.get("tribe", "")) + (" · В СИЗО" if p.get("jail") and not dim else "")
-        d.text((x0 + 88, mid + 18), sub, font=_regular(20), fill=(255, 150, 40) if p.get("jail") else MUTED,
-               anchor="lm")
+        jail = p.get("jail") and not dim
+        d.text((x + 128, mid + 18), _plain(p.get("tribe", "")) + (" · В СИЗО" if jail else ""), font=_regular(20),
+               fill=(255, 150, 40) if jail else MUTED, anchor="lm")
         if not dim:
-            d.text((x0 + inner - 22, mid + 20), f"наличными {p['cash']}₽", font=_regular(19), fill=MUTED, anchor="rm")
-        y += row_h
-    # памятка по особым клеткам — внизу центра
-    d = ImageDraw.Draw(img)
-    legend = [("start", "стипуха за круг"), ("rumor", "случайное событие"), ("pps", "штраф"),
+            d.text((x + card_w - 22, mid + 20), f"наличными {p['cash']}₽", font=_regular(18), fill=MUTED, anchor="rm")
+    # подвал: памятка по особым клеткам
+    legend = [("start", "стипуха за круг"), ("rumor", "событие"), ("pps", "штраф"),
               ("jail", f"пропуск {C.JAIL_TURNS} ходов"), ("pzd", "подкол и штраф")]
-    ly = BOARD_W - M - CELL - 40 - 34 * len(legend)
-    if ly > y + 10:
-        for kind, what in legend:
-            label, col = SPECIAL[kind]
-            icon = next(C.cell_icon(i) for i in range(C.SIZE) if C.BOARD[i][0] == kind)
-            _paste_icon(img, icon, x0 + 16, ly + 14, 26)
-            d = ImageDraw.Draw(img)
-            d.text((x0 + 42, ly + 14), label, font=_bold(20), fill=col, anchor="lm")
-            d.text((x0 + 42 + d.textlength(label + "  ", font=_bold(20)), ly + 14), f"- {what}", font=_regular(20),
-                   fill=MUTED, anchor="lm")
-            ly += 34
+    items = []
+    d = ImageDraw.Draw(img)
+    for kind, what in legend:
+        label, col = SPECIAL[kind]
+        wl = d.textlength(label, font=_bold(20)) + d.textlength(f" - {what}", font=_regular(20)) + 40
+        items.append((kind, label, col, what, wl))
+    total = sum(it[4] for it in items) + 26 * (len(items) - 1)
+    lx, ly = (IMG_W - total) / 2, HEAD + ROWS * CELL + FOOT // 2 + 4
+    for kind, label, col, what, wl in items:
+        icon = next(C.cell_icon(i) for i in range(C.SIZE) if C.BOARD[i][0] == kind)
+        _paste_icon(img, icon, int(lx + 14), ly, 28)
+        d = ImageDraw.Draw(img)
+        d.text((lx + 34, ly), label, font=_bold(20), fill=col, anchor="lm")
+        d.text((lx + 34 + d.textlength(label, font=_bold(20)), ly), f" - {what}", font=_regular(20), fill=MUTED,
+               anchor="lm")
+        lx += wl + 26
     return _png(img)
 
 
