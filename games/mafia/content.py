@@ -27,7 +27,7 @@ ROLES: dict[str, tuple[str, str, str, str]] = {
 ROLE_ORDER = ["don", "mafia", "sheriff", "doctor", "civ"]
 
 GOALS = {
-    "mafia": "Остаться в большинстве: когда мафии не меньше, чем мирных, — город ваш.",
+    "mafia": "Остаться в большинстве — когда мафии не меньше, чем мирных, город ваш.",
     "town": "Найти и казнить всю мафию, пока она не перебила город.",
 }
 
@@ -62,18 +62,24 @@ def deal_roles(players: int) -> list[str]:
     return roles + ["civ"] * max(0, players - len(roles))
 
 
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    return few if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else many
+
+
 def composition(roles: list[str]) -> str:
-    """«🔫 мафия: 2 (вкл. Дона) · ⭐ Комиссар · 💉 Доктор · 🙂 мирных: 4»."""
+    """«2 мафии (с Доном), Комиссар, Доктор, 4 мирных»."""
     m = sum(1 for r in roles if team(r) == "mafia")
     civ = roles.count("civ")
-    parts = [f"🔫 мафия: {m}" + (" (вкл. Дона 🎩)" if "don" in roles else "")]
+    parts = [f"{m} {_plural(m, 'мафия', 'мафии', 'мафий')}" + (" (с Доном)" if "don" in roles else "")]
     if "sheriff" in roles:
-        parts.append("⭐ Комиссар")
+        parts.append("Комиссар")
     if "doctor" in roles:
-        parts.append("💉 Доктор")
+        parts.append("Доктор")
     if civ:
-        parts.append(f"🙂 мирных: {civ}")
-    return " · ".join(parts)
+        parts.append(f"{civ} {_plural(civ, 'мирный', 'мирных', 'мирных')}")
+    return ", ".join(parts)
 
 
 # ---------- без ИИ ----------

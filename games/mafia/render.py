@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import math
+import re
 
 from PIL import Image, ImageDraw
 
@@ -23,6 +24,14 @@ GREY = (196, 196, 190)
 ROLE_COLOR = {"don": GOLD, "mafia": RED, "sheriff": BLUE, "doctor": GREEN, "civ": GREY}
 TEAM_COLOR = {"mafia": RED, "town": BLUE}
 STAMPS = {"killed": ("УБИТ", RED), "executed": ("КАЗНЁН", RED), "alive": ("ВЫЖИЛ", GREEN)}
+
+
+_EMOJI = re.compile("[\U0001F000-\U0001FFFF\u2600-\u27BF\uFE0F\u200D\u2B00-\u2BFF]+")
+
+
+def _plain(text) -> str:
+    """Без эмодзи: в шрифте их нет, на картинке вышли бы квадратики (например, «🤖 Валера»)."""
+    return re.sub(r"[ \t]{2,}", " ", _EMOJI.sub("", str(text))).strip()
 
 
 def _png(img: Image.Image) -> bytes:
@@ -127,6 +136,8 @@ def _paragraphs(d: ImageDraw.ImageDraw, text: str, font, width: int) -> list[str
 def render_role_card(name: str, role: str, city: str, serial: int, family: list[str] | None = None,
                      stamp: str | None = None) -> bytes:
     """Карточка роли. family — напарники (для мафии), stamp — killed / executed / alive."""
+    name, city = _plain(name), _plain(city)
+    family = [_plain(f) for f in family] if family else None
     w = 1000
     tm = C.team(role)
     accent = TEAM_COLOR[tm]
@@ -177,6 +188,7 @@ def render_role_card(name: str, role: str, city: str, serial: int, family: list[
 
 
 def render_cover(city: str, intro: str, players: int, mafia: int, serial: int) -> bytes:
+    city, intro = _plain(city), _plain(intro)
     w = 1000
     probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     title_lines = _wrap(probe, city.upper(), _bold(62), w - 2 * PAD, 2)
@@ -218,6 +230,9 @@ def render_credits(city: str, winner: str, players: list[dict], nominations: lis
                    serial: int, date: str) -> bytes:
     """players — [{name, role, fate}], fate — «выжил(а)», «убит(а) ночью 2», «казнён(а) днём 1»;
     winner — mafia / town / draw; nominations — [(НАЗВАНИЕ, имя, пояснение)]."""
+    city = _plain(city)
+    players = [{**p, "name": _plain(p["name"])} for p in players]
+    nominations = [(lab, _plain(n), _plain(note)) for lab, n, note in nominations]
     w = 1000
     head, color = {"mafia": ("ПОБЕДА МАФИИ", RED), "town": ("ПОБЕДА ГОРОДА", BLUE)}.get(
         winner, ("НИЧЬЯ", GREY))
