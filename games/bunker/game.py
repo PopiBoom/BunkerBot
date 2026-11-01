@@ -1088,7 +1088,7 @@ async def _run_game(bot: Bot, game: Game) -> None:
 
     cards = setup.get("cards")
     _assign_cards(players, cards if isinstance(cards, list) else [])
-    for p, action in zip(players, C.deal_actions(len(players))):
+    for p, action in zip(players, C.deal_actions(len(players)), strict=True):
         p.action = action
         p.serial = random.randint(1, 9999)
 

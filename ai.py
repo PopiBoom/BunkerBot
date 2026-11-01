@@ -1082,7 +1082,11 @@ async def roast_auto(messages: list[dict], dossiers: dict[str, str], new_ids: se
     )
     text = await _complete(ROAST_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=3000, model=REPLY_MODEL)
     data = _extract_json(text)
-    return {"reply_to": data.get("reply_to"), "text": _clean_reply(str(data.get("text") or ""))}
+    try:  # id иногда приходит строкой («123») — тогда ответ уходил не туда (мимо new_ids)
+        reply_to = int(data.get("reply_to"))
+    except (TypeError, ValueError):
+        reply_to = None
+    return {"reply_to": reply_to, "text": _clean_reply(str(data.get("text") or ""))}
 
 
 async def comeback(name: str, text: str, short: bool = False, dossier: str = "",

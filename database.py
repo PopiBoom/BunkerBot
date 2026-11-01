@@ -684,6 +684,9 @@ class Database:
             await db.execute("DELETE FROM chat_messages WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
             await db.execute("DELETE FROM dossiers WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
             await db.execute("DELETE FROM quotes WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+            # «всё о тебе удалено» — значит, и пол, и обещания, и счёт «клоуна дня» тоже
+            for table in ("user_gender", "promises", "clown_stats"):
+                await db.execute(f"DELETE FROM {table} WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
             await db.execute(
                 "INSERT INTO roast_optout (chat_id, user_id, name, username) VALUES (?, ?, ?, ?) "
                 "ON CONFLICT(chat_id, user_id) DO UPDATE SET name = excluded.name, username = excluded.username",
@@ -732,7 +735,7 @@ class Database:
     async def ai_usage_report(self) -> dict:
         """Сводка расходов: последняя партия, сегодня, 30 дней, всё время, по моделям."""
         now = int(time.time())
-        day = now - now % 86400
+        day = now - (now + 3 * 3600) % 86400  # «сегодня» — с полуночи по МСК
         async with aiosqlite.connect(self.path) as db:
             async def one(sql: str, args: tuple = ()) -> tuple:
                 cur = await db.execute(sql, args)
@@ -796,7 +799,7 @@ class Database:
                 "ORDER BY survived DESC, games ASC LIMIT ?",
                 (limit,),
             )
-            return [dict(zip(self._BUNKER_COLS, r)) for r in await cur.fetchall()]
+            return [dict(zip(self._BUNKER_COLS, r, strict=True)) for r in await cur.fetchall()]
 
     async def bunker_profile(self, user_id: int) -> dict | None:
         async with aiosqlite.connect(self.path) as db:
@@ -805,7 +808,7 @@ class Database:
             row = await cur.fetchone()
             if not row:
                 return None
-            prof = dict(zip(self._BUNKER_COLS, row))
+            prof = dict(zip(self._BUNKER_COLS, row, strict=True))
             cur = await db.execute("SELECT COUNT(*) FROM bunker_stats WHERE survived > ?", (prof["survived"],))
             prof["place"] = int((await cur.fetchone())[0]) + 1
             return prof

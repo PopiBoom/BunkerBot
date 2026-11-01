@@ -461,7 +461,7 @@ async def _album_leader(message: Message) -> tuple[bool, str, int]:
 
 def _media_kind(message: Message) -> str:
     return ("фото" if message.photo else "видео" if message.video or message.animation else
-            "голосовое" if message.voice or message.video_note else "опрос" if message.poll else
+            "кружок" if message.video_note else "голосовое" if message.voice else "опрос" if message.poll else
             "файл" if message.document else "")
 
 
@@ -891,7 +891,10 @@ async def cmd_roast(message: Message, command: CommandObject, bot: Bot, db: Data
     if not text:
         await temp_reply(message, "Что-то я сегодня не в форме. Попробуй позже.")
         return
-    await _say(bot, chat_id, f"🔥 Прожарка: {target_name}\n\n{text}", reply_to=message.message_id)
+    # Команду бот уже удалил (middleware) — отвечаем на сообщение того, кого жарим, если /roast был ответом
+    rt = message.reply_to_message
+    await _say(bot, chat_id, f"🔥 Прожарка: {target_name}\n\n{text}",
+               reply_to=rt.message_id if rt and rt.from_user and rt.from_user.id == target_id else None)
 
 
 async def _week_digest(bot: Bot, db: Database, chat_id: int) -> bool:
@@ -1386,8 +1389,10 @@ async def _check_promise(db: Database, message: Message) -> None:
         return
     if not data.get("promise") or not data.get("due") or not data.get("what"):
         return
+    # время ИИ иногда пишет строкой «null» или «в 18:00» — берём ЧЧ:ММ, если есть, иначе полдень
+    tm = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", str(data.get("time") or ""))
+    hh, mm = (tm.group(1), tm.group(2)) if tm else ("12", "00")
     try:
-        hh, mm = (str(data.get("time") or "12:00")[:5]).split(":")
         due = datetime.strptime(str(data["due"])[:10], "%Y-%m-%d").replace(
             hour=int(hh), minute=int(mm), tzinfo=MSK)
     except (ValueError, TypeError):

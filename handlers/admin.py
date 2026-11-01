@@ -167,7 +167,7 @@ async def admin_chan_posts(call: CallbackQuery, bot: Bot, db: Database, config: 
             "выключится сам и напишет тебе. Выключить раньше — та же кнопка.\n\n"
             "Нужно, чтобы бот был админом канала с правом «Публикация сообщений». В постах — его мысли "
             "в духе канала, без имён и переписки из чата (канал видят подписчики). Свои посты он в чате "
-            "не комментирует. Пишет Opus с «подумать» — каждый пост ≈ $0.03 (весь тест ≈ $0.4)."
+            "не комментирует. Пишут по очереди Opus и Gemini (без ключа OpenRouter — только Opus) или победитель /compare — каждый пост ≈ $0.003-0.03."
         )
 
 
@@ -424,7 +424,7 @@ async def _send_backup(bot: Bot, db: Database, chat_id: int, auto: bool = False)
 
     tmp = await asyncio.to_thread(_make_backup, db.path)
     try:
-        size = os.path.getsize(tmp)
+        size = await asyncio.to_thread(os.path.getsize, tmp)
         if size > MAX_BACKUP_SIZE:
             await bot.send_message(chat_id, f"⚠️ База выросла до {size // (1024 * 1024)} МБ — "
                                             "Telegram не даст отправить её файлом. Скажи Claude, чтобы ужал бэкап.")
@@ -486,9 +486,9 @@ async def _restore_db(message: Message, bot: Bot, db: Database) -> None:
         os.remove(tmp)
         return
     old = f"{db.path}.before-restore-{_t.strftime('%Y%m%d-%H%M%S')}"
-    if os.path.exists(db.path):
-        shutil.copy2(db.path, old)
-    shutil.move(tmp, db.path)
+    if await asyncio.to_thread(os.path.exists, db.path):
+        await asyncio.to_thread(shutil.copy2, db.path, old)
+    await asyncio.to_thread(shutil.move, tmp, db.path)
     await db.init()  # досоздаст таблицы, если бэкап старее кода
     await message.answer(
         "✅ База восстановлена: досье, переписка, рейтинги, обещания и настройки на месте.\n"

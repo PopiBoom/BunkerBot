@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -138,7 +139,7 @@ async def tick(bot: Bot, db: Database) -> None:
     if not text:
         return
     try:
-        msg = await bot.send_message(chan, text)
+        msg = await bot.send_message(chan, html.escape(text))  # «<» и «&» от ИИ иначе ломали HTML-разметку
     except Exception as e:
         await stop(db)
         await _tell_admin(bot, db, "📢 Не могу писать в канал — сделай бота админом канала с правом "

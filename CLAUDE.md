@@ -169,6 +169,10 @@ Telegram-бот на aiogram 3 + Claude API. Владелец общается �
   «Я» → `short_answer_meaning`; смех на шутку → `_maybe_laugh`; пустые реплики — не цель фоновых
   подколов (`_trivial`); внешность → `about_looks/fix_looks`; запретные слова → `scrub` в `_say`;
   «бать» в каждом ответе → `vary_father`; обрезанные надписи на фото — правило в `describe_photo`.
+- Контекстные метки ИИ (`ai.ship_note`, `father_rude`, `recent_bot_lines`…) живут в contextvar: в фоне
+  (`roast.background`) `_auto_roast` и `_heavy` идут отдельной задачей — иначе метка одного подкола
+  утекала в следующие (шиппинг в клоуне дня и т.п.). Текст ИИ в Telegram — только через `html.escape`
+  (parse_mode HTML): пост в канал с «<» или «&» раньше падал. /forget_me стирает и пол, и обещания, и клоунов.
 - Модели и цены ($ за 1M вход/выход): Opus 5.5 4/20, Fable 5.1 10/50, Sonnet 5.5 2/10, Haiku 5.5 0.1/0.5;
   через OpenRouter: Gemini 4 Argon ~2/10 (на деле ≈$0.003 за пост), GPT-6.1 Terra Pro 1/5, Grok 4.7 2/6.
   Во всех запросах по умолчанию `effort=low` (`ai._complete`), посты — `high` (иначе юмор плоский).
