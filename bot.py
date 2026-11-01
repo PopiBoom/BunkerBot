@@ -18,7 +18,7 @@ from aiogram.types import (
     Message,
 )
 
-from commands import (ADMIN_SECTION, GROUP_MENU, GROUP_SECTIONS, PRIVATE_SECTIONS, PUBLIC_COMMANDS, PUBLIC_GROUP_SECTIONS,
+from commands import (ADMIN_SECTION, GROUP_SECTIONS, PRIVATE_SECTIONS, PUBLIC_COMMANDS, PUBLIC_GROUP_SECTIONS,
                       PUBLIC_PRIVATE_SECTIONS, command_name, menu)
 from config import load_config
 from dashes import NoLongDashes
@@ -43,7 +43,7 @@ async def set_commands(bot: Bot, config, db: Database) -> None:
         return [BotCommand(command=c, description=d) for c, d in menu(sections)]
 
     admin_private = cmds(PRIVATE_SECTIONS[:-1] + [ADMIN_SECTION] + PRIVATE_SECTIONS[-1:])
-    admin_group = [BotCommand(command=c, description=d) for c, d in menu(GROUP_SECTIONS, only=GROUP_MENU)]
+    admin_group = cmds(GROUP_SECTIONS)
     try:
         await bot.set_my_commands(cmds(PUBLIC_PRIVATE_SECTIONS), scope=BotCommandScopeAllPrivateChats())
         if PUBLIC_GROUP_SECTIONS:
@@ -65,7 +65,8 @@ async def set_commands(bot: Bot, config, db: Database) -> None:
 
 class AdminOnlyCommands(BaseMiddleware):
     """Команды — только админам. Кроме PUBLIC_COMMANDS (/start): чужие команды бот молча
-    пропускает, будто их не было (а во время игры, где им не место, — удаляет)."""
+    пропускает, будто их не было (а во время игры, где им не место, — удаляет).
+    Команды админа в группе бот удаляет из чата и выполняет — чтобы не висели строчки «/mafia@бот»."""
 
     async def __call__(self, handler, event: Message, data: dict):
         if event.is_automatic_forward:  # пост канала в чате — под ним комментарии, игры их не удаляют
@@ -81,6 +82,13 @@ class AdminOnlyCommands(BaseMiddleware):
                     except Exception:
                         pass
                 return None
+        if cmd and event.text and event.chat.type in ("group", "supergroup"):
+            # Команду в чате бот сразу убирает (в группе Telegram ещё и дописывает «@имя_бота» — некрасиво).
+            # Удаляем ДО выполнения: ответ бота тогда уходит обычным сообщением, без ссылки на удалённое.
+            try:
+                await event.delete()
+            except Exception:  # нет права удалять — просто выполняем команду
+                pass
         return await handler(event, data)
 
 
@@ -92,7 +100,8 @@ async def main() -> None:
     bot = Bot(
         token=config.token,
         session=session,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        # allow_sending_without_reply: команды админа в чате бот удаляет — ответ на них уходит обычным сообщением
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML, allow_sending_without_reply=True),
     )
     bot.session.middleware(NoLongDashes())  # «-» вместо «—» во всём, что бот отправляет
     db = Database(config.db_path)
