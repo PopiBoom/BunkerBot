@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from aiogram import Bot, Dispatcher
+from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
@@ -14,9 +14,12 @@ from aiogram.types import (
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeChat,
+    BotCommandScopeChatMember,
+    Message,
 )
 
-from commands import ADMIN_SECTION, GROUP_SECTIONS, PRIVATE_SECTIONS, menu
+from commands import (ADMIN_SECTION, GROUP_SECTIONS, PRIVATE_SECTIONS, PUBLIC_COMMANDS, PUBLIC_GROUP_SECTIONS,
+                      PUBLIC_PRIVATE_SECTIONS, command_name, menu)
 from config import load_config
 from database import Database
 from games import bunker_router
@@ -32,21 +35,42 @@ logging.basicConfig(
 logger = logging.getLogger("bot")
 
 
-async def set_commands(bot: Bot, config) -> None:
-    """Меню команд, которое Telegram показывает при вводе «/» — по разделам (см. commands.py)."""
+async def set_commands(bot: Bot, config, db: Database) -> None:
+    """Меню «/» по разделам (commands.py). Участники видят только /start и «забыть меня»,
+    админ — все команды: в личке и в каждом известном боту чате (меню «для участника чата»)."""
     def cmds(sections) -> list[BotCommand]:
         return [BotCommand(command=c, description=d) for c, d in menu(sections)]
 
-    private = cmds(PRIVATE_SECTIONS)
-    admin = cmds(PRIVATE_SECTIONS[:-1] + [ADMIN_SECTION] + PRIVATE_SECTIONS[-1:])
-    group = cmds(GROUP_SECTIONS)
+    admin_private = cmds(PRIVATE_SECTIONS[:-1] + [ADMIN_SECTION] + PRIVATE_SECTIONS[-1:])
+    admin_group = cmds(GROUP_SECTIONS)
     try:
-        await bot.set_my_commands(private, scope=BotCommandScopeAllPrivateChats())
-        await bot.set_my_commands(group, scope=BotCommandScopeAllGroupChats())
+        await bot.set_my_commands(cmds(PUBLIC_PRIVATE_SECTIONS), scope=BotCommandScopeAllPrivateChats())
+        await bot.set_my_commands(cmds(PUBLIC_GROUP_SECTIONS), scope=BotCommandScopeAllGroupChats())
         for admin_id in config.admin_ids:
-            await bot.set_my_commands(admin, scope=BotCommandScopeChat(chat_id=admin_id))
+            await bot.set_my_commands(admin_private, scope=BotCommandScopeChat(chat_id=admin_id))
     except Exception as e:  # меню — не критично, бот работает и без него
         logger.warning("Не удалось установить меню команд: %s", e)
+    import time as _time
+    for chat_id in await db.active_chats(int(_time.time()) - 60 * 86400):
+        for admin_id in config.admin_ids:
+            try:
+                await bot.set_my_commands(admin_group, scope=BotCommandScopeChatMember(chat_id=chat_id, user_id=admin_id))
+            except Exception as e:
+                logger.info("меню админа в чате %s не поставилось: %s", chat_id, e)
+
+
+class AdminOnlyCommands(BaseMiddleware):
+    """Команды — только админам. Кроме PUBLIC_COMMANDS (/start, /forget_me, /remember_me):
+    чужие команды бот молча пропускает, будто их не было."""
+
+    async def __call__(self, handler, event: Message, data: dict):
+        cmd = command_name(event.text or event.caption or "")
+        if cmd and cmd not in PUBLIC_COMMANDS:
+            cfg = data.get("config")
+            user = event.from_user
+            if not (cfg and user and cfg.is_admin(user.id)):
+                return None
+        return await handler(event, data)
 
 
 async def main() -> None:
@@ -70,6 +94,8 @@ async def main() -> None:
     dp["db"] = db
     dp["config"] = config
 
+    # Команды — только админам (кроме /start, /forget_me, /remember_me); проверка до всех роутеров
+    dp.message.outer_middleware(AdminOnlyCommands())
     # admin_router раньше user_router: состояния FSM админа имеют приоритет
     dp.include_router(admin_router)
     dp.include_router(compare_router)
@@ -82,7 +108,7 @@ async def main() -> None:
     # Стёб-бот последним: ловит все остальные сообщения групп
     dp.include_router(roast_router)
 
-    await set_commands(bot, config)
+    await set_commands(bot, config, db)
 
     me = await bot.get_me()
     logger.info("Бот @%s запущен. Требуемые чаты: %s", me.username, config.required_chats)

@@ -71,6 +71,32 @@ ADMIN_SECTION: tuple[str, list[tuple[str, str, str]]] = ("🛠 Админ", [
 ])
 
 
+# Команды, доступные ВСЕМ. Остальные — только админам (ADMIN_IDS): чужие бот молча игнорирует.
+#   start — проверка подписки и вход в «Бункер» по кнопке «Вступить» (без неё никто не вступит в игру);
+#   forget_me / remember_me — право человека попросить бота его не трогать.
+PUBLIC_COMMANDS = {"start", "forget_me", "remember_me"}
+
+# Меню для обычных участников: в группе — только «забыть меня», в личке — только /start
+PUBLIC_GROUP_SECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
+    ("⚙️ Прочее", [
+        ("forget_me", "забыть меня и не стебать", "бот удалит всё о тебе в этом чате и перестанет запоминать"),
+        ("remember_me", "снова запоминать меня", "вернуться под стёб после /forget_me"),
+    ]),
+]
+PUBLIC_PRIVATE_SECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
+    ("🔑 Доступ", [
+        ("start", "проверить подписку и получить доступ", "проверка подписки на каналы и выдача доступа"),
+    ]),
+]
+
+
+def command_name(text: str) -> str | None:
+    """«/roast@pizdyuk_bot @вася» → «roast»; не команда → None."""
+    if not text or not text.startswith("/"):
+        return None
+    return text.split()[0][1:].split("@")[0].lower() or None
+
+
 def menu(sections) -> list[tuple[str, str]]:
     """[(команда, описание для меню)] — эмодзи раздела в начале описания."""
     out = []
