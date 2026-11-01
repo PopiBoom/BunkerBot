@@ -219,10 +219,10 @@ def _bar(value: float, top: float, width: int = 8) -> str:
 
 def _fate(p: Player) -> str:
     if p.fate == "night":
-        return f"убит(а) ночью {p.fate_no}"
+        return f"убит ночью {p.fate_no}"
     if p.fate == "day":
-        return f"казнён(а) днём {p.fate_no}"
-    return "выжил(а)"
+        return f"казнён днём {p.fate_no}"
+    return "выжил"
 
 
 def _clock(sec: float) -> str:
@@ -610,7 +610,7 @@ async def cmd_mafia_top(message: Message, command: CommandObject, db: Database) 
 async def _profile(message: Message, db: Database, user_id: int, name: str) -> None:
     prof = await db.mafia_profile(user_id)
     if not prof or not prof["games"]:
-        await message.answer(f"🕵️ {_e(name)} ещё не играл(а) в Мафию. /mafia — исправить.")
+        await message.answer(f"🕵️ {_e(name)} ещё не играл в Мафию. /mafia — исправить.")
         return
     g = prof["games"]
     ttl = C.titles(prof)
@@ -619,11 +619,11 @@ async def _profile(message: Message, db: Database, user_id: int, name: str) -> N
              f"({round(100 * prof['wins'] / g)}%)",
              f"🔫 За мафию: {prof['mafia_games']} игр, {prof['mafia_wins']} побед · 🏙 побед за город: "
              f"{prof['town_wins']}",
-             f"🧱 Дожил(а) до конца: <b>{prof['survived']}</b> · ☠️ убит(а) ночью: {prof['killed']} · "
-             f"⚖️ казнён(а): {prof['executed']}",
-             f"🎯 Убит(а) первой ночью: {prof['first_victim']}",
+             f"🧱 Дожил до конца: <b>{prof['survived']}</b> · ☠️ убит ночью: {prof['killed']} · "
+             f"⚖️ казнён: {prof['executed']}",
+             f"🎯 Убит первой ночью: {prof['first_victim']}",
              f"⭐ Комиссаром: {prof['sheriff_hits']} мафий из {prof['sheriff_checks']} проверок · "
-             f"💉 Доктором спас(ла): {prof['doc_saves']}",
+             f"💉 Доктором спас: {prof['doc_saves']}",
              f"🗳 Днём (за город): против мафии {prof['votes_right']}, против своих {prof['votes_wrong']}"]
     if ttl:
         lines += ["", "🏅 <b>Звания</b>"] + [f"{e} <b>{n}</b> — {w}" for e, n, w in ttl]
@@ -668,7 +668,7 @@ async def cb_leave(call: CallbackQuery) -> None:
         await call.answer("Ведущий не может выйти — нажми «Отмена».", show_alert=True)
         return
     game.players.pop(uid, None)
-    await call.answer("Ты вышел(ла) из игры.")
+    await call.answer("Ты вышел из игры.")
     await _refresh_lobby(call.bot, game)
 
 
@@ -727,7 +727,7 @@ async def cb_start(call: CallbackQuery) -> None:
 
 
 def _role_alert(game: Game, p: Player) -> str:
-    s = f"Ты — {C.title(p.role)}" + ("" if p.alive else " (ты мёртв(а))")
+    s = f"Ты — {C.title(p.role)}" + ("" if p.alive else " (ты мёртв)")
     if _is_mafia(p):
         fam = [f"{o.name} ({C.title(o.role)}{'' if o.alive else ', †'})"
                for o in game.players.values() if o is not p and _is_mafia(o)]
@@ -802,7 +802,7 @@ def _role_caption(game: Game, p: Player) -> str:
     lines = [f"<b>Твоя роль: {name}</b>", "", _e(desc), "", f"Цель: {_e(goal[0].lower() + goal[1:])}"]
     if tm == "mafia":
         fam = [f"{o.name} ({C.title(o.role)})" for o in game.players.values() if o is not p and _is_mafia(o)]
-        lines += ["", "Семья: " + (_e(", ".join(fam)) if fam else "ты один(одна)")]
+        lines += ["", "Семья: " + (_e(", ".join(fam)) if fam else "ты один")]
     if p.role != "civ":
         lines += ["", "Ночью сюда придут кнопки для хода."]
     return "\n".join(lines)
@@ -975,9 +975,9 @@ async def _step_actions(bot: Bot, game: Game, p: Player, step: str) -> None:
     elif step == "doctor":
         notes = []
         if p.healed_self:
-            notes.append("себя ты уже лечил(а)")
+            notes.append("себя ты уже лечил")
         if p.last_heal is not None and p.last_heal in game.players:
-            notes.append(f"{game.players[p.last_heal].name} — лечил(а) прошлой ночью")
+            notes.append(f"{game.players[p.last_heal].name} — лечил прошлой ночью")
         await send("heal", f"<b>Ночь {game.no} — кого лечим?</b>\nЕсли мафия придёт за ним, он выживет."
                    + (f"\n<i>Нельзя: {_e('; '.join(notes))}</i>" if notes else ""), "mfh", _heal_targets(game, p))
 
@@ -1082,7 +1082,7 @@ async def cb_kill(call: CallbackQuery) -> None:
         return
     game, p, target = ctx
     if p.user_id in game.kill_votes:
-        await call.answer("Ты уже выбрал(а).", show_alert=True)
+        await call.answer("Ты уже выбрал.", show_alert=True)
         return
     if _is_mafia(target):
         await call.answer("Своих не трогаем.", show_alert=True)
@@ -1103,7 +1103,7 @@ async def cb_don_check(call: CallbackQuery) -> None:
         await call.answer("Это не твой ход.", show_alert=True)
         return
     if game.don_target is not None:
-        await call.answer("Этой ночью ты уже проверял(а).", show_alert=True)
+        await call.answer("Этой ночью ты уже проверял.", show_alert=True)
         return
     game.don_target = target.user_id
     res = "Комиссар!" if target.role == "sheriff" else "не Комиссар"
@@ -1115,7 +1115,7 @@ async def cb_don_check(call: CallbackQuery) -> None:
                     f"Ночь {game.no}, проверка: <b>{_e(target.name)}</b> — {res}")
     for o in _alive(game):  # семья узнаёт находку Дона
         if o is not p and _is_mafia(o):
-            await _dm(call.bot, o, f"Дон проверил(а) <b>{_e(target.name)}</b>: {res}")
+            await _dm(call.bot, o, f"Дон проверил <b>{_e(target.name)}</b>: {res}")
     _check_done(game)
 
 
@@ -1126,7 +1126,7 @@ async def cb_sheriff_check(call: CallbackQuery) -> None:
         return
     game, p, target = ctx
     if game.sheriff_target is not None:
-        await call.answer("Этой ночью ты уже проверял(а).", show_alert=True)
+        await call.answer("Этой ночью ты уже проверял.", show_alert=True)
         return
     if target is p:
         await call.answer("Себя проверять незачем.", show_alert=True)
@@ -1303,7 +1303,7 @@ async def _morning(bot: Bot, game: Game) -> None:
     if not victim or not _is_active(game):
         return
     await _send_card(bot, game, victim, "killed",
-                     f"<b>Этой ночью убит(а): {_e(victim.name)}</b>\nРоль: <b>{_e(role)}</b>")
+                     f"<b>Этой ночью убит: {_e(victim.name)}</b>\nРоль: <b>{_e(role)}</b>")
     if _winner(game) is None:  # партия на этом кончилась — последнее слово уже не к месту
         await _offer_last_word(bot, game, victim, "<b>Тебя убили этой ночью.</b>")
 
@@ -1604,26 +1604,26 @@ async def _nominations(game: Game) -> list[tuple[str, str, str]]:
     pl = game.players
     if game.first_victim in pl:
         v = pl[game.first_victim]
-        noms.append(("Первая жертва", v.name, "убит(а) в первую же ночь" if v.fate_no == 1
-                     else f"первым(ой) погиб(ла) от мафии — ночью {v.fate_no}"))
+        noms.append(("Первая жертва", v.name, "убит в первую же ночь" if v.fate_no == 1
+                     else f"первым погиб от мафии — ночью {v.fate_no}"))
     sheriff = next((p for p in pl.values() if p.role == "sheriff"), None)
     if sheriff:
         hits, checks = game.sheriff_hits.get(sheriff.user_id, 0), game.sheriff_checks.get(sheriff.user_id, 0)
         if hits:
-            noms.append(("Шерлок", sheriff.name, f"нашёл(ла) мафию: {hits} из {checks} проверок"))
+            noms.append(("Шерлок", sheriff.name, f"нашёл мафию: {hits} из {checks} проверок"))
         elif checks >= 2:
             noms.append(("Комиссар Слепошарый", sheriff.name, f"{checks} проверки — и ни одной мафии"))
     for uid, n in game.doc_saves.items():
         if uid in pl:
-            noms.append(("Айболит", pl[uid].name, f"спас(ла) от мафии: {n}"))
+            noms.append(("Айболит", pl[uid].name, f"спас от мафии: {n}"))
     if game.votes_right:
         uid, n = max(game.votes_right.items(), key=lambda kv: kv[1])
         if n >= 2:
-            noms.append(("Чуйка", pl[uid].name, f"{n} раз(а) голосовал(а) против мафии"))
+            noms.append(("Чуйка", pl[uid].name, f"{n} {C._plural(n, 'раз', 'раза', 'раз')} голосовал против мафии"))
     if game.votes_wrong:
         uid, n = max(game.votes_wrong.items(), key=lambda kv: kv[1])
         if n >= 2:
-            noms.append(("Палач невиновных", pl[uid].name, f"{n} раз(а) голосовал(а) против своих"))
+            noms.append(("Палач невиновных", pl[uid].name, f"{n} {C._plural(n, 'раз', 'раза', 'раз')} голосовал против своих"))
     if game.db and len(noms) < 5:  # кто больше всех болтал за партию (бот запоминает переписку дня)
         try:
             rows = await game.db.recent_messages(game.chat_id, limit=3000, since=int(game.started))

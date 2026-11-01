@@ -228,7 +228,7 @@ def render_cover(city: str, intro: str, players: int, mafia: int, serial: int) -
 
 def render_credits(city: str, winner: str, players: list[dict], nominations: list[tuple[str, str, str]],
                    serial: int, date: str) -> bytes:
-    """players — [{name, role, fate}], fate — «выжил(а)», «убит(а) ночью 2», «казнён(а) днём 1»;
+    """players — [{name, role, fate}], fate — «выжил», «убит ночью 2», «казнён днём 1»;
     winner — mafia / town / draw; nominations — [(НАЗВАНИЕ, имя, пояснение)]."""
     city = _plain(city)
     players = [{**p, "name": _plain(p["name"])} for p in players]
