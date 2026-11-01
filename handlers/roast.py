@@ -649,8 +649,8 @@ async def _set_ship(db: Database, chat_id: int, *user_ids: int | None) -> None:
     ai.ship_note.set(note)
 
 
-SHIP_REPLY_CHANCE = 0.5     # один из пары ответил другому — бот влезает с подколом (не каждый раз)
-SHIP_COOLDOWN = 15 * 60     # и не чаще раза в 15 минут на чат
+SHIP_REPLY_CHANCE = 1.0     # один из пары ответил другому — бот влезает с подколом КАЖДЫЙ раз (просьба бати)
+SHIP_COOLDOWN = 0           # без паузы между такими подколами
 _last_ship: dict[int, float] = {}
 
 
@@ -666,7 +666,7 @@ async def _maybe_ship(message: Message, bot: Bot, db: Database) -> bool:
     if len(pair) != 2 or {user.id, rt.from_user.id} != ids:
         return False
     now = time.time()
-    if now - _last_ship.get(chat_id, 0) < SHIP_COOLDOWN or now - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
+    if now - _last_ship.get(chat_id, 0) < SHIP_COOLDOWN:
         return False
     if random.random() > SHIP_REPLY_CHANCE:
         return False
@@ -686,7 +686,7 @@ async def _maybe_ship(message: Message, bot: Bot, db: Database) -> bool:
             if text:
                 ai.ship_note.set(ai.ship_text(a_name, b_name))  # редактор знает, что шутка про парочку — так надо
                 text = await ai.polish(text, message.text or "", ctx, author=a_name)
-            if text and time.time() - _last_bot_msg.get(chat_id, 0) >= QUIET_AFTER_SPEAKING:
+            if text:
                 await _say_human(bot, chat_id, text, reply_to=message.message_id)
         except Exception as e:
             logger.warning("ship comment failed: %s", e)
