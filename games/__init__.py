@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 
 from .bunker import router as bunker_router
@@ -18,6 +19,9 @@ __all__ = ["bunker_router", "mafia_router", "active", "any_running", "hush", "fl
 logger = logging.getLogger("games")
 GAME_FLAG = Path(__file__).resolve().parents[1] / ".game_running"  # свежий файл = идёт игра (см. update.sh)
 FLAG_EVERY = 10  # сек: как часто обновляем флаг (update.sh считает его устаревшим через 2 минуты)
+MAX_GAME_AGE = 3 * 3600  # партия (или зависшее лобби) дольше 3 ч — флаг за неё больше не держим: иначе
+#                          одна зависшая игра навсегда блокирует обновления сервера
+_first_seen: dict[int, float] = {}
 
 
 # Посты канала, пересланные в чат (их id = id ветки комментариев). Пополняется middleware в bot.py,
@@ -95,9 +99,32 @@ def _set_flag(on: bool) -> None:
         logger.info("game flag: %s", e)
 
 
+def _flag_needed() -> bool:
+    """Есть ли живая (не зависшая) партия, ради которой стоит отложить обновление сервера."""
+    from .bunker.game import games as bunker
+    from .mafia.game import games as mafia
+
+    now, seen, need = time.time(), set(), False
+    for pool in (bunker, mafia):
+        for g in pool.values():
+            if g.phase == "ended":
+                continue
+            key = id(g)
+            seen.add(key)
+            first = _first_seen.setdefault(key, now)
+            if now - first < MAX_GAME_AGE:
+                need = True
+            elif now - first < MAX_GAME_AGE + FLAG_EVERY:
+                logger.warning("игра в чате %s идёт дольше %d ч — обновления больше не держу",
+                               g.chat_id, MAX_GAME_AGE // 3600)
+    for key in set(_first_seen) - seen:
+        _first_seen.pop(key, None)
+    return need
+
+
 async def flag_loop() -> None:
-    """Держит флаг «идёт игра» свежим, пока есть хоть одна партия; без партий — удаляет."""
+    """Держит флаг «идёт игра» свежим, пока есть живая партия; без партий (или если она зависла) — удаляет."""
     _set_flag(False)  # после перезапуска игр точно нет
     while True:
         await asyncio.sleep(FLAG_EVERY)
-        _set_flag(any_running())
+        _set_flag(_flag_needed())
