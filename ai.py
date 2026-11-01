@@ -572,6 +572,20 @@ def ship_text(a: str, b: str) -> str:
             "из переписки.")
 
 
+async def ship_comment(a_name: str, a_text: str, b_name: str, b_text: str, context: list[dict]) -> str:
+    """Один из «парочки чата» ответил другому — бот влезает в их переписку и шипперит их."""
+    user = (
+        f"Контекст чата:\n{_msgs_block(context)}\n"
+        f"«{a_name}» ответил на сообщение «{b_name}».\n"
+        f"«{b_name}» писал: <msg>{b_text[:300]}</msg>\n«{a_name}» ответил: <msg>{a_text[:300]}</msg>\n"
+        f"{ship_text(a_name, b_name)}\n"
+        "Влезь в их переписку одной короткой репликой (до 20 слов), как будто ты сосед, который подслушал "
+        "разговор парочки: по смыслу их сообщений, а не общими словами. Обращайся к ним обоим или к одному."
+        + _gender_note() + _JSON_REPLY
+    )
+    return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, model=REPLY_MODEL))
+
+
 # Последние реплики бота в текущем чате — чтобы не повторяться (ставит handlers/roast.py)
 recent_bot_lines: contextvars.ContextVar[list[str]] = contextvars.ContextVar("recent_bot_lines", default=())
 

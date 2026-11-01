@@ -649,6 +649,52 @@ async def _set_ship(db: Database, chat_id: int, *user_ids: int | None) -> None:
     ai.ship_note.set(note)
 
 
+SHIP_REPLY_CHANCE = 0.5     # один из пары ответил другому — бот влезает с подколом (не каждый раз)
+SHIP_COOLDOWN = 15 * 60     # и не чаще раза в 15 минут на чат
+_last_ship: dict[int, float] = {}
+
+
+async def _maybe_ship(message: Message, bot: Bot, db: Database) -> bool:
+    """Один из «парочки» ответил на сообщение другого — иногда бот влезает: «опять милуетесь»."""
+    rt = message.reply_to_message
+    user = message.from_user
+    if not (rt and rt.from_user and user and ai.available()) or rt.from_user.id == user.id:
+        return False
+    chat_id = message.chat.id
+    pair = await _ship_pair(db, chat_id)
+    ids = {pid for pid, _ in pair}
+    if len(pair) != 2 or {user.id, rt.from_user.id} != ids:
+        return False
+    now = time.time()
+    if now - _last_ship.get(chat_id, 0) < SHIP_COOLDOWN or now - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
+        return False
+    if random.random() > SHIP_REPLY_CHANCE:
+        return False
+    if await db.is_optout(chat_id, user.id) or await db.is_optout(chat_id, rt.from_user.id):
+        return False
+    _last_ship[chat_id] = now
+    names = dict(pair)
+    a_name, b_name = names.get(user.id, _name(message)), names.get(rt.from_user.id, rt.from_user.first_name or "")
+    b_text = rt.text or rt.caption or "[без текста]"
+
+    async def run() -> None:
+        await asyncio.sleep(random.uniform(2.0, 4.0))
+        try:
+            await _remember_lines(db, chat_id)
+            ctx = _as_dicts(await db.recent_messages(chat_id, limit=15))
+            text = await ai.ship_comment(a_name, message.text or "", b_name, b_text, ctx)
+            if text:
+                ai.ship_note.set(ai.ship_text(a_name, b_name))  # редактор знает, что шутка про парочку — так надо
+                text = await ai.polish(text, message.text or "", ctx, author=a_name)
+            if text and time.time() - _last_bot_msg.get(chat_id, 0) >= QUIET_AFTER_SPEAKING:
+                await _say_human(bot, chat_id, text, reply_to=message.message_id)
+        except Exception as e:
+            logger.warning("ship comment failed: %s", e)
+
+    _spawn(run())
+    return True
+
+
 @router.message(Command("ship"))
 async def cmd_ship(message: Message, command: CommandObject, db: Database) -> None:
     """/ship @a @b — бот шипперит этих двоих; /ship @b (или ответом) — тебя и его; /ship off; /ship — кто сейчас."""
@@ -851,6 +897,9 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     mentioned = bool(me.username and f"@{me.username.lower()}" in text.lower())
     by_name = bool(_BOT_NAME.search(text))
     addressed = reply_to_bot or mentioned or by_name or bool(_BOT_WORD.search(text))
+    # «Парочка чата» (/ship): один ответил другому — бот иногда влезает в их переписку
+    if not addressed and not optout and await _maybe_ship(message, bot, db):
+        return
     if not addressed:
         if not optout:  # /forget_me — «не трогаю»: без реакций
             _spawn(_maybe_react(bot, db, message, user.id == _father_id(config)))
