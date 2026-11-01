@@ -181,12 +181,13 @@ ai.py             # все запросы к Claude: ведущий игры, с
 links.py          # что за ссылка (YouTube/TikTok/сайт), с защитой от внутренних адресов
 frames.py         # кадр из середины видео/кружка (PyAV)
 rhymes.py         # рифмы-отговорки («и чё?» — «хуй через плечо»)
-handlers/         # user.py (подписка), admin.py (админка), roast.py (стёб-бот),
+handlers/         # user.py (подписка), admin.py (админка), roast.py (стёб-бот), menu.py (/menu),
                   # quotes.py (/quote), stats.py (/stats), fun.py (/poll, вопрос дня), help.py (/help)
 games/            # __init__.py: какая игра идёт в чате, флаг «идёт игра» для update.sh
 games/bunker/     # game.py (ход игры), content.py (карты, режимы, звания),
                   # render.py (картинки, титры), icons.py (значки персонажей)
 games/mafia/      # game.py (ход игры), content.py (роли, тексты без ИИ, звания), render.py (карты, титры)
+tools/            # menu_images.py — рисует картинки /menu (assets/menu)
 deploy/           # install.sh (установка на VPS), update.sh (автообновление), README (пошагово)
 assets/fonts/     # шрифты DejaVu для карточек
 ```
