@@ -653,6 +653,29 @@ SHIP_REPLY_CHANCE = 1.0     # один из пары ответил другом
 SHIP_STREAK = 5             # если переписка идёт потоком: после 5 подколов подряд…
 SHIP_PAUSE = 5 * 60         # …бот молчит 5 минут; поток кончился (тишина дольше паузы) — счёт заново
 _ship_state: dict[int, dict] = {}
+_ship_debug: dict[int, str] = {}   # чат -> что было с последним ответом «одного другому» (видно в /ship)
+
+
+def _msk_time() -> str:
+    return datetime.now(timezone(timedelta(hours=3))).strftime("%H:%M")
+
+
+def _version() -> str:
+    """Коммит, на котором сейчас работает бот (видно в /ship — проверить, доехало ли обновление)."""
+    try:
+        git = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".git")
+        head = open(os.path.join(git, "HEAD"), encoding="utf-8").read().strip()
+        if head.startswith("ref:"):
+            ref = head.split(maxsplit=1)[1]
+            path = os.path.join(git, ref)
+            if os.path.exists(path):
+                return open(path, encoding="utf-8").read().strip()[:7]
+            for line in open(os.path.join(git, "packed-refs"), encoding="utf-8"):
+                if line.strip().endswith(ref):
+                    return line[:7]
+        return head[:7]
+    except OSError:
+        return "?"
 SHIP_FALLBACK = [
     "Да потрахайтесь вы уже, а то весь чат за вас переживает.",
     "Снимите комнату, тут вообще-то люди.",
@@ -666,21 +689,33 @@ async def _maybe_ship(message: Message, bot: Bot, db: Database) -> bool:
     """Один из «парочки» ответил на сообщение другого — иногда бот влезает: «опять милуетесь»."""
     rt = message.reply_to_message
     user = message.from_user
-    if not (rt and rt.from_user and user and ai.available()) or rt.from_user.id == user.id:
+    if not (rt and rt.from_user and user) or rt.from_user.id == user.id:
         return False
     chat_id = message.chat.id
+    who = f"{_name(message)} → {rt.from_user.first_name or rt.from_user.username or rt.from_user.id}"
+
+    def skip(why: str) -> bool:
+        _ship_debug[chat_id] = f"{_msk_time()} {who}: {why}"
+        logger.info("ship skip in %s: %s: %s", chat_id, who, why)
+        return False
+
+    if not ai.available():
+        return skip("ИИ выключен")
     pair = await _ship_pair(db, chat_id)
     ids = {pid for pid, _ in pair}
-    if len(pair) != 2 or {user.id, rt.from_user.id} != ids:
-        return False
+    if len(pair) != 2:
+        return skip("пара не задана (/ship)")
+    if {user.id, rt.from_user.id} != ids:
+        return skip(f"это не пара (id {user.id} → {rt.from_user.id}, а в паре {sorted(ids)})")
     now = time.time()
     st = _ship_state.setdefault(chat_id, {"n": 0, "last": 0.0, "pause": 0.0})
     if now < st["pause"]:
-        return False
+        return skip(f"пауза после {SHIP_STREAK} подколов подряд")
     if random.random() > SHIP_REPLY_CHANCE:
-        return False
+        return skip("не выпал шанс")
     if await db.is_optout(chat_id, user.id) or await db.is_optout(chat_id, rt.from_user.id):
-        return False
+        return skip("кто-то из пары в /forget_me")
+    _ship_debug[chat_id] = f"{_msk_time()} {who}: подкол отправляется"
     if now - st["last"] > SHIP_PAUSE:  # давно не было — новый поток
         st["n"] = 0
     st["n"] += 1
@@ -711,8 +746,10 @@ async def _maybe_ship(message: Message, bot: Bot, db: Database) -> bool:
         logger.info("ship: %s -> %s in %s", a_name, b_name, chat_id)
         try:
             await _say_human(bot, chat_id, text, reply_to=message.message_id)
+            _ship_debug[chat_id] = f"{_msk_time()} {who}: подкол отправлен"
         except Exception as e:
             logger.warning("ship send failed: %s", e)
+            _ship_debug[chat_id] = f"{_msk_time()} {who}: не смог отправить ({str(e)[:80]})"
 
     _spawn(run())
     return True
@@ -749,10 +786,13 @@ async def cmd_ship(message: Message, command: CommandObject, db: Database) -> No
             return
         st = _ship_state.get(chat_id, {})
         left = int(st.get("pause", 0) - time.time())
-        await message.answer(f"💞 Сейчас шипперю: {html.escape(pair[0][1])} + {html.escape(pair[1][1])}.\n"
+        last = _ship_debug.get(chat_id, "ответов друг другу пока не видел")
+        await message.answer(f"💞 Сейчас шипперю: {html.escape(pair[0][1])} (id {pair[0][0]}) + "
+                             f"{html.escape(pair[1][1])} (id {pair[1][0]}).\n"
                              + (f"Пауза после {SHIP_STREAK} подколов подряд: ещё {left // 60 + 1} мин.\n" if left > 0
                                 else f"Подколов в этом потоке: {st.get('n', 0)} из {SHIP_STREAK}.\n")
-                             + "/ship off - выключить.")
+                             + f"Последний ответ: {html.escape(last)}\n"
+                             + f"Версия бота: {_version()}\n/ship off - выключить.")
         return
     if len(people) == 1 and message.from_user:
         people.insert(0, (message.from_user.id, _name(message)))
@@ -905,6 +945,11 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     if not optout and _PROMISE_HINT.search(message.text):
         _spawn(_check_promise(db, message))
 
+    rt0 = message.reply_to_message
+    if rt0 and rt0.from_user and rt0.from_user.id not in (user.id, bot.id):  # для /ship: дошло, но вдруг дальше не дойдёт
+        _ship_debug[chat_id] = (f"{_msk_time()} {_name(message)} → {rt0.from_user.first_name or rt0.from_user.id}: "
+                                "сообщение перехватил кто-то раньше (игра, рифма, заступничество, смех, обращение к боту)")
+
     # Пока идёт игра (Бункер, Мафия) — бот только запоминает, не встревает и не ставит реакции
     if _bunker_active(chat_id):
         return
@@ -930,6 +975,8 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     by_name = bool(_BOT_NAME.search(text))
     addressed = reply_to_bot or mentioned or by_name or bool(_BOT_WORD.search(text))
     # «Парочка чата» (/ship): один ответил другому — бот иногда влезает в их переписку
+    if not addressed and optout and rt0 and rt0.from_user and rt0.from_user.id != bot.id:
+        _ship_debug[chat_id] = f"{_msk_time()} {_name(message)}: автор в /forget_me"
     if not addressed and not optout and await _maybe_ship(message, bot, db):
         return
     if not addressed:
