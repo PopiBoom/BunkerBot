@@ -42,7 +42,7 @@ import ai
 from database import Database
 from ephemeral import delete_later, temp_reply
 
-from ..common import busy_text, lobby_text
+from ..common import lobby_text
 from . import content as C
 from . import render as R
 
@@ -593,7 +593,8 @@ async def cmd_mafia(message: Message, command: CommandObject, db: Database) -> N
 
     busy = active(chat_id)
     if busy:
-        await temp_reply(message, busy_text(busy))
+        await temp_reply(message, "В этом чате уже идёт " + ("Мафия. Доиграйте или /mafia_stop." if busy == "mafia"
+                                                         else "Бункер. Доиграйте или /bunker_stop."))
         return
     from games import load_channel_posts
 

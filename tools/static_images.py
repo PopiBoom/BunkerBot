@@ -1,6 +1,6 @@
 """Рисует постоянные картинки бота — один раз, бот потом шлёт готовые файлы:
   * assets/menu/*.jpg — /menu: главная и по одной на каждый раздел (из SECTIONS в handlers/menu.py);
-  * assets/lobby/*.jpg — карточки лобби Бункера, Мафии и Нефоров;
+  * assets/lobby/*.jpg — карточки лобби Бункера и Мафии;
   * assets/mafia/*.jpg — фазы Мафии: night_N, morning_kill_N / morning_safe_N, day_N, vote_N (N = 1..10).
 
 Запускать вручную, когда что-то из этого меняется:  python tools/static_images.py
@@ -69,10 +69,7 @@ def _fit(d: ImageDraw.ImageDraw, text: str, size: int, width: int, minimum: int 
 
 
 def main_image() -> Image.Image:
-    cols, th, gap, gy = 3, 210, 28, 236
-    rows = math.ceil(len(ORDER) / cols)
-    h = max(H, gy + rows * th + (rows - 1) * gap + 56)  # разделов больше шести — картинка выше
-    img = _noise(Image.new("RGB", (W, h), BG), 7)
+    img = _noise(Image.new("RGB", (W, H), BG), 7)
     d = ImageDraw.Draw(img)
     _strip(d, YELLOW, RED)
     d.text((64, 52), "ПИЗДЮК", font=_bold(92), fill=TEXT)
@@ -80,8 +77,8 @@ def main_image() -> Image.Image:
     face = emoji("😈", 104)
     img.paste(face, (W - 64 - face.width, 44), face)
     d = ImageDraw.Draw(img)
-    gx = 64
-    tw = (W - 2 * gx - gap * (cols - 1)) // cols
+    gx, gy, cols, gap = 64, 236, 3, 28
+    tw, th = (W - 2 * gx - gap * (cols - 1)) // cols, 210
     for i, key in enumerate(ORDER):
         s = SECTIONS[key]
         x = gx + (i % cols) * (tw + gap)
@@ -187,40 +184,6 @@ def lobby_mafia() -> Image.Image:
         d.text((64, 290 + k * 46), line, font=_regular(34), fill=MUTED)
     _chips(img, ["ВСТУПИ", "РОЛЬ В ЛС", "ВЫЧИСЛИ МАФИЮ"], M_RED, 470)
     return img
-
-
-def lobby_nefor() -> Image.Image:
-    from games.nefor.render import ACID, BG as N_BG
-
-    img = _noise(Image.new("RGB", (LW, LH), N_BG), 23)
-    d = ImageDraw.Draw(img)
-    for x in range(0, LW, 40):  # кислотная «изолента» сверху и снизу
-        col = ACID if (x // 40) % 2 == 0 else (24, 24, 28)
-        d.rectangle([x, 0, x + 40, 14], fill=col)
-        d.rectangle([x, LH - 14, x + 40, LH], fill=col)
-    cx, cy, r = LW - 64 - 170, 280, 170
-    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=PANEL, outline=ACID, width=8)
-    _paste_center(img, emoji("🎸", 190), cx, cy)
-    d = ImageDraw.Draw(img)
-    d.text((64, 84), "ВОЛГОГРАД · ЛОББИ", font=_mono(30), fill=ACID)
-    d.text((58, 120), "НЕФОРЫ", font=_bold(132), fill=TEXT)
-    for k, line in enumerate(_wrap(d, "Тусовки делят город: ЦР, Мармелад, Ткачёвский рынок.",
-                                   _regular(34), 720, 2)):
-        d.text((64, 290 + k * 46), line, font=_regular(34), fill=MUTED)
-    _chips(img, ["ВСТУПИ", "ЗАЙМИ ТОЧКИ", "ЗАБЕРИ ГОРОД"], ACID, 470)
-    return img
-
-
-def nefor_icons() -> int:
-    """Цветные значки «Нефоров» (точки, тусовки, особые клетки) — PNG 128px в assets/nefor/icons."""
-    from games.nefor import content as NC
-    from games.nefor.render import ICONS
-
-    ICONS.mkdir(parents=True, exist_ok=True)
-    emojis = NC.all_icons() | {"👑"}
-    for e in emojis:
-        emoji(e.replace("\ufe0f", ""), 128).save(ICONS / f"{NC.icon_key(e)}.png", optimize=True)
-    return len(emojis)
 
 
 # ---------- фазы Мафии: ночь / утро (убили или все живы) / день / голосование, с номером ----------
@@ -385,8 +348,6 @@ if __name__ == "__main__":
         save(section_image(key), key)
     save(lobby_bunker(), "bunker", LOBBY)
     save(lobby_mafia(), "mafia", LOBBY)
-    save(lobby_nefor(), "nefor", LOBBY)
-    nefor_icons()
     for n in range(1, PHASE_MAX + 1):
         save(phase_night(n), f"night_{n}", PHASES)
         save(phase_morning(n, True), f"morning_kill_{n}", PHASES)

@@ -89,7 +89,7 @@ def _hazard_band(img: Image.Image, y: int, h: int) -> None:
 
 def _noise(img: Image.Image, seed: int) -> Image.Image:
     # seed не трогает глобальный random: раньше тут был random.seed(seed) — и после каждой картинки
-    # «случайные» ходы игр (слухи, реплики ботов) шли по одному и тому же сценарию. Шум Pillow от него
+    # «случайные» ходы игр (реплики ботов и т.п.) шли по одному и тому же сценарию. Шум Pillow от него
     # всё равно не зависел.
     del seed
     grain = Image.effect_noise(img.size, 60).convert("RGB")
