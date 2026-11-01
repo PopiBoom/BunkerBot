@@ -82,16 +82,12 @@ def composition(roles: list[str]) -> str:
 
 
 def composition_list(roles: list[str]) -> str:
-    """Состав столбиком — для лобби и обложки."""
+    """Состав столбиком — для лобби и обложки; у каждой роли — число."""
     m = sum(1 for r in roles if team(r) == "mafia")
-    civ = roles.count("civ")
-    rows = [f"• Мафия — {m}" + (", из них Дон" if "don" in roles else "")]
-    if "sheriff" in roles:
-        rows.append("• Комиссар")
-    if "doctor" in roles:
-        rows.append("• Доктор")
-    if civ:
-        rows.append(f"• Мирные — {civ}")
+    rows = [f"• Мафия - {m}" + (" (из них Дон)" if "don" in roles else "")]
+    for role, label in (("sheriff", "Комиссар"), ("doctor", "Доктор"), ("civ", "Мирные")):
+        if roles.count(role):
+            rows.append(f"• {label} - {roles.count(role)}")
     return "\n".join(rows)
 
 

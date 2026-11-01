@@ -11,6 +11,8 @@ import re
 
 from PIL import Image, ImageDraw
 
+from dashes import plain_dashes
+
 from ..bunker.render import LINE, MUTED, PAD, PANEL, TEXT, _bold, _mono, _noise, _regular, _stamp_layer, _wrap
 from . import content as C
 
@@ -31,7 +33,7 @@ _EMOJI = re.compile("[\U0001F000-\U0001FFFF\u2600-\u27BF\uFE0F\u200D\u2B00-\u2BF
 
 def _plain(text) -> str:
     """Без эмодзи: в шрифте их нет, на картинке вышли бы квадратики (например, «🤖 Валера»)."""
-    return re.sub(r"[ \t]{2,}", " ", _EMOJI.sub("", str(text))).strip()
+    return re.sub(r"[ \t]{2,}", " ", _EMOJI.sub("", plain_dashes(str(text)))).strip()
 
 
 def _png(img: Image.Image) -> bytes:

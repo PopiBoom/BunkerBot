@@ -21,6 +21,7 @@ from aiogram.types import (
 from commands import (ADMIN_SECTION, GROUP_SECTIONS, PRIVATE_SECTIONS, PUBLIC_COMMANDS, PUBLIC_GROUP_SECTIONS,
                       PUBLIC_PRIVATE_SECTIONS, command_name, menu)
 from config import load_config
+from dashes import NoLongDashes
 from database import Database
 from games import bunker_router, flag_loop, hush, mafia_router, note_channel_post
 from handlers import (admin_router, compare_router, fun_router, help_router, quotes_router, roast_router,
@@ -93,6 +94,7 @@ async def main() -> None:
         session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    bot.session.middleware(NoLongDashes())  # «-» вместо «—» во всём, что бот отправляет
     db = Database(config.db_path)
     await db.init()
     import ai

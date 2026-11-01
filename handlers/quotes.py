@@ -72,7 +72,7 @@ def render_quote(num: int, text: str, name: str, date: str) -> bytes:
         d.text((PAD + 24, y), line, font=font, fill=TEXT)
         y += line_h
     y += 50
-    d.text((W - PAD, y), f"— {name}", font=_bold(40), fill=ACCENT, anchor="ra")
+    d.text((W - PAD, y), f"- {name}", font=_bold(40), fill=ACCENT, anchor="ra")
     d.text((W - PAD, y + 58), date, font=_regular(26), fill=MUTED, anchor="ra")
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=90)  # из-за зерна фона PNG весит полмегабайта

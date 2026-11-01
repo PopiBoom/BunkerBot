@@ -13,6 +13,8 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
+from dashes import plain_dashes
+
 from .content import ACTIONS, ATTR_ICON, ATTRS
 from .icons import badge
 
@@ -48,7 +50,7 @@ def _mono(size: int):
 
 
 def _wrap(draw: ImageDraw.ImageDraw, text: str, font, width: int, max_lines: int) -> list[str]:
-    words = str(text).split()
+    words = plain_dashes(str(text)).split()  # «-», а не «—» — и на картинках
     lines: list[str] = []
     cur = ""
     for w in words:
