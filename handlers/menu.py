@@ -3,7 +3,7 @@
 Нажал раздел — в том же сообщении меняются картинка (своя у каждого раздела) и кнопки действий;
 нажал действие — бот выполняет ту же команду, что и при наборе (/mafia, /poll…), от имени нажавшего.
 Ходить по разделам может любой, выполнять действия — только админ (как и команды).
-Картинки — готовые файлы в assets/menu (их рисует tools/menu_images.py из данных ниже).
+Картинки — готовые файлы в assets/menu (их рисует tools/static_images.py из данных ниже).
 """
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ IMAGES = Path(__file__).resolve().parents[1] / "assets" / "menu"
 
 YELLOW, RED, PURPLE, BLUE, GOLD, GREY = ((247, 196, 37), (206, 38, 52), (170, 90, 230), (70, 150, 235),
                                          (230, 170, 60), (140, 146, 156))
+ACID = (170, 240, 60)
 
 # Разделы: эмодзи, название, подпись, цвет, строки (эмодзи, название, что делает, команда, действие или
 # None — только подсказка на картинке, без кнопки) и примечание внизу картинки.
@@ -40,6 +41,12 @@ SECTIONS: dict[str, dict] = {
                        ("🏆", "Рейтинг", "победы и звания", "/mafia_top", "mafia_top"),
                        ("🤖", "Тестовые боты", "добавить в лобби", "/mafia_bots", "mafia_bots")],
               "note": "Ночью чат закрыт, мёртвые молчат"},
+    "nefor": {"emoji": "🎸", "title": "Нефоры", "tagline": "тусовки делят Волгоград", "color": ACID,
+              "rows": [("▶️", "Начать", "лобби прямо в чате", "/nefor", "nefor"),
+                       ("⏹", "Остановить", "прервать партию", "/nefor_stop", "nefor_stop"),
+                       ("🏆", "Рейтинг", "победы и звания", "/nefor_top", "nefor_top"),
+                       ("🤖", "Тестовые боты", "добавить в лобби", "/nefor_bots", "nefor_bots")],
+              "note": "8 кругов, сделки до броска, побеждает капитал"},
     "roast": {"emoji": "😈", "title": "Стёб", "tagline": "прожарка, итоги недели, клоуны", "color": PURPLE,
               "rows": [("🔥", "Прожарка", "ответом на сообщение или @ник", "/roast", None),
                        ("📅", "Итоги недели", "номинации по чату", "/week", "week"),
@@ -51,9 +58,10 @@ SECTIONS: dict[str, dict] = {
                      ("📜", "Цитата", "из золотого фонда", "/quote", "quote"),
                      ("📈", "Статистика", "кто болтает и матерится", "/stats", "stats")],
             "note": "Ответь /quote на сообщение - оно уйдёт в золотой фонд"},
-    "top": {"emoji": "🏆", "title": "Рейтинги", "tagline": "звания в Бункере и Мафии", "color": GOLD,
+    "top": {"emoji": "🏆", "title": "Рейтинги", "tagline": "звания во всех играх", "color": GOLD,
             "rows": [("🏚", "Бункер", "выжившие и звания", "/top", "top"),
                      ("🕵️", "Мафия", "победы и звания", "/mafia_top", "mafia_top"),
+                     ("🎸", "Нефоры", "победы и звания", "/nefor_top", "nefor_top"),
                      ("🤡", "Клоуны", "кто чаще клоун дня", "/clowns", "clowns")],
             "note": "Профиль игрока - ответь /top или /mafia_top на его сообщение"},
     "other": {"emoji": "⚙️", "title": "Прочее", "tagline": "помощь, забыть человека", "color": GREY,
@@ -62,7 +70,7 @@ SECTIONS: dict[str, dict] = {
                        ("😈", "Вернуть", "снова запоминать", "/remember_me", None)],
               "note": "Все команды работают и если набрать их руками"},
 }
-ORDER = ["bunker", "mafia", "roast", "fun", "top", "other"]
+ORDER = ["bunker", "mafia", "nefor", "roast", "fun", "top", "other"]
 MAIN_CAPTION = "Выбери раздел - кнопки ниже."
 
 _file_ids: dict[str, str] = {}  # картинка -> file_id в Telegram (после первой отправки не грузим заново)
@@ -156,6 +164,7 @@ async def run_action(action: str, call: CallbackQuery, bot: Bot, db: Database, c
     """Выполняет команду так же, как если бы нажавший набрал её в этом чате."""
     from games.bunker import game as bunker
     from games.mafia import game as mafia
+    from games.nefor import game as nefor
     from handlers import fun, help as help_, quotes, roast, stats
 
     msg = call.message.model_copy(update={"from_user": call.from_user, "text": f"/{action}",
@@ -170,6 +179,10 @@ async def run_action(action: str, call: CallbackQuery, bot: Bot, db: Database, c
         "mafia_stop": lambda: mafia.cmd_mafia_stop(msg),
         "mafia_top": lambda: mafia.cmd_mafia_top(msg, cmd, db),
         "mafia_bots": lambda: mafia.cmd_mafia_bots(msg, cmd),
+        "nefor": lambda: nefor.cmd_nefor(msg, cmd, db),
+        "nefor_stop": lambda: nefor.cmd_nefor_stop(msg),
+        "nefor_top": lambda: nefor.cmd_nefor_top(msg, cmd, db),
+        "nefor_bots": lambda: nefor.cmd_nefor_bots(msg, cmd),
         "week": lambda: roast.cmd_week(msg, bot, db),
         "clowns": lambda: roast.cmd_clowns(msg, db),
         "promises": lambda: roast.cmd_promises(msg, db),

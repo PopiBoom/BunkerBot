@@ -24,7 +24,7 @@ from config import load_config
 from dashes import NoLongDashes
 from ephemeral import TEMP_COMMANDS, TTL, TempReplies, auto_delete
 from database import Database
-from games import bunker_router, flag_loop, hush, mafia_router, note_channel_post
+from games import bunker_router, flag_loop, hush, mafia_router, nefor_router, note_channel_post
 from handlers import (admin_router, compare_router, fun_router, help_router, menu_router, quotes_router,
                       roast_router, stats_router, user_router)
 from handlers.admin import auto_backup_loop
@@ -135,6 +135,7 @@ async def main() -> None:
     dp.include_router(compare_router)
     dp.include_router(bunker_router)
     dp.include_router(mafia_router)
+    dp.include_router(nefor_router)
     dp.include_router(user_router)
     dp.include_router(help_router)
     dp.include_router(menu_router)

@@ -1,4 +1,4 @@
-"""Игры бота: Бункер и Мафия. В одном чате — одна игра за раз.
+"""Игры бота: Бункер, Мафия и Нефоры в Волгограде. В одном чате — одна игра за раз.
 
 Пока идёт игра (включая лобби), стёб-бот молчит, а сервер не обновляется (флаг GAME_FLAG):
 deploy/update.sh ждёт, пока флаг не устареет, — иначе перезапуск молча оборвал бы партию.
@@ -11,8 +11,9 @@ from pathlib import Path
 
 from .bunker import router as bunker_router
 from .mafia import router as mafia_router
+from .nefor import router as nefor_router
 
-__all__ = ["bunker_router", "mafia_router", "active", "any_running", "hush", "flag_loop", "GAME_FLAG",
+__all__ = ["bunker_router", "mafia_router", "nefor_router", "active", "any_running", "hush", "flag_loop", "GAME_FLAG",
            "is_comment", "note_channel_post", "load_channel_posts"]
 
 logger = logging.getLogger("games")
@@ -55,11 +56,12 @@ def is_comment(message) -> bool:
 
 
 def active(chat_id: int) -> str | None:
-    """Какая игра идёт в чате (вместе с лобби): "bunker", "mafia" или None."""
+    """Какая игра идёт в чате (вместе с лобби): "bunker", "mafia", "nefor" или None."""
     from .bunker.game import games as bunker
     from .mafia.game import games as mafia
+    from .nefor.game import games as nefor
 
-    for name, pool in (("bunker", bunker), ("mafia", mafia)):
+    for name, pool in (("bunker", bunker), ("mafia", mafia), ("nefor", nefor)):
         g = pool.get(chat_id)
         if g and g.phase != "ended":
             return name
@@ -69,8 +71,9 @@ def active(chat_id: int) -> str | None:
 def any_running() -> bool:
     from .bunker.game import games as bunker
     from .mafia.game import games as mafia
+    from .nefor.game import games as nefor
 
-    return any(g.phase != "ended" for pool in (bunker, mafia) for g in pool.values())
+    return any(g.phase != "ended" for pool in (bunker, mafia, nefor) for g in pool.values())
 
 
 def hush(message) -> bool:

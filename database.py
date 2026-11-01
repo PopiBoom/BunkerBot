@@ -192,6 +192,20 @@ class Database:
             )
             await db.execute(
                 """
+                CREATE TABLE IF NOT EXISTS nefor_stats (
+                    user_id  INTEGER PRIMARY KEY,
+                    name     TEXT NOT NULL,
+                    games    INTEGER NOT NULL DEFAULT 0,
+                    wins     INTEGER NOT NULL DEFAULT 0,
+                    best     INTEGER NOT NULL DEFAULT 0,
+                    trades   INTEGER NOT NULL DEFAULT 0,
+                    bankrupt INTEGER NOT NULL DEFAULT 0,
+                    spots    INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            await db.execute(
+                """
                 CREATE TABLE IF NOT EXISTS mafia_stats (
                     user_id        INTEGER PRIMARY KEY,
                     name           TEXT NOT NULL,
@@ -846,6 +860,41 @@ class Database:
                 return None
             prof = dict(zip(self._MAFIA_COLS, row, strict=True))
             cur = await db.execute("SELECT COUNT(*) FROM mafia_stats WHERE wins > ?", (prof["wins"],))
+            prof["place"] = int((await cur.fetchone())[0]) + 1
+            return prof
+
+    # --- статистика «Нефоров» ---
+
+    _NEFOR_COLS = ("user_id", "name", "games", "wins", "best", "trades", "bankrupt", "spots")
+
+    async def record_nefor_game(self, results: list[dict]) -> None:
+        """results: [{user_id, name, games=1, wins, best (капитал партии — храним максимум), trades, bankrupt, spots}]."""
+        async with aiosqlite.connect(self.path) as db:
+            for r in results:
+                await db.execute(
+                    "INSERT INTO nefor_stats (user_id, name, games, wins, best, trades, bankrupt, spots) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET name = excluded.name, "
+                    "games = games + excluded.games, wins = wins + excluded.wins, best = MAX(best, excluded.best), "
+                    "trades = trades + excluded.trades, bankrupt = bankrupt + excluded.bankrupt, "
+                    "spots = spots + excluded.spots",
+                    [r["user_id"], r["name"]] + [int(r.get(c, 0) or 0) for c in self._NEFOR_COLS[2:]])
+            await db.commit()
+
+    async def nefor_top(self, limit: int = 10) -> list[dict]:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(f"SELECT {', '.join(self._NEFOR_COLS)} FROM nefor_stats "
+                                   "ORDER BY wins DESC, best DESC LIMIT ?", (limit,))
+            return [dict(zip(self._NEFOR_COLS, r, strict=True)) for r in await cur.fetchall()]
+
+    async def nefor_profile(self, user_id: int) -> dict | None:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(f"SELECT {', '.join(self._NEFOR_COLS)} FROM nefor_stats WHERE user_id = ?",
+                                   (user_id,))
+            row = await cur.fetchone()
+            if not row:
+                return None
+            prof = dict(zip(self._NEFOR_COLS, row, strict=True))
+            cur = await db.execute("SELECT COUNT(*) FROM nefor_stats WHERE wins > ?", (prof["wins"],))
             prof["place"] = int((await cur.fetchone())[0]) + 1
             return prof
 

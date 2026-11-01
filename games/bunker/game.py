@@ -41,7 +41,7 @@ import ai
 from database import Database
 from ephemeral import delete_later, temp_reply
 
-from ..common import lobby_text
+from ..common import busy_text, lobby_text
 from . import content as C
 from . import render as R
 from .render import render_card
@@ -682,8 +682,9 @@ async def cmd_bunker(message: Message, command: CommandObject, db: Database) -> 
         return
     from games import active, load_channel_posts
 
-    if active(chat_id) == "mafia":
-        await temp_reply(message, "В этом чате идёт Мафия. Доиграйте или /mafia_stop.")
+    busy = active(chat_id)
+    if busy and busy != "bunker":
+        await temp_reply(message, busy_text(busy))
         return
     await load_channel_posts(db, chat_id)  # чтобы не удалять комментарии к постам канала
 

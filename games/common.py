@@ -1,4 +1,4 @@
-"""Общее для игр: одинаковый вид подписи лобби у Бункера и Мафии (просьба владельца)."""
+"""Общее для игр: одинаковый вид подписи лобби (просьба владельца) и текст «уже идёт другая игра»."""
 from __future__ import annotations
 
 import html
@@ -20,3 +20,12 @@ def lobby_text(title: str, players: list[tuple[str, bool, bool]], max_players: i
     if block and n >= min_players:
         lines += ["", f"<b>{block_title}</b>", *block]
     return "\n".join(lines)
+
+
+BUSY = {"bunker": "Бункер. Доиграйте или /bunker_stop.", "mafia": "Мафия. Доиграйте или /mafia_stop.",
+        "nefor": "партия Нефоров. Доиграйте или /nefor_stop."}
+
+
+def busy_text(name: str) -> str:
+    """«В этом чате уже идёт …» — для любой игры (в чате одна игра за раз)."""
+    return "В этом чате уже идёт " + BUSY.get(name, "игра.")

@@ -19,7 +19,7 @@ logger = logging.getLogger("ephemeral")
 TTL = 30  # сек, через сколько удалить
 # Команды, все ответы которых в чате — служебные (таблицы, статусы, справка)
 TEMP_COMMANDS = {"bunker_stop", "mafia_stop", "bunker_bots", "mafia_bots", "clowns", "promises", "top",
-                 "mafia_top", "stats", "help", "forget_me", "remember_me"}
+                 "mafia_top", "stats", "help", "forget_me", "remember_me", "nefor_stop", "nefor_bots", "nefor_top"}
 _SENDS = {"SendMessage"}  # только текст: картинки владелец хочет оставлять
 
 auto_delete: contextvars.ContextVar[int] = contextvars.ContextVar("auto_delete", default=0)
