@@ -1032,7 +1032,7 @@ async def _night(bot: Bot, game: Game) -> None:
     game.night_step = ""
     for p in game.players.values():
         p.night_msgs = {}
-    await _send(bot, game.chat_id, f"🌙 <b>НОЧЬ {game.no}</b>\n{HR}\n\nГород засыпает. До утра чат закрыт.",
+    await _send(bot, game.chat_id, f"🌙 <b>НОЧЬ {game.no}</b>\n{HR}\n\nГород засыпает.",
                 reply_markup=_night_kb(game))
     await _pause(game, 2)
     for step in ("doctor", "sheriff", "mafia"):
@@ -1378,7 +1378,7 @@ def _bars(game: Game) -> str:
     names = [game.players[u].name[:14] for u, _ in rows] + ["никого"]
     width = min(14, max(len(n) for n in names))
     lines = [f"{_e(game.players[u].name[:14].ljust(width))} {_bar(n, top)} {n}" for u, n in rows]
-    lines.append(f"{'никого'.ljust(width)} {_bar(skip, top)} {skip}")
+    lines += ["", f"{'никого'.ljust(width)} {_bar(skip, top)} {skip}"]
     return "<code>" + "\n".join(lines) + "</code>"
 
 
@@ -1623,7 +1623,7 @@ async def _finish(bot: Bot, game: Game, winner: str) -> None:
             R.render_credits, game.city, winner, [{"name": p.name, "role": p.role, "fate": _fate(p)} for p in players],
             noms, game.serial, date.today().strftime("%d.%m.%Y"))
         await _retry(bot.send_photo, game.chat_id, BufferedInputFile(png, filename="credits.png"),
-                     caption="/mafia — ещё раз · /mafia_top — рейтинг")
+                     caption="/mafia — ещё раз\n\n/mafia_top — рейтинг")
     except Exception as e:
         logger.warning("mafia credits failed: %s", e)
         await _send(bot, game.chat_id, "<b>Кто был кем</b>\n\n" + "\n".join(
