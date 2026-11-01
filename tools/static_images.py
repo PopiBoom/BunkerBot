@@ -1,6 +1,8 @@
-"""Рисует картинки для /menu (assets/menu/*.jpg): главную и по одной на каждый раздел.
+"""Рисует постоянные картинки бота — один раз, бот потом шлёт готовые файлы:
+  * assets/menu/*.jpg — /menu: главная и по одной на каждый раздел (из SECTIONS в handlers/menu.py);
+  * assets/lobby/*.jpg — карточки лобби Бункера и Мафии.
 
-Запускать вручную, когда меняются разделы в handlers/menu.py:  python tools/menu_images.py
+Запускать вручную, когда что-то из этого меняется:  python tools/static_images.py
 Нужен цветной шрифт эмодзи (Noto Color Emoji: пакет fonts-noto-color-emoji). На сервере он не нужен —
 бот отправляет уже готовые картинки.
 """
@@ -123,13 +125,72 @@ def section_image(key: str) -> Image.Image:
     return img
 
 
-def save(img: Image.Image, name: str) -> None:
-    IMAGES.mkdir(parents=True, exist_ok=True)
-    img.save(IMAGES / f"{name}.jpg", format="JPEG", quality=90, optimize=True)
+# ---------- карточки лобби ----------
+
+LOBBY = ROOT / "assets" / "lobby"
+LW, LH = 1280, 640
+
+
+def _chips(img: Image.Image, steps: list[str], color, y: int) -> None:
+    """Шаги партии плашками в ряд: «1 ВСТУПИ», «2 …»."""
+    d = ImageDraw.Draw(img)
+    font = _mono(26)
+    x = 64
+    for i, step in enumerate(steps, 1):
+        label = f"{i}  {step}"
+        w = int(d.textlength(label, font=font)) + 44
+        d.rounded_rectangle([x, y, x + w, y + 58], radius=14, fill=PANEL, outline=color, width=2)
+        d.text((x + 22, y + 29), label, font=font, fill=TEXT, anchor="lm")
+        x += w + 18
+
+
+def lobby_bunker() -> Image.Image:
+    from games.bunker.render import ACCENT, _canvas
+
+    img = _canvas(LW, LH, 42)
+    d = ImageDraw.Draw(img)
+    cx, cy, r = 1280 - 64 - 170, 250, 170
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=PANEL, outline=ACCENT, width=8)
+    d.text((cx, cy + 8), "☢", font=_regular(230), fill=ACCENT, anchor="mm")
+    d.text((64, 84), "СБОР ВЫЖИВШИХ · ЛОББИ", font=_mono(30), fill=ACCENT)
+    d.text((58, 120), "БУНКЕР", font=_bold(132), fill=TEXT)
+    for k, line in enumerate(_wrap(d, "Мест меньше, чем людей. Решайте, кого оставить за дверью.",
+                                   _regular(34), 720, 2)):
+        d.text((64, 290 + k * 46), line, font=_regular(34), fill=MUTED)
+    _chips(img, ["ВСТУПИ", "КАРТОЧКА В ЛС", "ВЫЖИВИ"], ACCENT, 470)
+    return img
+
+
+def lobby_mafia() -> Image.Image:
+    from games.mafia.render import RED as M_RED
+    from games.mafia.render import TEXT as M_TEXT
+    from games.mafia.render import _canvas as m_canvas
+    from games.mafia.render import icon
+
+    img = m_canvas(LW, LH, 17, M_RED)
+    d = ImageDraw.Draw(img)
+    cx, cy, r = 1280 - 64 - 170, 280, 170
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=PANEL, outline=M_RED, width=8)
+    hat = icon("mafia", 230, M_TEXT)
+    img.paste(hat, (cx - hat.width // 2, cy - hat.height // 2), hat)
+    d = ImageDraw.Draw(img)
+    d.text((64, 84), "СБОР ГОРОДА · ЛОББИ", font=_mono(30), fill=M_RED)
+    d.text((58, 120), "МАФИЯ", font=_bold(132), fill=TEXT)
+    for k, line in enumerate(_wrap(d, "Днём все соседи. Ночью кто-то из вас точит нож.", _regular(34), 720, 2)):
+        d.text((64, 290 + k * 46), line, font=_regular(34), fill=MUTED)
+    _chips(img, ["ВСТУПИ", "РОЛЬ В ЛС", "ВЫЧИСЛИ МАФИЮ"], M_RED, 470)
+    return img
+
+
+def save(img: Image.Image, name: str, folder: Path = IMAGES) -> None:
+    folder.mkdir(parents=True, exist_ok=True)
+    img.save(folder / f"{name}.jpg", format="JPEG", quality=90, optimize=True)
 
 
 if __name__ == "__main__":
     save(main_image(), "main")
     for key in ORDER:
         save(section_image(key), key)
-    print("готово:", sorted(p.name for p in IMAGES.glob("*.jpg")))
+    save(lobby_bunker(), "bunker", LOBBY)
+    save(lobby_mafia(), "mafia", LOBBY)
+    print("готово:", sorted(str(p.relative_to(ROOT)) for p in (*IMAGES.glob("*.jpg"), *LOBBY.glob("*.jpg"))))

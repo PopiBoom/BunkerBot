@@ -187,7 +187,7 @@ games/            # __init__.py: какая игра идёт в чате, фл�
 games/bunker/     # game.py (ход игры), content.py (карты, режимы, звания),
                   # render.py (картинки, титры), icons.py (значки персонажей)
 games/mafia/      # game.py (ход игры), content.py (роли, тексты без ИИ, звания), render.py (карты, титры)
-tools/            # menu_images.py — рисует картинки /menu (assets/menu)
+tools/            # static_images.py — рисует постоянные картинки: /menu и лобби игр (assets/)
 deploy/           # install.sh (установка на VPS), update.sh (автообновление), README (пошагово)
 assets/fonts/     # шрифты DejaVu для карточек
 ```

@@ -21,6 +21,7 @@ import os
 import random
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
@@ -28,6 +29,7 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
@@ -126,6 +128,7 @@ class Game:
     force_tally: bool = False
     # сообщения
     lobby_msg_id: int | None = None
+    lobby_photo: bool = False  # лобби отправлено картинкой (правим подпись)
     board_msg_id: int | None = None
     vote_msg_id: int | None = None
     turn_msg_id: int | None = None
@@ -383,14 +386,6 @@ def _lobby_text(game: Game) -> str:
         host = " 👑" if p.user_id == game.host_id else ""
         dm = "" if p.dm_ok or p.is_bot else " <i>(не открыл бота)</i>"
         lines.append(f"• {_e(p.name)}{host}{dm}")
-    lines += [
-        "",
-        "🎮 Жми «Вступить в игру» — откроется бот, нажми Start, и ты в игре.",
-        "",
-        "📬 В ЛС придут карточка и карта действия.",
-        "",
-        "👑 Ведущий тоже жмёт «Вступить», потом «Начать».",
-    ]
     return "\n".join(lines)
 
 
@@ -408,6 +403,44 @@ def _lobby_kb(game: Game) -> InlineKeyboardMarkup:
     b.row(_btn(f"🎭 Ведущий: {_mode_title(game)}", "bk:mode"), _btn("Выйти 🚪", "bk:leave"))
     b.row(_btn("Начать игру ▶️", "bk:start"), _btn("Отмена ❌", "bk:cancel"))
     return b.as_markup()
+
+# ---------- лобби картинкой (assets/lobby — готовый файл, рисует tools/static_images.py) ----------
+
+LOBBY_IMAGE = Path(__file__).resolve().parents[2] / "assets" / "lobby" / "bunker.jpg"
+_lobby_file_id: list[str] = []  # file_id картинки в Telegram — после первой отправки не грузим заново
+
+
+async def _send_lobby(message: Message, game: Game) -> None:
+    """Лобби — картинка с подписью (список игроков) и кнопками; без картинки — просто текстом."""
+    try:
+        photo = _lobby_file_id[0] if _lobby_file_id else FSInputFile(LOBBY_IMAGE)
+        sent = await message.answer_photo(photo, caption=_lobby_text(game), reply_markup=_lobby_kb(game))
+        if sent.photo and not _lobby_file_id:
+            _lobby_file_id.append(sent.photo[-1].file_id)
+        game.lobby_photo = True
+    except Exception as e:
+        logger.info("lobby photo failed, sending text: %s", e)
+        sent = await message.answer(_lobby_text(game), reply_markup=_lobby_kb(game))
+        game.lobby_photo = False
+    game.lobby_msg_id = sent.message_id
+
+
+async def _edit_lobby(bot: Bot, game: Game, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
+    """Правка лобби: у картинки меняем подпись, у текста — текст."""
+    if game.lobby_msg_id is None:
+        return
+    if not game.lobby_photo:
+        await _edit(bot, game.chat_id, game.lobby_msg_id, text, reply_markup)
+        return
+    try:
+        await bot.edit_message_caption(chat_id=game.chat_id, message_id=game.lobby_msg_id, caption=text,
+                                       reply_markup=reply_markup)
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e):
+            logger.debug("lobby caption edit failed: %s", e)
+    except Exception as e:
+        logger.debug("lobby caption edit failed: %s", e)
+
 
 
 def _board_player(p: Player, short: bool) -> str:
@@ -670,8 +703,7 @@ async def cmd_bunker(message: Message, command: CommandObject, db: Database) -> 
     )
     games[chat_id] = game
 
-    sent = await message.answer(_lobby_text(game), reply_markup=_lobby_kb(game))
-    game.lobby_msg_id = sent.message_id
+    await _send_lobby(message, game)
     _launch(message.bot, game, _lobby_timer(message.bot, game), fatal=False)
 
 
@@ -704,7 +736,7 @@ async def cmd_deeplink_join(message: Message, command: CommandObject) -> None:
     if user.id in game.players:
         game.players[user.id].dm_ok = True  # например, ведущий подключает личку
         await message.answer("Ты уже в игре! Жди старта — карточка придёт сюда, в ЛС. 🧳")
-        await _edit(message.bot, game.chat_id, game.lobby_msg_id, _lobby_text(game), _lobby_kb(game))
+        await _edit_lobby(message.bot, game, _lobby_text(game), _lobby_kb(game))
         return
     if len(game.players) >= MAX_PLAYERS:
         await message.answer("Увы, мест в лобби больше нет.")
@@ -719,7 +751,7 @@ async def cmd_deeplink_join(message: Message, command: CommandObject) -> None:
         await _send(message.bot, chat_id, f"➕ <b>{_e(player.name)}</b> спускается в бункер!")
     except Exception:
         pass
-    await _edit(message.bot, game.chat_id, game.lobby_msg_id, _lobby_text(game), _lobby_kb(game))
+    await _edit_lobby(message.bot, game, _lobby_text(game), _lobby_kb(game))
 
 
 def _mode_key(chat_id: int) -> str:
@@ -755,7 +787,7 @@ async def cmd_bunker_bots(message: Message, command: CommandObject) -> None:
         game.players[uid] = Player(user_id=uid, name=name, is_bot=True)
         added.append(name)
     await message.answer("➕ В бункер спускаются тестовые боты: " + ", ".join(_e(a) for a in added))
-    await _edit(message.bot, game.chat_id, game.lobby_msg_id, _lobby_text(game), _lobby_kb(game))
+    await _edit_lobby(message.bot, game, _lobby_text(game), _lobby_kb(game))
 
 
 def _bots(game: Game) -> list[Player]:
@@ -899,7 +931,7 @@ async def cb_mode(call: CallbackQuery) -> None:
     if game.db:
         await game.db.set_setting(_mode_key(game.chat_id), game.mode)  # запомним на следующие партии
     await call.answer(f"Ведущий: {_mode_title(game)}")
-    await _edit(call.bot, game.chat_id, game.lobby_msg_id, _lobby_text(game), _lobby_kb(game))
+    await _edit_lobby(call.bot, game, _lobby_text(game), _lobby_kb(game))
 
 
 @router.callback_query(F.data == "bk:leave")
@@ -917,7 +949,7 @@ async def cb_leave(call: CallbackQuery) -> None:
         return
     game.players.pop(uid, None)
     await call.answer("Ты вышел из игры.")
-    await _edit(call.bot, game.chat_id, game.lobby_msg_id, _lobby_text(game), _lobby_kb(game))
+    await _edit_lobby(call.bot, game, _lobby_text(game), _lobby_kb(game))
 
 
 @router.callback_query(F.data == "bk:cancel")
@@ -935,7 +967,7 @@ async def cb_cancel(call: CallbackQuery) -> None:
     _end_game(game)
     await call.answer("Игра отменена.")
     if call.message:
-        await call.message.edit_text("❌ Игра в Бункер отменена.")
+        await _edit_lobby(call.bot, game, "❌ Игра в Бункер отменена.")
 
 
 @router.callback_query(F.data == "bk:start")

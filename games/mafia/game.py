@@ -28,12 +28,14 @@ import re
 import time
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 from datetime import date
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardButton,
+                           InlineKeyboardMarkup, Message)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import ai
@@ -105,6 +107,7 @@ class Game:
     started: float = 0.0
     bot_username: str = ""
     lobby_msg_id: int | None = None
+    lobby_photo: bool = False  # лобби отправлено картинкой (правим подпись)
     stop: asyncio.Event = field(default_factory=asyncio.Event)
     # ночь
     night_step: str = ""          # чей сейчас ход ночью: doctor | sheriff | mafia
@@ -438,7 +441,6 @@ def _lobby_text(game: Game) -> str:
         lines.append(f"• {_e(p.name)}{host}{dm}")
     if n >= MIN_PLAYERS:
         lines += ["", "<b>Состав</b>", C.composition_list(C.deal_roles(n))]
-    lines += ["", "Жми «Вступить в игру» — откроется бот, нажми Start. Роль придёт в личку."]
     return "\n".join(lines)
 
 
@@ -450,6 +452,44 @@ def _lobby_kb(game: Game) -> InlineKeyboardMarkup:
     b.row(_btn(f"Ведущий: {_mode_title(game)}", "mf:mode"), _btn("Выйти", "mf:leave"))
     b.row(_btn("Начать ▶️", "mf:start"), _btn("Отмена", "mf:cancel"))
     return b.as_markup()
+
+# ---------- лобби картинкой (assets/lobby — готовый файл, рисует tools/static_images.py) ----------
+
+LOBBY_IMAGE = Path(__file__).resolve().parents[2] / "assets" / "lobby" / "mafia.jpg"
+_lobby_file_id: list[str] = []  # file_id картинки в Telegram — после первой отправки не грузим заново
+
+
+async def _send_lobby(message: Message, game: Game) -> None:
+    """Лобби — картинка с подписью (список игроков) и кнопками; без картинки — просто текстом."""
+    try:
+        photo = _lobby_file_id[0] if _lobby_file_id else FSInputFile(LOBBY_IMAGE)
+        sent = await message.answer_photo(photo, caption=_lobby_text(game), reply_markup=_lobby_kb(game))
+        if sent.photo and not _lobby_file_id:
+            _lobby_file_id.append(sent.photo[-1].file_id)
+        game.lobby_photo = True
+    except Exception as e:
+        logger.info("lobby photo failed, sending text: %s", e)
+        sent = await message.answer(_lobby_text(game), reply_markup=_lobby_kb(game))
+        game.lobby_photo = False
+    game.lobby_msg_id = sent.message_id
+
+
+async def _edit_lobby(bot: Bot, game: Game, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
+    """Правка лобби: у картинки меняем подпись, у текста — текст."""
+    if game.lobby_msg_id is None:
+        return
+    if not game.lobby_photo:
+        await _edit(bot, game.chat_id, game.lobby_msg_id, text, reply_markup)
+        return
+    try:
+        await bot.edit_message_caption(chat_id=game.chat_id, message_id=game.lobby_msg_id, caption=text,
+                                       reply_markup=reply_markup)
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e):
+            logger.debug("lobby caption edit failed: %s", e)
+    except Exception as e:
+        logger.debug("lobby caption edit failed: %s", e)
+
 
 
 def _unique_name(game: Game, raw: str | None) -> str:
@@ -464,7 +504,7 @@ def _unique_name(game: Game, raw: str | None) -> str:
 
 
 async def _refresh_lobby(bot: Bot, game: Game) -> None:
-    await _edit(bot, game.chat_id, game.lobby_msg_id, _lobby_text(game), _lobby_kb(game))
+    await _edit_lobby(bot, game, _lobby_text(game), _lobby_kb(game))
 
 
 @router.message(CommandStart(deep_link=True, magic=F.args.func(lambda a: bool(a) and a.startswith("mf_"))))
@@ -533,8 +573,7 @@ async def cmd_mafia(message: Message, command: CommandObject, db: Database) -> N
         game.bot_username = ""
     game.players[user.id] = Player(user_id=user.id, name=_unique_name(game, user.first_name), username=user.username)
     games[chat_id] = game
-    sent = await message.answer(_lobby_text(game), reply_markup=_lobby_kb(game))
-    game.lobby_msg_id = sent.message_id
+    await _send_lobby(message, game)
     _launch(message.bot, game, _lobby_timer(message.bot, game), fatal=False)
 
 
@@ -543,7 +582,7 @@ async def _lobby_timer(bot: Bot, game: Game) -> None:
     if games.get(game.chat_id) is not game or game.phase != "lobby":
         return
     _end_game(game)
-    await _edit(bot, game.chat_id, game.lobby_msg_id, "⌛ Лобби Мафии закрыто — игра так и не началась.\n"
+    await _edit_lobby(bot, game, "⌛ Лобби Мафии закрыто — игра так и не началась.\n"
                                                       "/mafia — собрать заново.")
 
 
@@ -694,7 +733,7 @@ async def cb_cancel(call: CallbackQuery) -> None:
     _end_game(game)
     await call.answer("Игра отменена.")
     if call.message:
-        await call.message.edit_text("❌ Мафия отменена.")
+        await _edit_lobby(call.bot, game, "❌ Мафия отменена.")
 
 
 @router.callback_query(F.data == "mf:start")
