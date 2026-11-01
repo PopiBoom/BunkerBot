@@ -650,8 +650,9 @@ async def _set_ship(db: Database, chat_id: int, *user_ids: int | None) -> None:
 
 
 SHIP_REPLY_CHANCE = 1.0     # один из пары ответил другому — бот влезает с подколом КАЖДЫЙ раз (просьба бати)
-SHIP_COOLDOWN = 0           # без паузы между такими подколами
-_last_ship: dict[int, float] = {}
+SHIP_STREAK = 5             # если переписка идёт потоком: после 5 подколов подряд…
+SHIP_PAUSE = 5 * 60         # …бот молчит 5 минут; поток кончился (тишина дольше паузы) — счёт заново
+_ship_state: dict[int, dict] = {}
 
 
 async def _maybe_ship(message: Message, bot: Bot, db: Database) -> bool:
@@ -666,13 +667,19 @@ async def _maybe_ship(message: Message, bot: Bot, db: Database) -> bool:
     if len(pair) != 2 or {user.id, rt.from_user.id} != ids:
         return False
     now = time.time()
-    if now - _last_ship.get(chat_id, 0) < SHIP_COOLDOWN:
+    st = _ship_state.setdefault(chat_id, {"n": 0, "last": 0.0, "pause": 0.0})
+    if now < st["pause"]:
         return False
     if random.random() > SHIP_REPLY_CHANCE:
         return False
     if await db.is_optout(chat_id, user.id) or await db.is_optout(chat_id, rt.from_user.id):
         return False
-    _last_ship[chat_id] = now
+    if now - st["last"] > SHIP_PAUSE:  # давно не было — новый поток
+        st["n"] = 0
+    st["n"] += 1
+    st["last"] = now
+    if st["n"] >= SHIP_STREAK:  # это пятый подряд — после него пауза
+        st["n"], st["pause"] = 0, now + SHIP_PAUSE
     names = dict(pair)
     a_name, b_name = names.get(user.id, _name(message)), names.get(rt.from_user.id, rt.from_user.first_name or "")
     b_text = rt.text or rt.caption or "[без текста]"
