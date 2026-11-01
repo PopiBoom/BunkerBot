@@ -160,7 +160,10 @@ def render_role_card(name: str, role: str, city: str, serial: int, family: list[
     d = ImageDraw.Draw(img)
 
     y = 490
-    d.text((w // 2, y), C.title(role).upper(), font=_bold(78), fill=ROLE_COLOR.get(role, GREY), anchor="ma")
+    title_text, size = C.title(role).upper(), 78
+    while size > 44 and d.textlength(title_text, font=_bold(size)) > w - 2 * PAD:  # длинная роль — мельче
+        size -= 2
+    d.text((w // 2, y + (78 - size) // 2), title_text, font=_bold(size), fill=ROLE_COLOR.get(role, GREY), anchor="ma")
     y += 104
     d.text((w // 2, y), _wrap(d, name, _regular(42), w - 2 * PAD, 1)[0], font=_regular(42), fill=TEXT, anchor="ma")
     y += 74

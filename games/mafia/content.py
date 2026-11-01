@@ -14,7 +14,7 @@ ROLES: dict[str, tuple[str, str, str, str]] = {
             "Глава мафии. Ночью вместе с семьёй выбираешь, кого убрать, — при равенстве голосов решаешь ты."),
     "mafia": ("Мафия", "🔫", "mafia",
               "Ночью вместе с семьёй выбираешь, кого убрать. Днём притворяешься честным горожанином."),
-    "sheriff": ("Комиссар", "⭐", "town",
+    "sheriff": ("Следователь СК РФ", "🔎", "town",
                 "Каждую ночь проверяешь одного игрока: мафия он или нет. Как подсказать городу и не спалиться — "
                 "решай сам."),
     "doctor": ("Доктор", "💉", "town",
@@ -54,7 +54,7 @@ def mafia_count(players: int) -> int:
 
 
 def deal_roles(players: int) -> list[str]:
-    """Набор ролей на партию (не перемешан): классика — мафия (с Доном от двух), Комиссар, Доктор, мирные."""
+    """Набор ролей на партию (не перемешан): классика — мафия (с Доном от двух), Следователь СК РФ, Доктор, мирные."""
     m = mafia_count(players)
     roles = ["don"] + ["mafia"] * (m - 1) if m >= 2 else ["mafia"]
     roles += ["sheriff", "doctor"]
@@ -68,12 +68,12 @@ def _plural(n: int, one: str, few: str, many: str) -> str:
 
 
 def composition(roles: list[str]) -> str:
-    """«2 мафии (с Доном), Комиссар, Доктор, 4 мирных»."""
+    """«2 мафии (с Доном), Следователь СК РФ, Доктор, 4 мирных»."""
     m = sum(1 for r in roles if team(r) == "mafia")
     civ = roles.count("civ")
     parts = [f"{m} {_plural(m, 'мафия', 'мафии', 'мафий')}" + (" (с Доном)" if "don" in roles else "")]
     if "sheriff" in roles:
-        parts.append("Комиссар")
+        parts.append("Следователь СК РФ")
     if "doctor" in roles:
         parts.append("Доктор")
     if civ:
@@ -85,7 +85,7 @@ def composition_list(roles: list[str]) -> str:
     """Состав столбиком — для лобби и обложки; у каждой роли — число."""
     m = sum(1 for r in roles if team(r) == "mafia")
     rows = [f"• Мафия - {m}" + (" (из них Дон)" if "don" in roles else "")]
-    for role, label in (("sheriff", "Комиссар"), ("doctor", "Доктор"), ("civ", "Мирные")):
+    for role, label in (("sheriff", "Следователь СК РФ"), ("doctor", "Доктор"), ("civ", "Мирные")):
         if roles.count(role):
             rows.append(f"• {label} - {roles.count(role)}")
     return "\n".join(rows)
@@ -167,9 +167,9 @@ def executed_fallback(name: str, role: str, right: bool) -> str:
 
 TITLES: list[tuple[str, str, object, str]] = [
     ("👑", "Крёстный отец", lambda s: s["mafia_wins"] >= 3, "3+ победы за мафию"),
-    ("🕵️", "Шерлок", lambda s: s["sheriff_hits"] >= 3, "Комиссаром нашёл мафию 3+ раза"),
-    ("🙈", "Комиссар Слепошарый", lambda s: s["sheriff_checks"] >= 6 and s["sheriff_hits"] <= 1,
-     "Комиссаром проверил 6+ человек — и почти всё мимо"),
+    ("🕵️", "Шерлок", lambda s: s["sheriff_hits"] >= 3, "Следователем нашёл мафию 3+ раза"),
+    ("🙈", "Следователь Слепошарый", lambda s: s["sheriff_checks"] >= 6 and s["sheriff_hits"] <= 1,
+     "Следователем проверил 6+ человек — и почти всё мимо"),
     ("🩺", "Айболит", lambda s: s["doc_saves"] >= 2, "Доктором спас 2+ жизни"),
     ("🧠", "Чуйка", lambda s: s["votes_right"] >= 8 and s["votes_right"] >= 2 * s["votes_wrong"],
      "днём голосует против мафии вдвое чаще, чем мимо"),
