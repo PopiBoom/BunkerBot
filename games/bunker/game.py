@@ -334,13 +334,17 @@ def _host(game: Game, text: str) -> str:
     return f"{voice}\n<blockquote>{_e(text.strip())}</blockquote>"
 
 
+AI_TIMEOUT = 90       # сек: дольше реплику ведущего не ждём — партия идёт дальше без неё
+SETUP_TIMEOUT = 150   # сек: сценарий партии (Opus, большой JSON); дольше — встроенный генератор
+
+
 def _ai_task(coro) -> asyncio.Task:
-    """Запускает запрос к ИИ заранее, пока идёт пауза; ошибки не роняют игру."""
+    """Запускает запрос к ИИ заранее, пока идёт пауза; ошибки и зависания не роняют и не держат игру."""
     async def safe():
         try:
-            return await coro
-        except Exception as e:
-            logger.warning("AI call failed: %s", e)
+            return await asyncio.wait_for(coro, timeout=AI_TIMEOUT)
+        except Exception as e:  # в том числе TimeoutError
+            logger.warning("AI call failed: %s", e or type(e).__name__)
             return None
     return asyncio.create_task(safe())
 
@@ -1007,8 +1011,8 @@ async def _run_game(bot: Bot, game: Game) -> None:
         await game.db.set_setting(f"bunker_last_cat:{game.chat_id}", cat[0])
 
     try:
-        setup = (await ai.generate_setup(names, C.style_examples(), cat[0]) if ai.available()
-                 else C.fallback_setup(names, cat))
+        setup = (await asyncio.wait_for(ai.generate_setup(names, C.style_examples(), cat[0]), SETUP_TIMEOUT)
+                 if ai.available() else C.fallback_setup(names, cat))
     except Exception as e:
         logger.warning("AI setup failed: %s", e)
         setup = C.fallback_setup(names, cat)
@@ -1465,7 +1469,7 @@ async def _threat_chances(game: Game) -> dict[int, dict]:
                    "known": {C.ATTR_MAP[k][0]: (p.card or {}).get(k, "") for k in C.ATTR_KEYS}}
                   for p in alive]
         try:
-            res = await ai.threat_chances(game.threat.get("text", ""), public)
+            res = await asyncio.wait_for(ai.threat_chances(game.threat.get("text", ""), public), AI_TIMEOUT)
         except Exception as e:
             logger.warning("AI threat chances failed: %s", e)
     out = {}
@@ -1713,7 +1717,7 @@ async def _end_speech(bot: Bot, game: Game) -> None:
     # Ведущий оценивает речи, только если высказались оба обвиняемых
     if len(speeches) >= 2 and ai.available():
         try:
-            note = await ai.narrate_speeches(game.catastrophe, speeches, _style(game))
+            note = await asyncio.wait_for(ai.narrate_speeches(game.catastrophe, speeches, _style(game)), AI_TIMEOUT)
             if note:
                 await _say(bot, game.chat_id, _host(game, note), delay=SPEECH_NOTE_DELAY)
                 return

@@ -391,7 +391,7 @@ async def _say(bot: Bot, chat_id: int, text: str, reply_to: int | None = None) -
         if len(answered) > 500:
             answered.clear()
     _last_bot_msg[chat_id] = time.time()
-    sent = await bot.send_message(chat_id, html.escape(text.strip())[:4000], **kwargs)
+    sent = await bot.send_message(chat_id, html.escape(text.strip()[:3800]), **kwargs)  # режем до экранирования
     # Запоминаем свою реплику: иначе бот не понимает, когда его спрашивают про им же сказанное
     if _db_ref:
         try:
@@ -670,6 +670,8 @@ async def cmd_roast(message: Message, command: CommandObject, bot: Bot, db: Data
         text = await ai.roast_user(target_name or "Аноним", dossier, _as_dicts(rows), quote=quote)
     except Exception as e:
         logger.warning("roast failed: %s", e)
+        text = ""
+    if not text:
         await message.reply("Что-то я сегодня не в форме. Попробуй позже.")
         return
     await _say(bot, chat_id, f"🔥 Прожарка: {target_name}\n\n{text}", reply_to=message.message_id)
@@ -1508,14 +1510,19 @@ async def background(bot: Bot, db: Database) -> None:
                     await channel_posts.tick(bot, db)
                 except Exception as e:
                     logger.warning("channel posts tick failed: %s", e)
-                # Опросы «Кто из нас…»: закрыть просроченные; тишина в чате — «вопрос дня»
+                # Тишина в чате — «вопрос дня»
                 try:
                     from handlers import fun
-                    await fun.finish_polls(bot, db)
                     for chat_id in await db.active_chats(int(time.time()) - fun.DEAD_AFTER):
                         await fun.quiet_kick(bot, db, chat_id)
                 except Exception as e:
                     logger.warning("fun tick failed: %s", e)
+            # Опросы «Кто из нас…» закрываем всегда — даже если стёб выключен (итоги тогда без прожарки)
+            try:
+                from handlers import fun
+                await fun.finish_polls(bot, db)
+            except Exception as e:
+                logger.warning("polls finish failed: %s", e)
         except Exception:
             logger.exception("roast background tick failed")
         # Проверяем чаще, чем интервал, но не реже раза в минуту

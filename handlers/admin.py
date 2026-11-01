@@ -525,8 +525,9 @@ async def admin_ai_costs(call: CallbackQuery, db: Database, config: Config) -> N
             lines.append(f"• {model}: {money(cost)} · {n} запр. · {tin // 1000}K вход / {tout // 1000}K выход")
     lines += [
         "",
-        f"⚙️ Сценарий и вердикт: <code>{ai.MODEL}</code>",
-        f"⚡️ Реплики ведущего: <code>{ai.FAST_MODEL}</code>",
+        f"⚙️ Бункер (сценарий, вердикт), прожарки, эпилог Мафии: <code>{ai.MODEL}</code>",
+        f"💬 Ответы в чате, ведущий Мафии, редактор: <code>{ai.REPLY_MODEL}</code>",
+        f"⚡️ Реплики ведущего Бункера, описания фото и стикеров: <code>{ai.FAST_MODEL}</code>",
         "",
         "<i>Оценка по ценам Anthropic, без налогов. Точный счёт и баланс — "
         "platform.claude.com → Billing.</i>",

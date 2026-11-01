@@ -70,6 +70,10 @@ class Database:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_chat_messages ON chat_messages (chat_id, ts)"
             )
+            # поиск по номеру сообщения (импорт истории, реакции на шутки бота, посты канала)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_messages_msg ON chat_messages (chat_id, msg_id)"
+            )
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS dossiers (
@@ -701,12 +705,15 @@ class Database:
 
     async def purge_old_messages(self, older_than: int, keep_last: int = 3000) -> None:
         """Удаляет сообщения старше older_than, но последние keep_last в каждом чате оставляет."""
+        # Нумеруем сообщения каждого чата от новых к старым одним проходом (оконная функция) —
+        # раньше подзапрос с сортировкой выполнялся заново для каждой старой строки.
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "DELETE FROM chat_messages WHERE ts < ? AND rowid NOT IN ("
-                "SELECT c2.rowid FROM chat_messages c2 WHERE c2.chat_id = chat_messages.chat_id "
-                "ORDER BY c2.ts DESC LIMIT ?)",
-                (older_than, keep_last),
+                "DELETE FROM chat_messages WHERE rowid IN ("
+                "SELECT rowid FROM (SELECT rowid, ts, ROW_NUMBER() OVER "
+                "(PARTITION BY chat_id ORDER BY ts DESC) AS rn FROM chat_messages) "
+                "WHERE rn > ? AND ts < ?)",
+                (keep_last, older_than),
             )
             await db.commit()
 

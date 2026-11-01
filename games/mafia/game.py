@@ -388,11 +388,14 @@ async def _dossier(game: Game, p: Player) -> str:
         return ""
 
 
+AI_TIMEOUT = 60  # сек: дольше ведущего не ждём — берём запасной текст, партия не стоит
+
+
 async def _ai(coro, what: str):
     try:
-        return await coro
-    except Exception as e:
-        logger.warning("mafia AI %s failed: %s", what, e)
+        return await asyncio.wait_for(coro, timeout=AI_TIMEOUT)
+    except Exception as e:  # в том числе TimeoutError
+        logger.warning("mafia AI %s failed: %s", what, e or type(e).__name__)
         return None
 
 

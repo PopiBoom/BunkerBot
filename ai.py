@@ -1,10 +1,11 @@
 """«Мозг» ведущего на базе Claude (Anthropic API).
 
-Две модели:
-  * AI_MODEL (по умолчанию Opus 5.5) — то, где важны качество и логика: генерация
-    партии, шансы на угрозе, финальный вердикт;
-  * AI_MODEL_FAST (по умолчанию Haiku 5.5, в ~40 раз дешевле) — короткие реплики
-    ведущего: комментарий раунда, речи, изгнание, исход угрозы.
+Модели:
+  * AI_MODEL (Opus 5.5) — где важны качество и логика: сценарий и вердикт Бункера, шансы на угрозе,
+    прожарки, эпилог Мафии;
+  * AI_MODEL_REPLY / AI_MODEL_EDIT (Sonnet 5.5) — ответы людям в чате, редактор, ведущий Мафии;
+  * AI_MODEL_FAST (Haiku 5.5) — короткие реплики ведущего Бункера и служебное (фото, стикеры, досье);
+  * посты в канал — AI_MODEL_POSTS (Opus и Gemini через OpenRouter по очереди).
 
 Каждый запрос учитывается: токены и примерная стоимость уходят в «приёмник»
 (его подключает bot.py — пишет в базу), с пометкой партии через contextvar.
@@ -74,7 +75,8 @@ def _get_client() -> AsyncAnthropic:
         api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
         if not api_key:
             raise AIUnavailable("ANTHROPIC_API_KEY не задан")
-        _client = AsyncAnthropic(api_key=api_key)
+        # 5 минут на запрос (по умолчанию в SDK — 10): зависший запрос не должен держать партию полчаса
+        _client = AsyncAnthropic(api_key=api_key, timeout=300.0, max_retries=2)
     return _client
 
 
@@ -979,16 +981,18 @@ async def roast_user(name: str, dossier: str, messages: list[dict], quote: str =
         f"Его последние сообщения:\n{_msgs_block(messages)}\n"
         "2-3 коротких предложения (до 50 слов) в 1-2 абзаца: зацепись за 1-2 конкретные вещи, которые он реально писал, "
         "лучше всего — противоречия и нарушенные обещания, и сделай из них беспощадный вывод о "
-        + _gender_note() + "\n"
         "его характере. Обращайся на «ты», заканчивай самым сильным ударом — и он должен быть "
         "понятен сразу, без загадок. Перед ответом проверь каждую шутку: ясно ли, над чем смеёмся? "
-        "Если нет — замени."
+        "Если нет — замени." + _gender_note()
     )
     draft = await _complete(ROAST_SYSTEM, user, max_tokens=3000)
     # Редактор сверяет цитаты с перепиской и чинит непонятные шутки
     fixed = await polish(draft, f"Команда /roast: прожарить «{name}» по его сообщениям и досье.",
                          messages, max_words=70, author=name, long_form=True)
-    return fixed or draft
+    if fixed:
+        return fixed
+    draft = scrub(_clean_reply(draft) or draft)  # редактор не справился — черновик, но через те же фильтры
+    return "" if about_looks(draft) or _garbled(draft) else draft
 
 
 async def roast_auto(messages: list[dict], dossiers: dict[str, str], new_ids: set | None = None,
