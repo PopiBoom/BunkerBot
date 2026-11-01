@@ -653,6 +653,13 @@ SHIP_REPLY_CHANCE = 1.0     # один из пары ответил другом
 SHIP_STREAK = 5             # если переписка идёт потоком: после 5 подколов подряд…
 SHIP_PAUSE = 5 * 60         # …бот молчит 5 минут; поток кончился (тишина дольше паузы) — счёт заново
 _ship_state: dict[int, dict] = {}
+SHIP_FALLBACK = [
+    "Да потрахайтесь вы уже, а то весь чат за вас переживает.",
+    "Снимите комнату, тут вообще-то люди.",
+    "Напряжение между вами видно из космоса. Решайте уже.",
+    "Опять флиртуете при детях. Идите в личку и не позорьтесь.",
+    "Ссоритесь как женатые, а ещё даже не ебались. Исправляйте.",
+]
 
 
 async def _maybe_ship(message: Message, bot: Bot, db: Database) -> bool:
@@ -680,23 +687,32 @@ async def _maybe_ship(message: Message, bot: Bot, db: Database) -> bool:
     st["last"] = now
     if st["n"] >= SHIP_STREAK:  # это пятый подряд — после него пауза
         st["n"], st["pause"] = 0, now + SHIP_PAUSE
+    _answered.setdefault(chat_id, set()).add(message.message_id)  # фоновый подкол это сообщение не трогает
     names = dict(pair)
     a_name, b_name = names.get(user.id, _name(message)), names.get(rt.from_user.id, rt.from_user.first_name or "")
-    b_text = rt.text or rt.caption or "[без текста]"
+    b_text = rt.text or rt.caption or ("[гифка]" if rt.animation else "[фото]" if rt.photo else
+                                       "[стикер]" if rt.sticker else "[видео]" if rt.video or rt.video_note
+                                       else "[голосовое]" if rt.voice else "[без текста]")
 
     async def run() -> None:
         await asyncio.sleep(random.uniform(2.0, 4.0))
+        text = ""
         try:
             await _remember_lines(db, chat_id)
             ctx = _as_dicts(await db.recent_messages(chat_id, limit=15))
-            text = await ai.ship_comment(a_name, message.text or "", b_name, b_text, ctx)
-            if text:
-                ai.ship_note.set(ai.ship_text(a_name, b_name))  # редактор знает, что шутка про парочку — так надо
-                text = await ai.polish(text, message.text or "", ctx, author=a_name)
-            if text:
-                await _say_human(bot, chat_id, text, reply_to=message.message_id)
+            ai.ship_note.set(ai.ship_text(a_name, b_name))  # и автор, и редактор знают: шутка про парочку — так надо
+            draft = await ai.ship_comment(a_name, message.text or "", b_name, b_text, ctx)
+            if draft:  # редактор может зарубить «не по теме» — тогда шлём черновик как есть
+                text = await ai.polish(draft, message.text or "", ctx, author=a_name) or draft
         except Exception as e:
             logger.warning("ship comment failed: %s", e)
+        if not text:  # ИИ упал или промолчал — «каждый раз» всё равно: запасная фраза
+            text = random.choice(SHIP_FALLBACK)
+        logger.info("ship: %s -> %s in %s", a_name, b_name, chat_id)
+        try:
+            await _say_human(bot, chat_id, text, reply_to=message.message_id)
+        except Exception as e:
+            logger.warning("ship send failed: %s", e)
 
     _spawn(run())
     return True
