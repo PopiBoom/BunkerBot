@@ -171,6 +171,7 @@ async def _user_stats(message: Message, db: Database, user_id: int, name: str) -
     quotes = (await db.quote_counts(chat_id)).get(user_id, 0)
     clowns = next((c for uid, c in await db.clown_counts(chat_id) if uid == user_id), 0)
     bunker = await db.bunker_stats_of(user_id)
+    mafia = await db.mafia_profile(user_id)
     last = next((ts for uid, _n2, ts in await db.last_seen(chat_id) if uid == user_id), None)
 
     parts = [f"👤 <b>{html.escape(name)}</b> · {PERIOD_DAYS} дн.", HR, "",
@@ -189,6 +190,11 @@ async def _user_stats(message: Message, db: Database, user_id: int, name: str) -
         games, survived, first_out = bunker
         parts.append(f"🏚 Бункер: выжил(а) <b>{survived}</b> из {games}"
                      + (f" · вылетал(а) первым(ой): {first_out}" if first_out else ""))
+    if mafia and mafia["games"]:
+        m = mafia
+        parts.append(f"🕵️ Мафия: побед <b>{m['wins']}</b> из {m['games']} · за мафию {m['mafia_wins']}, "
+                     f"за город {m['town_wins']}"
+                     + (f" · убит первым: {m['first_victim']}" if m["first_victim"] else ""))
     if last:
         parts.append(f"🕒 Последнее сообщение: {_days(now - last)} назад")
     await message.answer("\n".join(parts))

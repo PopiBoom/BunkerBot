@@ -53,6 +53,7 @@ SHERIFF_TIME = 30         # сек на проверку Комиссара
 MAFIA_TIME = 45           # сек мафии на выбор жертвы (и Дону — на проверку)
 VOTE_TIME = 60            # сек на дневное голосование (раньше — если все проголосовали)
 LAST_WORD_MAX = 500       # символов в последнем слове
+LAST_WORD_SECONDS = 60    # голосовое или кружок — не длиннее
 SPEECH_TIME = 30          # сек на оправдания при ничьей
 REVOTE_TIME = 30          # сек на переголосование между равными
 MAX_IDLE = 2              # столько кругов «ночь + день» подряд без смертей — ничья
@@ -1216,15 +1217,18 @@ async def _offer_last_word(bot: Bot, game: Game, p: Player, how: str) -> None:
         await _bot_line(bot, game, p, C.BOT_LAST_WORDS, last=True, delay=False)
         return
     game.last_word.add(p.user_id)
-    msg = await _dm(bot, p, f"{how}\n\nМожешь сказать последнее слово: напиши его сюда одним сообщением — "
+    msg = await _dm(bot, p, f"{how}\n\nМожешь сказать последнее слово: пришли сюда одно сообщение — текст, "
+                            "голосовое или кружок (до минуты) — "
                             "я перешлю в чат. В самом чате мёртвые молчат.")
     if msg is None:
         game.last_word.discard(p.user_id)
 
 
 def _last_word_game(message: Message) -> Game | None:
-    if message.chat.type != "private" or message.from_user is None or not message.text \
-            or message.text.startswith("/"):
+    """Игра, в которой автор лички может сказать последнее слово: текстом, голосовым или кружком."""
+    if message.chat.type != "private" or message.from_user is None:
+        return None
+    if not (message.voice or message.video_note or (message.text and not message.text.startswith("/"))):
         return None
     uid = message.from_user.id
     return next((g for g in games.values() if uid in g.last_word and g.phase != "ended"), None)
@@ -1661,13 +1665,22 @@ async def on_last_word(message: Message) -> None:
     if game is None or message.from_user is None:
         return
     uid = message.from_user.id
+    media = message.voice or message.video_note
+    if media and (media.duration or 0) > LAST_WORD_SECONDS:
+        await message.answer(f"Длинновато — уложись в {LAST_WORD_SECONDS} сек и пришли ещё раз.")
+        return
     game.last_word.discard(uid)  # только одно сообщение
     p = game.players[uid]
-    text = (message.text or "").strip()[:LAST_WORD_MAX]
+    head = f"<b>Последнее слово — {_e(p.name)}</b> ({_e(C.title(p.role))})"
     try:
-        await _send(message.bot, game.chat_id,
-                    f"<b>Последнее слово — {_e(p.name)}</b> ({_e(C.title(p.role))})\n"
-                    f"<blockquote>{_e(text)}</blockquote>")
+        if message.voice:  # голосовое — одним сообщением с подписью
+            await _retry(message.bot.copy_message, game.chat_id, message.chat.id, message.message_id, caption=head)
+        elif message.video_note:  # у кружка подписи не бывает — сначала заголовок
+            await _send(message.bot, game.chat_id, head)
+            await _retry(message.bot.copy_message, game.chat_id, message.chat.id, message.message_id)
+        else:
+            text = (message.text or "").strip()[:LAST_WORD_MAX]
+            await _send(message.bot, game.chat_id, f"{head}\n<blockquote>{_e(text)}</blockquote>")
         await message.answer("Передал в чат.")
     except Exception as e:
         logger.warning("last word failed: %s", e)

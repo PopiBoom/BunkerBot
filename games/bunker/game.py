@@ -136,6 +136,7 @@ class Game:
     current_picker: int | None = None
     pick_event: asyncio.Event | None = None
     pending: set[str] = field(default_factory=set)
+    edit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # правки голосований — строго по очереди
     first_out: int | None = None
     round_votes: list[dict] = field(default_factory=list)  # по раундам: {"main": {кто: против кого}, "final": …, "out": id}
     heroes: set[int] = field(default_factory=set)          # кто справился с угрозой
@@ -559,8 +560,20 @@ def _vote_kb(game: Game) -> InlineKeyboardMarkup:
 
 
 async def _refresh_vote(bot: Bot, game: Game) -> None:
-    if game.phase == "voting" and game.stage in ("open", "speech", "revote"):
-        await _edit(bot, game.chat_id, game.vote_msg_id, _vote_text(game), _vote_kb(game))
+    """Обновить голосование. Под замком и с проверкой стадии уже под ним: иначе отложенная правка
+    (или повтор после флуд-лимита) ложилась поверх закрытого голосования и возвращала кнопки."""
+    mid = game.vote_msg_id
+    async with game.edit_lock:
+        if game.phase == "voting" and game.stage in ("open", "speech", "revote") and game.vote_msg_id == mid:
+            await _edit(bot, game.chat_id, mid, _vote_text(game), _vote_kb(game))
+
+
+async def _refresh_threat(bot: Bot, game: Game) -> None:
+    """То же для голосования «кого отправить на угрозу»."""
+    mid = game.threat_msg_id
+    async with game.edit_lock:
+        if game.phase == "threat" and game.threat_msg_id == mid:
+            await _edit(bot, game.chat_id, mid, _threat_text(game), _threat_kb(game))
 
 
 # ---------- посторонние во время партии ----------
@@ -750,8 +763,7 @@ async def _bots_vote(bot: Bot, game: Game, threat: bool = False) -> None:
         if threat:
             targets = [o.user_id for o in _alive(game)]
             game.threat_votes[p.user_id] = random.choice(targets)
-            _schedule(bot, game, "threat", lambda: _edit(bot, game.chat_id, game.threat_msg_id,
-                                                         _threat_text(game), _threat_kb(game)))
+            _schedule(bot, game, "threat", lambda: _refresh_threat(bot, game))
             if len(game.threat_votes) >= len(_alive(game)) and game.advance:
                 game.advance.set()
             continue
@@ -1491,7 +1503,8 @@ async def _threat(bot: Bot, game: Game) -> bool:
     p = game.players[random.choice(candidates)]
     chance = int(game.threat_chances.get(p.user_id, {}).get("chance", 50))
     died = random.randint(1, 100) <= chance
-    await _edit(bot, game.chat_id, game.threat_msg_id, _threat_text(game, closed=True))
+    async with game.edit_lock:  # после всех начатых правок — кнопки уже не вернутся
+        await _edit(bot, game.chat_id, game.threat_msg_id, _threat_text(game, closed=True))
 
     if died:
         known_card = dict(p.card or {})  # досье погибшего и так откроется целиком
@@ -1551,9 +1564,7 @@ async def cb_threat_vote(call: CallbackQuery) -> None:
         return
     game.threat_votes[call.from_user.id] = target
     await call.answer(f"Отправляем: {game.players[target].name}")
-    _schedule(call.bot, game, "threat",
-              lambda: _edit(call.bot, game.chat_id, game.threat_msg_id, _threat_text(game), _threat_kb(game))
-              if game.phase == "threat" else asyncio.sleep(0))
+    _schedule(call.bot, game, "threat", lambda: _refresh_threat(call.bot, game))
     if len(game.threat_votes) >= len(_alive(game)) and game.advance:
         game.advance.set()
 
@@ -1643,8 +1654,9 @@ async def _voting(bot: Bot, game: Game) -> None:
             [game.players[u].name for u in game.immune], [game.players[u].name for u in game.doubled],
             [game.players[u].name for u in game.cursed], [game.players[u].name for u in candidates],
         )
-        await _edit(bot, game.chat_id, game.vote_msg_id,
-                    f"🗳 <b>Голосование · раунд {game.round_no} — закрыто</b>\n\n{_bars(game)}")
+        async with game.edit_lock:  # после всех начатых правок — кнопки уже не вернутся
+            await _edit(bot, game.chat_id, game.vote_msg_id,
+                        f"🗳 <b>Голосование · раунд {game.round_no} — закрыто</b>\n\n{_bars(game)}")
         # Если больше всех набрал игрок с иммунитетом — прямо так и скажем
         scores = _scores(game)
         shielded = [u for u in game.immune if u in scores and scores[u] > top]
