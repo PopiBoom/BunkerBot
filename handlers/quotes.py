@@ -23,6 +23,8 @@ from PIL import Image, ImageDraw
 import ai
 from database import Database
 
+from ephemeral import temp_reply
+
 logger = logging.getLogger("quotes")
 router = Router(name="quotes")
 router.message.filter(F.chat.type.in_({"group", "supergroup"}))
@@ -86,7 +88,7 @@ def render_quote(num: int, text: str, name: str, date: str) -> bytes:
 async def cmd_quote(message: Message, command: CommandObject, bot: Bot, db: Database) -> None:
     chat_id = message.chat.id
     if _bunker_active(chat_id):
-        await message.reply("Идёт игра — цитаты после партии 📜")
+        await temp_reply(message, "Идёт игра — цитаты после партии 📜")
         return
     rt = message.reply_to_message
     if rt is not None:
@@ -102,12 +104,12 @@ async def cmd_quote(message: Message, command: CommandObject, bot: Bot, db: Data
     if arg.startswith("@"):
         found = await db.find_user(chat_id, arg.split()[0])
         if not found:
-            await message.reply("Не знаю такого. Пусть сначала что-нибудь напишет в чат.")
+            await temp_reply(message, "Не знаю такого. Пусть сначала что-нибудь напишет в чат.")
             return
         user_id = found[0]
     row = await db.random_quote(chat_id, user_id)
     if not row:
-        await message.reply("📜 Золотой фонд пока пуст" + (" у этого человека" if user_id else "") + ".\n\n"
+        await temp_reply(message, "📜 Золотой фонд пока пуст" + (" у этого человека" if user_id else "") + ".\n\n"
                             "Ответь /quote на смешное сообщение — и оно попадёт в фонд. "
                             "А ещё я сам каждый вечер добавляю туда лучшие фразы дня.")
         return
@@ -126,13 +128,13 @@ async def cmd_quote(message: Message, command: CommandObject, bot: Bot, db: Data
 async def _save_quote(message: Message, rt: Message, bot: Bot, db: Database) -> None:
     text = (rt.text or rt.caption or "").strip()
     if not text or text.startswith("/"):
-        await message.reply("В цитатник — только сообщения с текстом.")
+        await temp_reply(message, "В цитатник — только сообщения с текстом.")
         return
     if rt.forward_origin is not None:
-        await message.reply("Это пересланное — чужие слова. В фонд — только сказанное здесь.")
+        await temp_reply(message, "Это пересланное — чужие слова. В фонд — только сказанное здесь.")
         return
     if len(text) > MAX_QUOTE_LEN:
-        await message.reply("Слишком длинно для цитаты — это уже мемуары.")
+        await temp_reply(message, "Слишком длинно для цитаты — это уже мемуары.")
         return
     author = rt.from_user
     if rt.sender_chat is not None and rt.sender_chat.type == "channel":
@@ -142,20 +144,20 @@ async def _save_quote(message: Message, rt: Message, bot: Bot, db: Database) -> 
     elif author.id == bot.id:
         user_id, name = 0, "Пиздюк"
     elif author.is_bot:
-        await message.reply("Других ботов не цитирую.")
+        await temp_reply(message, "Других ботов не цитирую.")
         return
     else:
         if await db.is_optout(message.chat.id, author.id):
-            await message.reply("Этот человек попросил его не трогать — в фонд не кладу.")
+            await temp_reply(message, "Этот человек попросил его не трогать — в фонд не кладу.")
             return
         user_id, name = author.id, author.first_name or author.username or "Аноним"
     num = await db.add_quote(message.chat.id, rt.message_id, user_id, name, text,
                              int(rt.date.timestamp()), message.from_user.id if message.from_user else None)
     if num is None:
-        await message.reply("Это уже лежит в золотом фонде 📜")
+        await temp_reply(message, "Это уже лежит в золотом фонде 📜")
         return
     short = text if len(text) <= 120 else text[:119].rstrip() + "…"
-    await message.reply(f"📜 В золотой фонд, №{num}:\n<blockquote>{html.escape(short)}</blockquote>\n"
+    await temp_reply(message, f"📜 В золотой фонд, №{num}:\n<blockquote>{html.escape(short)}</blockquote>\n"
                         f"— <b>{html.escape(name)}</b>")
 
 

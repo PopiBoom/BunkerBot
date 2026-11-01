@@ -35,6 +35,8 @@ import links
 import rhymes
 from database import Database
 
+from ephemeral import temp_reply
+
 logger = logging.getLogger("roast")
 router = Router(name="roast")
 router.message.filter(F.chat.type.in_({"group", "supergroup"}))
@@ -624,43 +626,43 @@ async def cmd_remember_me(message: Message, command: CommandObject, db: Database
 @router.message(Command("roast"))
 async def cmd_roast(message: Message, command: CommandObject, bot: Bot, db: Database) -> None:
     if not await _enabled(db):
-        await message.reply("Стёб-бот сейчас выключен.")
+        await temp_reply(message, "Стёб-бот сейчас выключен.")
         return
     if not ai.available():
-        await message.reply("Для прожарки нужен ключ ИИ.")
+        await temp_reply(message, "Для прожарки нужен ключ ИИ.")
         return
     if _bunker_active(message.chat.id):
-        await message.reply("Идёт игра — прожарю после партии 😈")
+        await temp_reply(message, "Идёт игра — прожарю после партии 😈")
         return
     chat_id = message.chat.id
     now = time.time()
     if now - _last_roast.get(chat_id, 0) < ROAST_COOLDOWN:
-        await message.reply("Остынь, я ещё предыдущего дожариваю.")
+        await temp_reply(message, "Остынь, я ещё предыдущего дожариваю.")
         return
 
     target_id, target_name = None, None
     if message.reply_to_message and message.reply_to_message.from_user:
         u = message.reply_to_message.from_user
         if u.is_bot:
-            await message.reply("Себя не жарю. Я и так горяч.")
+            await temp_reply(message, "Себя не жарю. Я и так горяч.")
             return
         target_id, target_name = u.id, u.first_name or u.username
     elif command.args and command.args.strip().startswith("@"):
         found = await db.find_user(chat_id, command.args.strip().split()[0])
         if not found:
-            await message.reply("Не знаю такого. Пусть сначала что-нибудь напишет в чат.")
+            await temp_reply(message, "Не знаю такого. Пусть сначала что-нибудь напишет в чат.")
             return
         target_id, target_name = found
     elif message.from_user:
         target_id, target_name = message.from_user.id, _name(message)
 
     if await db.is_optout(chat_id, target_id):
-        await message.reply("Этот человек попросил его не трогать. Уважаю (нет, но правила есть правила).")
+        await temp_reply(message, "Этот человек попросил его не трогать. Уважаю (нет, но правила есть правила).")
         return
     rows = await db.recent_messages(chat_id, limit=40, user_id=target_id)
     dossier = await db.get_dossier(chat_id, target_id)
     if len(rows) < 5 and not dossier:
-        await message.reply(f"Про {html.escape(target_name or 'него')} я пока мало знаю. Пусть поболтает — потом поговорим.")
+        await temp_reply(message, f"Про {html.escape(target_name or 'него')} я пока мало знаю. Пусть поболтает — потом поговорим.")
         return
     _last_roast[chat_id] = now
     await _remember_lines(db, chat_id)
@@ -672,7 +674,7 @@ async def cmd_roast(message: Message, command: CommandObject, bot: Bot, db: Data
         logger.warning("roast failed: %s", e)
         text = ""
     if not text:
-        await message.reply("Что-то я сегодня не в форме. Попробуй позже.")
+        await temp_reply(message, "Что-то я сегодня не в форме. Попробуй позже.")
         return
     await _say(bot, chat_id, f"🔥 Прожарка: {target_name}\n\n{text}", reply_to=message.message_id)
 
@@ -696,14 +698,14 @@ async def _week_digest(bot: Bot, db: Database, chat_id: int) -> bool:
 @router.message(Command("week"))
 async def cmd_week(message: Message, bot: Bot, db: Database) -> None:
     if not await _enabled(db) or not ai.available():
-        await message.reply("Стёб-бот сейчас выключен.")
+        await temp_reply(message, "Стёб-бот сейчас выключен.")
         return
     if _bunker_active(message.chat.id):
-        await message.reply("Идёт игра — итоги недели после партии.")
+        await temp_reply(message, "Идёт игра — итоги недели после партии.")
         return
     now = time.time()
     if now - _last_week_cmd.get(message.chat.id, 0) < WEEK_COOLDOWN:
-        await message.reply("Итоги недели уже подводили. Не чаще раза в час.")
+        await temp_reply(message, "Итоги недели уже подводили. Не чаще раза в час.")
         return
     _last_week_cmd[message.chat.id] = now
     await bot.send_chat_action(message.chat.id, "typing")
@@ -713,7 +715,7 @@ async def cmd_week(message: Message, bot: Bot, db: Database) -> None:
         logger.warning("week digest failed: %s", e)
         ok = False
     if not ok:
-        await message.reply("Маловато вы общались на этой неделе, подводить нечего.")
+        await temp_reply(message, "Маловато вы общались на этой неделе, подводить нечего.")
 
 
 # ---------- все сообщения группы ----------
@@ -1360,8 +1362,18 @@ async def _clown_of_day(bot: Bot, db: Database, chat_id: int) -> bool:
 async def cmd_clowns(message: Message, db: Database) -> None:
     rows = await db.clown_top(message.chat.id)
     if not rows:
-        await message.reply("Клоунов ещё не выбирали. Первый — сегодня в 21:00 🤡")
+        await temp_reply(message, "Клоунов ещё не выбирали. Первый — сегодня в 21:00 🤡")
         return
+    total = sum(c for _uid, c in await db.clown_counts(message.chat.id))
+    try:  # таблица — картинкой с результатами
+        from aiogram.types import BufferedInputFile
+
+        from cards import render_clowns
+        png = await asyncio.to_thread(render_clowns, rows, total)
+        await message.answer_photo(BufferedInputFile(png, filename="clowns.png"), caption="🤡 Таблица позора")
+        return
+    except Exception as e:
+        logger.warning("clowns card failed: %s", e)
     medals = ["🥇", "🥈", "🥉"]
     lines = ["🤡 <b>ТАБЛИЦА ПОЗОРА</b>", "━━━━━━━━━━━━━━━", ""]
     for i, (name, count) in enumerate(rows):

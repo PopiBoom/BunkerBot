@@ -24,6 +24,8 @@ import ai
 from database import Database
 from handlers import roast as R
 
+from ephemeral import temp_reply
+
 logger = logging.getLogger("fun")
 router = Router(name="fun")
 router.message.filter(F.chat.type.in_({"group", "supergroup"}))
@@ -100,13 +102,13 @@ async def launch_poll(bot: Bot, db: Database, chat_id: int, auto: bool = False) 
 async def cmd_poll(message: Message, bot: Bot, db: Database) -> None:
     chat_id = message.chat.id
     if not await R._enabled(db) or not ai.available():
-        await message.reply("Стёб-бот сейчас выключен.")
+        await temp_reply(message, "Стёб-бот сейчас выключен.")
         return
     if R._bunker_active(chat_id):
-        await message.reply("Идёт игра — опросы после партии 🗳")
+        await temp_reply(message, "Идёт игра — опросы после партии 🗳")
         return
     if time.time() - _last_poll.get(chat_id, 0) < POLL_COOLDOWN:
-        await message.reply("Один опрос уже висит — дождитесь итогов.")
+        await temp_reply(message, "Один опрос уже висит — дождитесь итогов.")
         return
     _last_poll[chat_id] = time.time()
     try:
@@ -117,7 +119,7 @@ async def cmd_poll(message: Message, bot: Bot, db: Database) -> None:
         why = "Не вышло запустить опрос. Попробуй позже."
     if why:
         _last_poll.pop(chat_id, None)
-        await message.reply(why)
+        await temp_reply(message, why)
 
 
 async def finish_polls(bot: Bot, db: Database) -> None:

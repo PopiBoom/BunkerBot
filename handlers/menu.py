@@ -181,7 +181,12 @@ async def run_action(action: str, call: CallbackQuery, bot: Bot, db: Database, c
     run = actions.get(action)
     if run is None:
         return
+    from ephemeral import TEMP_COMMANDS, TTL, auto_delete
+
+    token = auto_delete.set(TTL if action in TEMP_COMMANDS else 0)  # ответы-справки удалятся через минуту
     try:
         await run()
     except Exception:
         logger.exception("menu action %s failed", action)
+    finally:
+        auto_delete.reset(token)

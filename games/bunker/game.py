@@ -39,6 +39,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import ai
 from database import Database
+from ephemeral import delete_later, temp_reply
 
 from . import content as C
 from . import render as R
@@ -678,12 +679,12 @@ async def cmd_bunker(message: Message, command: CommandObject, db: Database) -> 
 
     existing = games.get(chat_id)
     if existing and existing.phase != "ended":
-        await message.answer("В этом чате уже идёт игра в Бункер. Доиграйте или /bunker_stop.")
+        await temp_reply(message, "В этом чате уже идёт игра в Бункер. Доиграйте или /bunker_stop.")
         return
     from games import active, load_channel_posts
 
     if active(chat_id) == "mafia":
-        await message.answer("В этом чате идёт Мафия. Доиграйте или /mafia_stop.")
+        await temp_reply(message, "В этом чате идёт Мафия. Доиграйте или /mafia_stop.")
         return
     await load_channel_posts(db, chat_id)  # чтобы не удалять комментарии к постам канала
 
@@ -712,8 +713,8 @@ async def _lobby_timer(bot: Bot, game: Game) -> None:
     if games.get(game.chat_id) is not game or game.phase != "lobby":
         return
     _end_game(game)
-    await _edit(bot, game.chat_id, game.lobby_msg_id,
-                "⌛ Лобби закрыто — игра так и не началась.\n/bunker — собрать заново.")
+    await _edit_lobby(bot, game, "⌛ Лобби закрыто — игра так и не началась.\n/bunker — собрать заново.")
+    delete_later(bot, game.chat_id, game.lobby_msg_id)
 
 
 @router.message(CommandStart(deep_link=True, magic=F.args.func(lambda a: bool(a) and a.startswith("bk_"))))
@@ -968,6 +969,7 @@ async def cb_cancel(call: CallbackQuery) -> None:
     await call.answer("Игра отменена.")
     if call.message:
         await _edit_lobby(call.bot, game, "❌ Игра в Бункер отменена.")
+        delete_later(call.bot, game.chat_id, game.lobby_msg_id)  # через минуту уберём из чата
 
 
 @router.callback_query(F.data == "bk:start")

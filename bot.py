@@ -22,6 +22,7 @@ from commands import (ADMIN_SECTION, GROUP_SECTIONS, PRIVATE_SECTIONS, PUBLIC_CO
                       PUBLIC_PRIVATE_SECTIONS, command_name, menu)
 from config import load_config
 from dashes import NoLongDashes
+from ephemeral import TEMP_COMMANDS, TTL, TempReplies, auto_delete
 from database import Database
 from games import bunker_router, flag_loop, hush, mafia_router, note_channel_post
 from handlers import (admin_router, compare_router, fun_router, help_router, menu_router, quotes_router,
@@ -94,6 +95,12 @@ class AdminOnlyCommands(BaseMiddleware):
                 await event.delete()
             except Exception:  # нет права удалять — просто выполняем команду
                 pass
+            if cmd in TEMP_COMMANDS:  # служебная команда: её ответы в чате удалятся через минуту
+                token = auto_delete.set(TTL)
+                try:
+                    return await handler(event, data)
+                finally:
+                    auto_delete.reset(token)
         return await handler(event, data)
 
 
@@ -109,6 +116,7 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML, allow_sending_without_reply=True),
     )
     bot.session.middleware(NoLongDashes())  # «-» вместо «—» во всём, что бот отправляет
+    bot.session.middleware(TempReplies())   # служебные ответы в чате удаляются через минуту
     db = Database(config.db_path)
     await db.init()
     import ai

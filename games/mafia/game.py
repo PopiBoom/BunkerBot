@@ -40,6 +40,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import ai
 from database import Database
+from ephemeral import delete_later, temp_reply
 
 from . import content as C
 from . import render as R
@@ -554,7 +555,7 @@ async def cmd_mafia(message: Message, command: CommandObject, db: Database) -> N
 
     busy = active(chat_id)
     if busy:
-        await message.answer("В этом чате уже идёт " + ("Мафия. Доиграйте или /mafia_stop." if busy == "mafia"
+        await temp_reply(message, "В этом чате уже идёт " + ("Мафия. Доиграйте или /mafia_stop." if busy == "mafia"
                                                          else "Бункер. Доиграйте или /bunker_stop."))
         return
     from games import load_channel_posts
@@ -584,6 +585,7 @@ async def _lobby_timer(bot: Bot, game: Game) -> None:
     _end_game(game)
     await _edit_lobby(bot, game, "⌛ Лобби Мафии закрыто — игра так и не началась.\n"
                                                       "/mafia — собрать заново.")
+    delete_later(bot, game.chat_id, game.lobby_msg_id)
 
 
 @router.message(Command("mafia_bots"))
@@ -734,6 +736,7 @@ async def cb_cancel(call: CallbackQuery) -> None:
     await call.answer("Игра отменена.")
     if call.message:
         await _edit_lobby(call.bot, game, "❌ Мафия отменена.")
+        delete_later(call.bot, game.chat_id, game.lobby_msg_id)  # через минуту уберём из чата
 
 
 @router.callback_query(F.data == "mf:start")
