@@ -8,7 +8,7 @@ from __future__ import annotations
 # (раздел, [(команда, коротко для меню, подробно для /help)])
 GROUP_SECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
     ("🏚 Бункер", [
-        ("bunker", "начать игру (злой / добрый / кринж)",
+        ("bunker", "начать бункер (злой / добрый / кринж)",
          "собрать лобби и начать партию. Режим ведущего: /bunker злой, /bunker добрый, /bunker кринж"),
         ("bunker_stop", "остановить игру (только ведущий)", "остановить идущую партию — может только тот, кто её создал"),
         ("top", "рейтинг и звания · ответом — профиль",
@@ -87,6 +87,10 @@ ADMIN_SECTION: tuple[str, list[tuple[str, str, str]]] = ("🛠 Админ", [
 ])
 
 
+# Меню «/» в чате — только главное (просьба владельца: длинный список неудобен). Остальные команды
+# работают, если набрать руками, и все расписаны по разделам в /help.
+GROUP_MENU = ("bunker", "mafia", "roast", "poll", "quote", "stats", "help")
+
 # Команды, доступные ВСЕМ. Остальные — только админам (ADMIN_IDS): чужие бот молча игнорирует.
 #   start — проверка подписки и вход в «Бункер» по кнопке «Вступить» (без неё никто не вступит в игру).
 # /forget_me и /remember_me — тоже только админ, зато он может применить их к любому (ответом или @ником).
@@ -108,14 +112,17 @@ def command_name(text: str) -> str | None:
     return text.split()[0][1:].split("@")[0].lower() or None
 
 
-def menu(sections) -> list[tuple[str, str]]:
-    """[(команда, описание для меню)] — эмодзи раздела в начале описания."""
-    out = []
+def menu(sections, only=None) -> list[tuple[str, str]]:
+    """[(команда, описание для меню)] — эмодзи раздела в начале описания.
+    only — оставить только эти команды и в этом порядке."""
+    out = {}
     for title, items in sections:
         emoji = title.split()[0]
         for cmd, short, _long in items:
-            out.append((cmd, f"{emoji} {short}"[:256]))
-    return out
+            out.setdefault(cmd, f"{emoji} {short}"[:256])
+    if only is None:
+        return list(out.items())
+    return [(c, out[c]) for c in only if c in out]
 
 
 def help_text(sections) -> str:
@@ -127,5 +134,5 @@ def help_text(sections) -> str:
         parts.append(f"\n<b>{html.escape(title)}</b>")
         for cmd, _short, long in items:
             parts.append(f"/{cmd} — {html.escape(long)}")
-    parts.append("\n<i>Подсказка: набери «/» — команды появятся в меню.</i>")
+    parts.append("\n<i>В меню «/» — только главное, остальные команды набирай руками.</i>")
     return "\n".join(parts)

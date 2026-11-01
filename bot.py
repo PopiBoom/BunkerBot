@@ -18,7 +18,7 @@ from aiogram.types import (
     Message,
 )
 
-from commands import (ADMIN_SECTION, GROUP_SECTIONS, PRIVATE_SECTIONS, PUBLIC_COMMANDS, PUBLIC_GROUP_SECTIONS,
+from commands import (ADMIN_SECTION, GROUP_MENU, GROUP_SECTIONS, PRIVATE_SECTIONS, PUBLIC_COMMANDS, PUBLIC_GROUP_SECTIONS,
                       PUBLIC_PRIVATE_SECTIONS, command_name, menu)
 from config import load_config
 from dashes import NoLongDashes
@@ -43,7 +43,7 @@ async def set_commands(bot: Bot, config, db: Database) -> None:
         return [BotCommand(command=c, description=d) for c, d in menu(sections)]
 
     admin_private = cmds(PRIVATE_SECTIONS[:-1] + [ADMIN_SECTION] + PRIVATE_SECTIONS[-1:])
-    admin_group = cmds(GROUP_SECTIONS)
+    admin_group = [BotCommand(command=c, description=d) for c, d in menu(GROUP_SECTIONS, only=GROUP_MENU)]
     try:
         await bot.set_my_commands(cmds(PUBLIC_PRIVATE_SECTIONS), scope=BotCommandScopeAllPrivateChats())
         if PUBLIC_GROUP_SECTIONS:
