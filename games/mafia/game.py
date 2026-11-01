@@ -5,7 +5,7 @@
   (мафия знает своих) → обложка с городом и составом →
   НОЧЬ: чат закрыт — все сообщения удаляются; ходы кнопками в ЛС по очереди: Доктор лечит (себя — раз
   за игру, одного — не две ночи подряд) → Комиссар проверяет «мафия или нет» → мафия голосует за жертву
-  (выбор окончательный, семья видит голоса друг друга, при равенстве решает Дон) и Дон ищет Комиссара.
+  (выбор окончательный, семья видит голоса друг друга, при равенстве решает Дон).
   Шаг кончается, как только все его роли сходили (или по таймеру); в чате — «Доктор сделал выбор» и т.п. →
   УТРО: сводка ведущего, роль убитого открывается; убитому бот пишет в ЛС — может прислать одно
   сообщение «последнего слова», бот перешлёт его в чат (игра его не ждёт) →
@@ -86,7 +86,7 @@ class Player:
     fate_no: int = 0
     healed_self: bool = False     # Доктор уже лечил себя
     last_heal: int | None = None  # кого Доктор лечил прошлой ночью
-    checks: list[tuple[str, str]] = field(default_factory=list)  # проверки Комиссара/Дона: (имя, итог)
+    checks: list[tuple[str, str]] = field(default_factory=list)  # проверки Комиссара: (имя, итог)
     night_msgs: dict[int, str] = field(default_factory=dict)     # открытые сообщения с кнопками в ЛС: id -> вид
 
 
@@ -110,7 +110,6 @@ class Game:
     night_event: asyncio.Event | None = None
     dealt: bool = False           # роли розданы — кнопка «Моя роль» работает
     kill_votes: dict[int, int] = field(default_factory=dict)  # мафиози -> жертва
-    don_target: int | None = None
     sheriff_target: int | None = None
     heal: int | None = None
     # день
@@ -430,7 +429,7 @@ def _lobby_text(game: Game) -> str:
         dm = " — <i>не открыл бота</i>" if not (p.dm_ok or p.is_bot) else ""
         lines.append(f"• {_e(p.name)}{host}{dm}")
     if n >= MIN_PLAYERS:
-        lines += ["", f"Состав: {C.composition(C.deal_roles(n))}"]
+        lines += ["", "<b>Состав</b>", C.composition_list(C.deal_roles(n))]
     lines += ["", "Жми «Вступить в игру» — откроется бот, нажми Start. Роль придёт в личку."]
     return "\n".join(lines)
 
@@ -850,7 +849,7 @@ async def _run_game(bot: Bot, game: Game) -> None:
         pass
 
     mafia_n = sum(1 for r in roles if C.team(r) == "mafia")
-    caption = f"🕵️ <b>{_e(game.city)}</b>\n\nСостав: {comp}"
+    caption = f"🕵️ <b>{_e(game.city)}</b>\n\n<b>Состав</b>\n{C.composition_list(roles)}"
     kb = InlineKeyboardMarkup(inline_keyboard=[[_btn("Моя роль", "mf:role")]])
     try:
         png = await asyncio.to_thread(R.render_cover, game.city, intro_text, len(players), mafia_n, game.serial)
@@ -966,9 +965,6 @@ async def _step_actions(bot: Bot, game: Game, p: Player, step: str) -> None:
 
     if step == "mafia":
         await send("kill", _kill_text(game, p), "mfk", _kill_targets(game))
-        if p.role == "don":
-            await send("don", f"<b>Ночь {game.no} — кого проверим?</b>\nУзнаешь сразу, Комиссар он или нет.",
-                       "mfd", [o for o in _alive(game) if not _is_mafia(o)])
     elif step == "sheriff":
         await send("sheriff", f"<b>Ночь {game.no} — кого проверяем?</b>\nУзнаешь сразу: мафия или нет.",
                    "mfs", [o for o in _alive(game) if o is not p])
@@ -986,8 +982,6 @@ def _step_done(game: Game, step: str) -> bool:
     for p in _alive(game):
         if step == "mafia":
             if _is_mafia(p) and p.user_id not in game.kill_votes and _kill_targets(game):
-                return False
-            if p.role == "don" and game.don_target is None and _kill_targets(game):
                 return False
         elif step == "sheriff" and p.role == "sheriff" and game.sheriff_target is None:
             return False
@@ -1034,7 +1028,7 @@ async def _night_step(bot: Bot, game: Game, step: str) -> None:
 async def _night(bot: Bot, game: Game) -> None:
     game.no += 1
     game.phase = "night"
-    game.kill_votes, game.don_target, game.sheriff_target, game.heal = {}, None, None, None
+    game.kill_votes, game.sheriff_target, game.heal = {}, None, None
     game.night_step = ""
     for p in game.players.values():
         p.night_msgs = {}
@@ -1090,32 +1084,6 @@ async def cb_kill(call: CallbackQuery) -> None:
     game.kill_votes[p.user_id] = target.user_id
     await call.answer(f"Твой выбор: {target.name}")
     await _refresh_kill(call.bot, game)
-    _check_done(game)
-
-
-@router.callback_query(F.data.startswith("mfd:"))
-async def cb_don_check(call: CallbackQuery) -> None:
-    ctx = await _night_call(call, "mafia")
-    if not ctx:
-        return
-    game, p, target = ctx
-    if p.role != "don":
-        await call.answer("Это не твой ход.", show_alert=True)
-        return
-    if game.don_target is not None:
-        await call.answer("Этой ночью ты уже проверял.", show_alert=True)
-        return
-    game.don_target = target.user_id
-    res = "Комиссар!" if target.role == "sheriff" else "не Комиссар"
-    p.checks.append((target.name, res))
-    await call.answer(f"{target.name} — {res}", show_alert=True)
-    if call.message:
-        p.night_msgs.pop(call.message.message_id, None)
-        await _edit(call.bot, p.user_id, call.message.message_id,
-                    f"Ночь {game.no}, проверка: <b>{_e(target.name)}</b> — {res}")
-    for o in _alive(game):  # семья узнаёт находку Дона
-        if o is not p and _is_mafia(o):
-            await _dm(call.bot, o, f"Дон проверил <b>{_e(target.name)}</b>: {res}")
     _check_done(game)
 
 
@@ -1183,10 +1151,6 @@ async def _bots_step(bot: Bot, game: Game, step: str) -> None:
                 game.kill_votes[p.user_id] = (human[0] if human and random.random() < 0.7
                                               else random.choice(targets).user_id)
                 _schedule(bot, game, "kill", lambda: _refresh_kill(bot, game))
-            if p.role == "don" and targets:
-                t = random.choice(targets)
-                game.don_target = t.user_id
-                p.checks.append((t.name, "Комиссар!" if t.role == "sheriff" else "не Комиссар"))
         elif step == "sheriff":
             others = [o for o in _alive(game) if o is not p]
             if others:
@@ -1314,7 +1278,7 @@ async def _morning(bot: Bot, game: Game) -> None:
 def _day_text(game: Game, left: float | None = None) -> str:
     alive = _alive(game)
     lines = [f"☀️ <b>ДЕНЬ {game.no}</b>", HR, "",
-             f"В живых: {len(alive)} — " + ", ".join(_e(p.name) for p in alive), "",
+             f"<b>В живых — {len(alive)}</b>"] + [f"• {_e(p.name)}" for p in alive] + ["",
              "Обсуждаем, кто мафия."]
     if left is not None:
         lines += ["", f"До голосования: <b>{_clock(left)}</b>"]

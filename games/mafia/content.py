@@ -11,8 +11,7 @@ __all__ = ["MODE_ALIASES", "MODE_ORDER", "MODE_VOICE", "MODES"]
 # роль: (название, эмодзи, команда, что делает)
 ROLES: dict[str, tuple[str, str, str, str]] = {
     "don": ("Дон", "🎩", "mafia",
-            "Глава мафии. Ночью вместе с семьёй выбираешь, кого убрать, — при равенстве голосов решаешь ты. "
-            "А ещё каждую ночь ищешь Комиссара: проверяешь одного игрока."),
+            "Глава мафии. Ночью вместе с семьёй выбираешь, кого убрать, — при равенстве голосов решаешь ты."),
     "mafia": ("Мафия", "🔫", "mafia",
               "Ночью вместе с семьёй выбираешь, кого убрать. Днём притворяешься честным горожанином."),
     "sheriff": ("Комиссар", "⭐", "town",
@@ -80,6 +79,20 @@ def composition(roles: list[str]) -> str:
     if civ:
         parts.append(f"{civ} {_plural(civ, 'мирный', 'мирных', 'мирных')}")
     return ", ".join(parts)
+
+
+def composition_list(roles: list[str]) -> str:
+    """Состав столбиком — для лобби и обложки."""
+    m = sum(1 for r in roles if team(r) == "mafia")
+    civ = roles.count("civ")
+    rows = [f"• Мафия — {m}" + (", из них Дон" if "don" in roles else "")]
+    if "sheriff" in roles:
+        rows.append("• Комиссар")
+    if "doctor" in roles:
+        rows.append("• Доктор")
+    if civ:
+        rows.append(f"• Мирные — {civ}")
+    return "\n".join(rows)
 
 
 # ---------- без ИИ ----------
