@@ -623,16 +623,19 @@ SHIP_X_SLANG = [
 ]
 
 
-def _ship_spice(b: str) -> str:
-    """Случайная порция жести на эту реплику — каждый раз разная."""
+def _ship_spice(b: str, photo: bool = False) -> str:
+    """Случайная порция жести на эту реплику — каждый раз разная. photo — шутка по фото: место и сценарий
+    берутся с картинки, поэтому мест и штампов из списка не даём (иначе ИИ брал «гардероб» вместо кустов с фото)."""
     wants = "; ".join(w.replace("X", b) for w in random.sample(SHIP_X_WANTS, 3))
+    where = ("" if photo else f"где — {'; '.join(random.sample(SHIP_X_PLACES, 2))}; "
+             f"штамп — {random.choice(SHIP_X_TROPES)}; ")
     return (f"Материал на этот раз (возьми одно-два, переделай под их слова, не копируй дословно): желания — {wants}; "
-            f"где — {'; '.join(random.sample(SHIP_X_PLACES, 2))}; штамп — {random.choice(SHIP_X_TROPES)}; "
-            f"улики — {'; '.join(random.sample(SHIP_X_TELLS, 2))}; глаголы вместо «потрахайтесь» — "
-            f"{', '.join(random.sample(SHIP_X_SLANG, 4))}. ")
+            f"{where}улики — {'; '.join(random.sample(SHIP_X_TELLS, 2))}; глаголы вместо «потрахайтесь» — "
+            f"{', '.join(random.sample(SHIP_X_SLANG, 4))}. "
+            + ("Место и сценарий — ТОЛЬКО с фото, не из головы. " if photo else ""))
 
 
-def ship_text(a: str, b: str, explicit: bool = False) -> str:
+def ship_text(a: str, b: str, explicit: bool = False, photo: bool = False) -> str:
     """explicit — оба из пары САМИ нажали «🔞 Я за» (handlers/roast: согласие на шиппинг без тормозов)."""
     base = (f"Шиппинг (правило бати, ОБЯЗАТЕЛЬНО): «{a}» и «{b}» — «парочка чата». Весь твой ответ — жёсткий "
             "шиппинг 18+ с матом, а не обычный подкол. В КАЖДОЙ реплике — прямой посыл в лоб: «потрахайтесь "
@@ -650,7 +653,7 @@ def ship_text(a: str, b: str, explicit: bool = False) -> str:
             "пошлый намёк (написал «зануда» — «на каждое твоё «зануда» у него встаёт»). Призыв в конце — каждый раз "
             "другой глагол из списка ниже; «ебитесь уже, весь чат ждёт» и «снимите комнату» НЕ пиши — это уже "
             "заезжено. Обращайся к обоим или упоминай второго по имени. "
-            + _ship_spice(b) +
+            + _ship_spice(b, photo) +
             "Нельзя даже тут: анатомические подробности и описание процесса, насилие и «без спроса», возраст, "
             "родня, деньги за секс, внешность и ориентация. Пол — как в заметке о поле, не знаешь — пиши без "
             "рода (настоящее время). Не объясняй, что это шиппинг.")
@@ -691,13 +694,15 @@ async def ship_comment(a_name: str, a_text: str, b_name: str, b_text: str | None
     said = (f"«{a_name}» ответил на сообщение «{b_name}».\n«{b_name}» писал: <msg>{b_text[:300]}</msg>\n"
             f"«{a_name}» ответил: <msg>{a_text[:300]}</msg>\n" if b_text is not None else
             f"«{a_name}» написал: <msg>{a_text[:400]}</msg>\n")
-    photo = ("Фото (или кадр видео), которое прислал «" + a_name + "», приложено — посмотри его"
-             + (f" (на нём: «{seen}»)" if seen else "") + ". Шиппинг — ПО ФОТО: свяжи то, что на нём (место, "
-             "вещи, еда, поза, ситуация, надпись), с ними двумя — зачем он это прислал, на что намекает, что "
-             "второй с этим сделает. Не пересказывай фото — все его видят: одна деталь внутри шутки. Внешность "
-             "людей на фото не трогай.\n" if image else "")
+    photo = ("«" + a_name + "» прислал фото (или кадр видео) — оно приложено, посмотри"
+             + (f" (на нём: «{seen}»)" if seen else "") + ". Шутка строится ИЗ ФОТО: возьми то, что на нём (место, "
+             "вещь, еду, ситуацию, надпись), и преврати в пошлый смысл про них двоих — зачем он прислал ИМЕННО это, "
+             "что они там будут делать, на что это намёк (кусты — «уже присмотрел кусты, где вас никто не увидит»; "
+             "кровать — «это приглашение, а не фото»; еда — кто кого вместо неё съест). Место и сценарий — С ФОТО. "
+             "Не пиши «ты это фото скинул», «кидаешь фотку с …» и не перечисляй, что на нём, — сразу шути через "
+             "это. Внешность людей на фото не трогай.\n" if image else "")
     # ship_note ставит handlers/roast._ship_line — там же решено, без тормозов или нет (согласие пары)
-    rules = ship_note.get() or ship_text(a_name, b_name)
+    rules = ship_note.get() or ship_text(a_name, b_name, photo=image is not None)
     user = (
         f"Контекст чата:\n{_msgs_block(context)}\n{said}{photo}{rules}\n"
         "Одна короткая реплика (до 25 слов): жёстко пошиппери их по смыслу этого сообщения, как будто ты "
@@ -1164,7 +1169,9 @@ async def polish(reply: str, trigger: str, context: list[dict] | None = None,
         out = "" if _garbled(reply) else reply
     out = scrub(drop_echo(out, trigger))
     seen = seen or _seen_from(trigger)
-    if out and seen and retells(out, seen):  # «чипсы, пирожки и кола — …» — пересказ фото, переписываем
+    # «чипсы, пирожки и кола — …» — пересказ фото, переписываем. Шиппинг по фото строится ИЗ фото —
+    # там пара деталей с картинки нормальна, переписываем только явный перечень
+    if out and seen and retells(out, seen, max_shared=4 if ship else 1):
         logger.info("reply retells the picture, rewriting: %s", out)
         try:
             out = scrub(await drop_retell(out, seen, author, max_words=max_words))

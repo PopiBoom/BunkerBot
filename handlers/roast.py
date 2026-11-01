@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import html
 import json
 import logging
@@ -357,12 +359,41 @@ TYPE_SPEED = 18          # символов в секунду — «печата
 SPLIT_CHANCE = 0.35     # иногда разбивает ответ на два сообщения: подкол, потом добивка
 
 
+# Сколько бот уже «печатал», пока думал (ставит _typing_on): столько не ждём второй раз перед отправкой
+_typed_since: contextvars.ContextVar[float] = contextvars.ContextVar("typed_since", default=0.0)
+
+
 async def _typing(bot: Bot, chat_id: int, text: str, lo: float, hi: float) -> None:
     try:
         await bot.send_chat_action(chat_id, "typing")
     except Exception:
         pass
-    await asyncio.sleep(max(lo, min(hi, len(text) / TYPE_SPEED)))
+    wait = max(lo, min(hi, len(text) / TYPE_SPEED))
+    started = _typed_since.get()
+    if started:  # «печатает…» уже висело, пока ИИ думал — не заставляем ждать ещё раз
+        _typed_since.set(0.0)
+        wait = max(0.0, wait - (time.time() - started))
+    await asyncio.sleep(wait)
+
+
+@contextlib.asynccontextmanager
+async def _typing_on(bot: Bot, chat_id: int):
+    """«Печатает…» сразу и всё время, пока бот думает (Telegram гасит его через ~5 сек — обновляем)."""
+    async def keep() -> None:
+        while True:
+            try:
+                await bot.send_chat_action(chat_id, "typing")
+            except Exception:
+                pass
+            await asyncio.sleep(4)
+
+    task = asyncio.create_task(keep())
+    token = _typed_since.set(time.time())
+    try:
+        yield
+    finally:
+        task.cancel()
+        _typed_since.reset(token)
 
 
 async def _say_human(bot: Bot, chat_id: int, text: str, reply_to: int | None = None) -> None:
@@ -739,7 +770,7 @@ SHIP_STREAK = 5             # если переписка идёт потоко�
 SHIP_PAUSE = 5 * 60         # …бот молчит 5 минут; поток кончился (тишина дольше паузы) — счёт заново
 _ship_state: dict[int, dict] = {}
 _ship_debug: dict[int, str] = {}   # чат -> что было с последним ответом «одного другому» (видно в /ship)
-SHIP_GATHER = 6.0           # сек: пара пишет друг другу пачкой — ждём и отвечаем ОДИН раз, на последнее (просьба бати)
+SHIP_GATHER = 3.0           # сек: пара пишет друг другу пачкой — ждём и отвечаем ОДИН раз, на последнее (просьба бати)
 SHIP_GAP = 60               # сек: после подкола паре (любым путём) — следующий не раньше
 _ship_pending: dict[int, dict] = {}  # чат -> собираемая пачка сообщений пары {"msgs": [...]}
 _ship_last: dict[int, float] = {}    # чат -> когда бот последний раз шипперил пару
@@ -826,7 +857,7 @@ async def _ship_line(db: Database, chat_id: int, me: str, partner: str, text: st
     out = ""
     # и автор, и редактор знают: шутка про парочку — так надо; после — снимаем, чтобы не утекло
     explicit = await _ship_explicit(db, chat_id)
-    token = ai.ship_note.set(ai.ship_text(me, partner, explicit=explicit))
+    token = ai.ship_note.set(ai.ship_text(me, partner, explicit=explicit, photo=image is not None))
     try:
         await _remember_lines(db, chat_id)
         ctx = _as_dicts(await db.recent_messages(chat_id, limit=15))
@@ -908,6 +939,10 @@ async def _maybe_ship(message: Message, bot: Bot, db: Database,
                                        else "[голосовое]" if m.voice else "[без текста]")
 
     async def run() -> None:
+        async with _typing_on(bot, chat_id):  # «печатает…» сразу, пока собираем пачку и думаем
+            await gather_and_reply()
+
+    async def gather_and_reply() -> None:
         await asyncio.sleep(SHIP_GATHER)  # ждём, не напишут ли друг другу ещё
         if _ship_pending.get(chat_id) is not mine:  # уже ответили другим путём (обращение к боту)
             return
@@ -1200,12 +1235,9 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     _pending[chat_id] = {"items": [(message, rude)]}
     try:
         await asyncio.sleep(random.uniform(*REPLY_DELAY))
-        try:
-            await bot.send_chat_action(chat_id, "typing")
-        except Exception:
-            pass
         items = _pending[chat_id]["items"]
-        await _reply_once(bot, db, chat_id, items, config)
+        async with _typing_on(bot, chat_id):  # «печатает…» держится, пока ИИ думает
+            await _reply_once(bot, db, chat_id, items, config)
     finally:
         _pending.pop(chat_id, None)
 
@@ -1749,14 +1781,11 @@ async def _ship_photo(message: Message, bot: Bot, db: Database, shipped: tuple[s
         if time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
             return
     _ship_sent(chat_id)  # пока пишем — другие пути паре не отвечают
-    try:
-        await bot.send_chat_action(chat_id, "typing")
-    except Exception:
-        pass
     img, mime, descr = media
-    line = await _ship_line(db, chat_id, shipped[0], shipped[1], said, image=(img, mime), seen=descr)
-    _ship_debug[chat_id] = f"{_msk_time()} {shipped[0]} (фото): шиппинг отправлен"
-    await _say_human(bot, chat_id, line, reply_to=message.message_id)
+    async with _typing_on(bot, chat_id):
+        line = await _ship_line(db, chat_id, shipped[0], shipped[1], said, image=(img, mime), seen=descr)
+        _ship_debug[chat_id] = f"{_msk_time()} {shipped[0]} (фото): шиппинг отправлен"
+        await _say_human(bot, chat_id, line, reply_to=message.message_id)
     _ship_sent(chat_id)
 
 
