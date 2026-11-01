@@ -66,6 +66,8 @@ class Player:
     is_bot: bool = False
     tribe: str = ""
     color: tuple[int, int, int] = (200, 200, 200)
+    icon: str = ""
+    jail: int = 0         # сколько своих ходов ещё сидит в СИЗО
     cash: int = C.START_CASH
     pos: int = 0
     out: bool = False
@@ -261,13 +263,7 @@ def _capital(game: Game, p: Player) -> int:
 
 def _rent(game: Game, cell: int) -> int:
     base = round(C.price(cell) * C.RENT_RATE / 5) * 5
-    n = game.roofs.get(cell, 0)
-    if n:
-        return base * C.ROOF_MULT[n]
-    owner = game.owners.get(cell)
-    if owner is not None and all(game.owners.get(c) == owner for c in C.district_cells(C.district(cell))):
-        return base * C.DISTRICT_MULT
-    return base
+    return base * C.ROOF_MULT[game.roofs.get(cell, 0)]
 
 
 def _release(game: Game, cell: int) -> None:
@@ -311,6 +307,7 @@ def _lobby_text(game: Game) -> str:
                       MAX_PLAYERS, MIN_PLAYERS, _mode_title(game), "Правила",
                       [f"• {C.ROUNDS} кругов, у каждого {_rub(C.START_CASH)} на старте",
                        "• занимай точки города, ставь крыши, бери за вход",
+                       f"• СИЗО - пропуск {C.JAIL_TURNS} ходов",
                        "• сделки с другими - кнопкой до броска",
                        "• побеждает самый большой капитал"])
 
@@ -565,9 +562,9 @@ async def _run_game(bot: Bot, game: Game) -> None:
     game.order = list(game.players)
     random.shuffle(game.order)
     tribes = random.sample(C.TRIBES, len(game.order))
-    for uid, (tribe, color) in zip(game.order, tribes, strict=True):
+    for uid, (tribe, color, icon) in zip(game.order, tribes, strict=True):
         p = game.players[uid]
-        p.tribe, p.color, p.cash, p.pos = tribe, color, C.START_CASH, 0
+        p.tribe, p.color, p.icon, p.cash, p.pos = tribe, color, icon, C.START_CASH, 0
     if game.db:
         try:
             game.serial = int(await game.db.get_setting("nefor_serial", "0") or 0) + 1
@@ -581,7 +578,7 @@ async def _run_game(bot: Bot, game: Game) -> None:
                 f"🎸 <b>НЕФОРЫ В ВОЛГОГРАДЕ</b>\n{HR}\n\nТусовки делят город. У каждого {_rub(C.START_CASH)}, "
                 f"впереди {C.ROUNDS} кругов.\n\n<b>Порядок ходов</b>\n{order}\n\n"
                 f"Встал на свободную точку - можно занять. На чужой - плати за вход. Своя - ставь крышу, "
-                f"вход станет дороже. Весь район у одной тусовки - вход вдвое.\n\n"
+                f"вход станет дороже. Попал в СИЗО - пропускаешь {C.JAIL_TURNS} хода.\n\n"
                 f"Побеждает самый большой капитал: деньги + точки + крыши.")
     await _pause(game, 4)
     for rnd in range(1, C.ROUNDS + 1):
@@ -594,6 +591,17 @@ async def _run_game(bot: Bot, game: Game) -> None:
                 return
             p = game.players[uid]
             if p.out:
+                continue
+            if p.jail:
+                p.jail -= 1
+                game.round_log.append(f"• {_e(p.name)}: сидит в СИЗО")
+                try:
+                    m = await _send(bot, game.chat_id, f"🔒 <b>{_e(p.name)}</b> в СИЗО - пропускает ход"
+                                    + (f" (ещё {p.jail})." if p.jail else ". Следующий ход - уже на свободе."))
+                    game.round_msgs.append(m.message_id)
+                except Exception as e:
+                    logger.info("nefor jail note failed: %s", e)
+                await _pause(game, 2)
                 continue
             await _turn(bot, game, p)
             if len(_alive(game)) <= 1:
@@ -610,9 +618,10 @@ def _standings(game: Game) -> list[Player]:
 
 def _board_png(game: Game) -> bytes:
     return R.render_board(
-        [{"id": p.user_id, "name": p.name, "color": p.color, "cash": p.cash, "capital": _capital(game, p),
-          "pos": p.pos, "out": p.out} for p in game.players.values()],
-        dict(game.owners), dict(game.roofs), game.round_no, C.ROUNDS)
+        [{"id": p.user_id, "name": p.name, "color": p.color, "icon": p.icon, "tribe": p.tribe, "cash": p.cash,
+          "capital": _capital(game, p), "pos": p.pos, "out": p.out, "jail": p.jail} for p in game.players.values()],
+        dict(game.owners), dict(game.roofs), game.round_no, C.ROUNDS,
+        {c: _rent(game, c) for c in game.owners})
 
 
 def _board_caption(game: Game) -> str:
@@ -801,10 +810,9 @@ async def _resolve(bot: Bot, game: Game, p: Player, short: list[str], depth: int
     lines = game.lines
     if kind == "spot":
         owner = game.owners.get(cell)
-        district = C.DISTRICTS[C.district(cell)][0]
         cost = C.price(cell)
         if owner is None:
-            lines.append(f"<b>{_e(name)}</b> ({district}) - точка свободна, {_rub(cost)}.")
+            lines.append(f"<b>{_e(name)}</b> - точка свободна, {_rub(cost)}.")
             if p.cash < cost:
                 lines.append("Денег не хватает - идёт мимо.")
                 return
@@ -865,6 +873,11 @@ async def _resolve(bot: Bot, game: Game, p: Player, short: list[str], depth: int
             lines.append(f"<b>-{_rub(amount)}</b>")
             await _pay(game, p, amount, None, lines, short)
             short.append(f"Пиздюк взял {_rub(amount)}")
+    elif kind == "jail":
+        p.jail = C.JAIL_TURNS
+        lines.append(f"<b>СИЗО.</b> {_e(C.fmt(random.choice(C.JAIL_TEXTS), p.name, p.tribe))} "
+                     f"<b>Пропускает {C.JAIL_TURNS} хода.</b>")
+        short.append("загремел в СИЗО")
     elif kind == "pps":
         lines.append(f"<b>ППС.</b> {_e(C.fmt(random.choice(C.PPS_TEXTS), p.name, p.tribe))} <b>-{_rub(C.PPS_FINE)}</b>")
         await _pay(game, p, C.PPS_FINE, None, lines, short)
@@ -1181,7 +1194,7 @@ async def _finish(bot: Bot, game: Game) -> None:
     ranking = _standings(game)
     win = ranking[0]
     cap = _capital(game, win)
-    rows = [{"name": p.name, "tribe": p.tribe, "color": p.color, "capital": _capital(game, p),
+    rows = [{"name": p.name, "tribe": p.tribe, "color": p.color, "icon": p.icon, "capital": _capital(game, p),
              "spots": len(_spots(game, p.user_id)), "out": p.out} for p in ranking]
     epi = None
     if ai.available():

@@ -211,6 +211,18 @@ def lobby_nefor() -> Image.Image:
     return img
 
 
+def nefor_icons() -> int:
+    """Цветные значки «Нефоров» (точки, тусовки, особые клетки) — PNG 128px в assets/nefor/icons."""
+    from games.nefor import content as NC
+    from games.nefor.render import ICONS
+
+    ICONS.mkdir(parents=True, exist_ok=True)
+    emojis = NC.all_icons() | {"👑"}
+    for e in emojis:
+        emoji(e.replace("\ufe0f", ""), 128).save(ICONS / f"{NC.icon_key(e)}.png", optimize=True)
+    return len(emojis)
+
+
 # ---------- фазы Мафии: ночь / утро (убили или все живы) / день / голосование, с номером ----------
 
 PHASES = ROOT / "assets" / "mafia"
@@ -374,6 +386,7 @@ if __name__ == "__main__":
     save(lobby_bunker(), "bunker", LOBBY)
     save(lobby_mafia(), "mafia", LOBBY)
     save(lobby_nefor(), "nefor", LOBBY)
+    nefor_icons()
     for n in range(1, PHASE_MAX + 1):
         save(phase_night(n), f"night_{n}", PHASES)
         save(phase_morning(n, True), f"morning_kill_{n}", PHASES)
