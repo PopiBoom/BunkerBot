@@ -969,7 +969,7 @@ async def cb_cancel(call: CallbackQuery) -> None:
     await call.answer("Игра отменена.")
     if call.message:
         await _edit_lobby(call.bot, game, "❌ Игра в Бункер отменена.")
-        delete_later(call.bot, game.chat_id, game.lobby_msg_id)  # через минуту уберём из чата
+        delete_later(call.bot, game.chat_id, game.lobby_msg_id)  # мёртвое лобби — уберём из чата
 
 
 @router.callback_query(F.data == "bk:start")

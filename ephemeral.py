@@ -1,9 +1,10 @@
-"""Служебные ответы бота в чате удаляются сами через минуту (просьба владельца): «нет активной игры»,
-«никто ничего не обещал», «игра отменена», таблицы и справки по командам — чтобы не засоряли чат.
+"""Служебные («рабочие») ответы бота в чате удаляются сами через 30 секунд (просьба владельца):
+«нет активной игры», «никто ничего не обещал», «уже идёт игра», текстовые справки и рейтинги —
+чтобы не засоряли чат. Картинки (таблица позора, карточки) остаются — удаляется только текст.
 
 Как устроено: пока выполняется «временная» команда (TEMP_COMMANDS) или отправляется ответ через
 temp_reply(), стоит метка auto_delete; middleware сессии видит её и ставит удаление каждого сообщения,
-отправленного в группу. Остальное (игры, прожарка, цитаты, опросы) не трогается.
+отправленного в группу текстом. Картинки и всё остальное (игры, прожарка, цитаты, опросы) не трогается.
 """
 from __future__ import annotations
 
@@ -15,11 +16,11 @@ from aiogram.client.session.middlewares.base import BaseRequestMiddleware
 
 logger = logging.getLogger("ephemeral")
 
-TTL = 60  # сек, через сколько удалить
+TTL = 30  # сек, через сколько удалить
 # Команды, все ответы которых в чате — служебные (таблицы, статусы, справка)
 TEMP_COMMANDS = {"bunker_stop", "mafia_stop", "bunker_bots", "mafia_bots", "clowns", "promises", "top",
                  "mafia_top", "stats", "help", "forget_me", "remember_me"}
-_SENDS = {"SendMessage", "SendPhoto", "SendDocument", "SendAnimation", "SendSticker"}
+_SENDS = {"SendMessage"}  # только текст: картинки владелец хочет оставлять
 
 auto_delete: contextvars.ContextVar[int] = contextvars.ContextVar("auto_delete", default=0)
 _tasks: set[asyncio.Task] = set()
