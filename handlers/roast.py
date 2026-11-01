@@ -19,7 +19,6 @@ import asyncio
 import contextlib
 import contextvars
 import html
-import json
 import logging
 import os
 import random
@@ -30,8 +29,7 @@ from datetime import datetime, timedelta, timezone
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
-                           MessageReactionUpdated, ReactionTypeEmoji, ReplyParameters)
+from aiogram.types import Message, MessageReactionUpdated, ReactionTypeEmoji, ReplyParameters
 
 import ai
 import frames
@@ -39,7 +37,7 @@ import links
 import rhymes
 from database import Database
 
-from ephemeral import auto_delete, temp_reply
+from ephemeral import temp_reply
 
 logger = logging.getLogger("roast")
 router = Router(name="roast")
@@ -659,385 +657,6 @@ async def cmd_remember_me(message: Message, command: CommandObject, db: Database
         await message.reply(f"😈 {html.escape(name)} снова под наблюдением.")
 
 
-# ---------- шиппинг: бот иногда подкалывает двоих как «парочку чата» (просьба бати) ----------
-
-
-def _ship_key(chat_id: int) -> str:
-    return f"ship:{chat_id}"
-
-
-async def _ship_pair(db: Database, chat_id: int) -> list[tuple[int, str]]:
-    try:
-        pair = json.loads(await db.get_setting(_ship_key(chat_id), "") or "[]")
-        return [(int(u), str(n)) for u, n in pair][:2]
-    except (ValueError, TypeError):
-        return []
-
-
-async def _set_ship(db: Database, chat_id: int, *user_ids: int | None) -> None:
-    """Перед ответом (фото и т.п.): если ответ касается кого-то из пары — просим ИИ их пошипперить (SHIP_CHANCE)."""
-    note = ""
-    pair = await _ship_pair(db, chat_id)
-    if len(pair) == 2 and any(u in {pid for pid, _ in pair} for u in user_ids if u):
-        if random.random() < ai.SHIP_CHANCE:
-            note = ai.ship_text(pair[0][1], pair[1][1], explicit=await _ship_explicit(db, chat_id))
-    ai.ship_note.set(note)
-
-
-# ---------- согласие пары на шиппинг без тормозов (18+) ----------
-# Пошлое «кто кого чего хочет» — только если ОБА из пары сами нажали «🔞 Я за». За другого
-# согласиться нельзя (и админу тоже): кнопка засчитывает только того, кто её нажал. «Я против» — сразу выкл.
-
-
-def _ship_ok_key(chat_id: int) -> str:
-    return f"ship_ok:{chat_id}"
-
-
-async def _ship_consent(db: Database, chat_id: int) -> set[int]:
-    try:
-        return {int(u) for u in json.loads(await db.get_setting(_ship_ok_key(chat_id), "") or "[]")}
-    except (ValueError, TypeError):
-        return set()
-
-
-async def _ship_explicit(db: Database, chat_id: int) -> bool:
-    pair = await _ship_pair(db, chat_id)
-    return len(pair) == 2 and {u for u, _ in pair} <= await _ship_consent(db, chat_id)
-
-
-def _consent_text(pair: list[tuple[int, str]], ok: set[int]) -> str:
-    both = {u for u, _ in pair} <= ok
-    lines = [f"🔞 <b>Шиппинг без тормозов</b>: {html.escape(pair[0][1])} + {html.escape(pair[1][1])}", ""]
-    lines += [f"{'✅' if uid in ok else '⏳'} {html.escape(name)}" for uid, name in pair]
-    if both:
-        lines += ["", "Включён."]
-    return "\n".join(lines)
-
-
-def _consent_kb(pair: list[tuple[int, str]]) -> InlineKeyboardMarkup:
-    ids = f"{pair[0][0]}:{pair[1][0]}"
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔞 Я за", callback_data=f"shipok:{ids}:1"),
-        InlineKeyboardButton(text="🚫 Я против", callback_data=f"shipok:{ids}:0"),
-    ]])
-
-
-async def _send_consent(message: Message, db: Database, pair: list[tuple[int, str]]) -> None:
-    """Сообщение с кнопками согласия. Не служебное: /ship в TEMP_COMMANDS, а это должно остаться в чате."""
-    token = auto_delete.set(0)
-    try:
-        await message.answer(_consent_text(pair, await _ship_consent(db, message.chat.id)),
-                             reply_markup=_consent_kb(pair))
-    finally:
-        auto_delete.reset(token)
-
-
-@router.callback_query(F.data.startswith("shipok:"))
-async def cb_ship_consent(call: CallbackQuery, db: Database) -> None:
-    try:
-        _, a_s, b_s, yes_s = (call.data or "").split(":")
-        ids, yes = {int(a_s), int(b_s)}, yes_s == "1"
-    except ValueError:
-        await call.answer()
-        return
-    if call.message is None:
-        await call.answer()
-        return
-    chat_id = call.message.chat.id
-    pair = await _ship_pair(db, chat_id)
-    if len(pair) != 2 or {u for u, _ in pair} != ids:
-        await call.answer("Эта пара уже не актуальна.", show_alert=True)
-        return
-    uid = call.from_user.id
-    if uid not in ids:
-        await call.answer(f"Это решают только сами {pair[0][1]} и {pair[1][1]} - за другого согласиться нельзя.",
-                          show_alert=True)
-        return
-    ok = await _ship_consent(db, chat_id) & ids
-    (ok.add if yes else ok.discard)(uid)
-    await db.set_setting(_ship_ok_key(chat_id), json.dumps(sorted(ok)))
-    logger.info("ship consent in %s: %s -> %s (now %s)", chat_id, uid, yes, sorted(ok))
-    await call.answer("Записал: ты за." if yes else "Записал: ты против - без тормозов не будет.")
-    try:
-        await call.message.edit_text(_consent_text(pair, ok), reply_markup=_consent_kb(pair))
-    except TelegramBadRequest as e:
-        if "not modified" not in str(e):
-            logger.debug("consent edit failed: %s", e)
-
-
-SHIP_REPLY_CHANCE = 1.0     # один из пары ответил другому — бот влезает с подколом КАЖДЫЙ раз (просьба бати)
-SHIP_STREAK = 5             # если переписка идёт потоком: после 5 подколов подряд…
-SHIP_PAUSE = 5 * 60         # …бот молчит 5 минут; поток кончился (тишина дольше паузы) — счёт заново
-_ship_state: dict[int, dict] = {}
-_ship_debug: dict[int, str] = {}   # чат -> что было с последним ответом «одного другому» (видно в /ship)
-SHIP_GATHER = 3.0           # сек: пара пишет друг другу пачкой — ждём и отвечаем ОДИН раз, на последнее (просьба бати)
-SHIP_GAP = 60               # сек: после подкола паре (любым путём) — следующий не раньше
-_ship_pending: dict[int, dict] = {}  # чат -> собираемая пачка сообщений пары {"msgs": [...]}
-_ship_last: dict[int, float] = {}    # чат -> когда бот последний раз шипперил пару
-
-
-_media_said: dict[tuple[int, int], str] = {}  # (чат, сообщение) -> «[фото: что на нём] подпись»
-SHIP_PHOTO_CHANCE = 1 / 3   # фото кого-то из пары просто в чат — шиппинг по фото в 1 случае из 3 (просьба бати)
-
-
-def _ship_busy(chat_id: int) -> bool:
-    """Подкол паре уже собирается или был только что — второй не нужен."""
-    return chat_id in _ship_pending or time.time() - _ship_last.get(chat_id, 0) < SHIP_GAP
-
-
-def _ship_sent(chat_id: int) -> None:
-    _ship_last[chat_id] = time.time()
-    _ship_pending.pop(chat_id, None)  # ответили (например, на прямое обращение) — собранная пачка не нужна
-
-
-def _msk_time() -> str:
-    return datetime.now(timezone(timedelta(hours=3))).strftime("%H:%M")
-
-
-def _version() -> str:
-    """Версия и коммит, на которых сейчас работает бот (видно в /ship — проверить, доехало ли обновление)."""
-    import version
-    return f"{version.current()} ({version.commit()})"
-
-
-SHIP_FALLBACK = [  # {a} — кому отвечаем, {b} — его «половинка»
-    "Да потрахайтесь вы уже, {a} и {b}, а то весь чат за вас переживает.",
-    "{a}, {b}, снимите комнату, тут вообще-то люди.",
-    "Напряжение между вами видно из космоса. Ебитесь уже, {a} и {b}.",
-    "Опять флиртуете при детях. {a}, {b}, валите в личку и не позорьтесь.",
-    "Ссоритесь как женатые, а ещё даже не ебались. Исправляйте, {a} и {b}.",
-    "Весь чат уже ставки делает, когда {a} и {b} наконец потрахаются.",
-    "{a}, хватит строить из себя недотрогу - {b} тоже не из железа. Ебитесь уже.",
-    "{a} и {b}, когда свадьба? Чат уже скинулся на презервативы.",
-    "Вы двое переписываетесь как перед первым перепихоном. Давайте уже, {a} и {b}.",
-    "{a}, ты ответ ждёшь, как нюдсы. {b}, не мучай - потрахайтесь и успокойтесь.",
-]
-SHIP_FALLBACK_EXPLICIT = [  # оба сами согласились на «без тормозов» (18+)
-    "{a}, {b}, вы друг другу строчите, как перед минетом. Трахнитесь уже и не мучайте чат.",
-    "{a} и {b}, чат уже скинулся вам на смазку и стиральную машинку - сами знаете зачем.",
-    "{a}, ты пишешь так, будто уже стоишь на коленях. {b}, сжалься - потрахайтесь и успокойтесь.",
-    "Вы двое - сюжет дешёвого порно: начинается со ссоры в чате, кончается в стиральной машинке.",
-    "{a}, {b}, хватит дрочить друг на друга в переписке - идите уже отсосите друг другу и помиритесь.",
-    "{a}, у тебя каждое сообщение звучит как просьба отлизать. {b}, решайтесь уже, весь чат ждёт.",
-    "{a}, {b} хочет взять тебя раком в лифте между этажами, а пишет тебе «доброе утро». Хватит ломаться.",
-    "{a}, {b} сохраняет твои кружочки в папку «на вечер». Отсосите уже друг другу и не позорьтесь.",
-    "{a}, {b} кончает от одного твоего «привет». Представь, что будет от «приходи».",
-    "{a}, {b} хочет оттрахать тебя на кухонном столе среди грязной посуды. Посуду, кстати, тоже не моет.",
-    "{a}, {b} читает твои сообщения одной рукой. Догадайся, где вторая.",
-    "{a} и {b}, ваша переписка - прелюдия длиной в месяц. Пора уже к основной части, раком и без перерывов.",
-    "{a}, {b} мечтает вдуть тебе в примерочной ТЦ, пока продавщица спрашивает «вам размер подошёл?».",
-    "{a}, {b} на твоё «я в душ» ловит инфаркт и стояк одновременно. Пожалей человека.",
-    "{a}, {b} ждёт твоих нюдсов, как зарплату. И то, и другое ты зажимаешь.",
-    "{a} и {b}, сексуальное напряжение такое, что чат запотел. Выебите друг друга и проветрите.",
-    "{a}, {b} хочет раздеть тебя зубами, а пока только огрызается. Это одно и то же, просто медленнее.",
-    "{a} и {b}, вы ссоритесь, как перед перепихоном в туалете бара. Так идите уже в туалет.",
-    "{a}, {b} хочет трахать тебя, пока не сядет батарейка на телефоне. А телефон держит два дня.",
-    "{a}, {b} ставит твоё голосовое на рингтон и не может работать. Отсосите уже друг другу - пусть человек выспится.",
-    "{a} и {b}, у вас в истории браузера одни и те же запросы. Перепихнитесь и сэкономьте трафик.",
-    "{a}, {b} хочет «помочь» тебе вылезти из стиральной машинки. Ты знаешь, чем такие видео кончаются.",
-]
-
-
-async def _ship_partner(db: Database, chat_id: int, uid: int | None) -> tuple[str, str] | None:
-    """(имя этого человека, имя его «половинки»), если он в паре /ship; иначе None."""
-    pair = await _ship_pair(db, chat_id)
-    names = dict(pair)
-    if len(pair) != 2 or uid not in names:
-        return None
-    return names[uid], next(n for u, n in pair if u != uid)
-
-
-async def _ship_line(db: Database, chat_id: int, me: str, partner: str, text: str,
-                     replied: str | None = None, image: tuple[bytes, str] | None = None, seen: str = "") -> str:
-    """Реплика кому-то из пары — всегда жёсткий шиппинг; ИИ упал или редактор зарубил — запасная фраза.
-
-    Редактор раньше переписывал шиппинг в обычный подкол «за слова» — теперь он видит ship_note,
-    а здесь ещё и проверяем: итог не похож на шиппинг — берём черновик, и он не похож — запасную фразу.
-    """
-    out = ""
-    # и автор, и редактор знают: шутка про парочку — так надо; после — снимаем, чтобы не утекло
-    explicit = await _ship_explicit(db, chat_id)
-    token = ai.ship_note.set(ai.ship_text(me, partner, explicit=explicit, photo=image is not None))
-    try:
-        await _remember_lines(db, chat_id)
-        ctx = _as_dicts(await db.recent_messages(chat_id, limit=15))
-        draft = await ai.ship_comment(me, text, partner, replied, ctx, image=image, seen=seen)
-        if draft:  # редактор видит то же фото, что и автор
-            out = await ai.polish(draft, text, ctx, author=me, about_photo=image is not None, image=image, seen=seen)
-            if not ai.shippy(out, partner):
-                logger.info("ship: editor lost the shipping (%r), draft: %r", out, draft)
-                safe = ai.scrub(draft)
-                out = safe if ai.shippy(safe, partner) and not ai.about_looks(safe) else ""
-    except Exception as e:
-        logger.warning("ship line failed: %s", e)
-    finally:
-        ai.ship_note.reset(token)
-    return out or random.choice(SHIP_FALLBACK_EXPLICIT if explicit else SHIP_FALLBACK).format(a=me, b=partner)
-
-
-async def _maybe_ship(message: Message, bot: Bot, db: Database,
-                      media: tuple[bytes, str, str] | None = None) -> bool:
-    """Один из «парочки» ответил на сообщение другого — бот влезает: «опять милуетесь».
-    media — (картинка, mime, описание), если ответили фото/кружком: ИИ шипперит по самой картинке."""
-    rt = message.reply_to_message
-    user = message.from_user
-    if not (rt and rt.from_user and user) or rt.from_user.id == user.id:
-        return False
-    chat_id = message.chat.id
-    who = f"{_name(message)} → {rt.from_user.first_name or rt.from_user.username or rt.from_user.id}"
-
-    def skip(why: str) -> bool:
-        _ship_debug[chat_id] = f"{_msk_time()} {who}: {why}"
-        logger.info("ship skip in %s: %s: %s", chat_id, who, why)
-        return False
-
-    if not ai.available():
-        return skip("ИИ выключен")
-    pair = await _ship_pair(db, chat_id)
-    ids = {pid for pid, _ in pair}
-    if len(pair) != 2:
-        return skip("пара не задана (/ship)")
-    if {user.id, rt.from_user.id} != ids:
-        return skip(f"это не пара (id {user.id} → {rt.from_user.id}, а в паре {sorted(ids)})")
-    now = time.time()
-    st = _ship_state.setdefault(chat_id, {"n": 0, "last": 0.0, "pause": 0.0})
-    if now < st["pause"]:
-        return skip(f"пауза после {SHIP_STREAK} подколов подряд")
-    if random.random() > SHIP_REPLY_CHANCE:
-        return skip("не выпал шанс")
-    if await db.is_optout(chat_id, user.id) or await db.is_optout(chat_id, rt.from_user.id):
-        return skip("кто-то из пары в /forget_me")
-    answered = _answered.setdefault(chat_id, set())
-    answered.add(message.message_id)  # фоновый подкол это сообщение не трогает
-    pend = _ship_pending.get(chat_id)
-    if pend is not None:  # уже собираем пачку — добавляем, ответим один раз на последнее
-        pend["msgs"].append(message)
-        if media:
-            pend["media"][message.message_id] = media
-        _ship_debug[chat_id] = f"{_msk_time()} {who}: склеил с предыдущим - отвечу один раз"
-        return True
-    if now - _ship_last.get(chat_id, 0) < SHIP_GAP:
-        skip(f"только что уже подкалывал (не чаще раза в {SHIP_GAP} сек)")
-        return False
-    _ship_debug[chat_id] = f"{_msk_time()} {who}: подкол собирается"
-    if now - st["last"] > SHIP_PAUSE:  # давно не было — новый поток
-        st["n"] = 0
-    st["n"] += 1
-    st["last"] = now
-    if st["n"] >= SHIP_STREAK:  # это пятый подряд — после него пауза
-        st["n"], st["pause"] = 0, now + SHIP_PAUSE
-    mine = {"msgs": [message], "media": {message.message_id: media} if media else {}}
-    _ship_pending[chat_id] = mine
-    names = dict(pair)
-
-    def said(m: Message) -> str:
-        seen = _media_said.get((chat_id, m.message_id))  # «[фото: что на нём] подпись» — бот уже рассмотрел
-        if seen:
-            return seen
-        return m.text or m.caption or ("[гифка]" if m.animation else "[фото]" if m.photo else
-                                       "[стикер]" if m.sticker else "[видео]" if m.video or m.video_note
-                                       else "[голосовое]" if m.voice else "[без текста]")
-
-    async def run() -> None:
-        async with _typing_on(bot, chat_id):  # «печатает…» сразу, пока собираем пачку и думаем
-            await gather_and_reply()
-
-    async def gather_and_reply() -> None:
-        await asyncio.sleep(SHIP_GATHER)  # ждём, не напишут ли друг другу ещё
-        if _ship_pending.get(chat_id) is not mine:  # уже ответили другим путём (обращение к боту)
-            return
-        _ship_pending.pop(chat_id, None)
-        _ship_last[chat_id] = time.time()  # пока пишем — другие пути паре не отвечают
-        msgs = mine["msgs"]
-        last = msgs[-1]
-        a_id = last.from_user.id if last.from_user else user.id
-        a_name = names.get(a_id, _name(last))
-        b_name = next((n for u, n in pair if u != a_id), "")
-        lrt = last.reply_to_message
-        b_text = said(lrt) if lrt else None
-        # вся пачка — одним текстом: «Имя: …» по очереди, чтобы ИИ видел перепалку целиком
-        text = (said(last) if len(msgs) == 1 else
-                "\n".join(f"{names.get(m.from_user.id if m.from_user else 0, _name(m))}: {said(m)}" for m in msgs))
-        pic = next((mine["media"][m.message_id] for m in reversed(msgs) if m.message_id in mine["media"]), None)
-        line = await _ship_line(db, chat_id, a_name, b_name, text, b_text,
-                                image=(pic[0], pic[1]) if pic else None, seen=pic[2] if pic else "")
-        logger.info("ship: %s -> %s in %s (%d msgs)", a_name, b_name, chat_id, len(msgs))
-        try:
-            await _say_human(bot, chat_id, line, reply_to=last.message_id)
-            _ship_last[chat_id] = time.time()
-            _ship_debug[chat_id] = f"{_msk_time()} {who}: подкол отправлен" + (
-                f" (один на {len(msgs)} сообщ.)" if len(msgs) > 1 else "")
-        except Exception as e:
-            logger.warning("ship send failed: %s", e)
-            _ship_debug[chat_id] = f"{_msk_time()} {who}: не смог отправить ({str(e)[:80]})"
-
-    _spawn(run())
-    return True
-
-
-@router.message(Command("ship"))
-async def cmd_ship(message: Message, command: CommandObject, db: Database) -> None:
-    """/ship @a @b — бот шипперит этих двоих; /ship @b (или ответом) — тебя и его; /ship off; /ship — кто сейчас."""
-    chat_id = message.chat.id
-    if message.chat.type == "private":
-        await message.answer("Шиппинг настраивается в чате: напиши там /ship @ник.")
-        return
-    args = (command.args or "").split()
-    if args and args[0].lower() in ("off", "выкл", "стоп"):
-        await db.set_setting(_ship_key(chat_id), "")
-        await db.set_setting(_ship_ok_key(chat_id), "")  # согласия — только для этой пары
-        _ship_state.pop(chat_id, None)
-        await message.answer("💔 Шиппинг выключен.")
-        return
-    people: list[tuple[int, str]] = []
-    rt = message.reply_to_message
-    if rt and rt.from_user and not rt.from_user.is_bot:
-        people.append((rt.from_user.id, rt.from_user.first_name or rt.from_user.username or "Аноним"))
-    for nick in [a for a in args if a.startswith("@")][:2]:
-        found = await db.find_user(chat_id, nick)
-        if not found:
-            await message.answer(f"Не знаю {html.escape(nick)}. Пусть сначала что-нибудь напишет в чат.")
-            return
-        people.append((found[0], found[1] or nick))
-    if not people:
-        pair = await _ship_pair(db, chat_id)
-        if len(pair) != 2:
-            await message.answer("Шиппинг выключен. /ship @a @b - шипперить двоих, /ship @ник или ответом "
-                                 "на сообщение - тебя и его.")
-            return
-        st = _ship_state.get(chat_id, {})
-        ok = await _ship_consent(db, chat_id)
-        both = {u for u, _ in pair} <= ok
-        left = int(st.get("pause", 0) - time.time())
-        last = _ship_debug.get(chat_id, "ответов друг другу пока не видел")
-        await message.answer(f"💞 Сейчас шипперю: {html.escape(pair[0][1])} (id {pair[0][0]}) + "
-                             f"{html.escape(pair[1][1])} (id {pair[1][0]}).\n"
-                             + (f"Пауза после {SHIP_STREAK} подколов подряд: ещё {left // 60 + 1} мин.\n" if left > 0
-                                else f"Подколов в этом потоке: {st.get('n', 0)} из {SHIP_STREAK}.\n")
-                             + f"Последний ответ: {html.escape(last)}\n"
-                             + ("18+ без тормозов: включён (оба согласились сами).\n" if both else
-                                "18+ без тормозов: выключен - ждём кнопку от: "
-                                + ", ".join(html.escape(n) for u, n in pair if u not in ok) + " (кнопки ниже).\n")
-                             + f"Версия бота: {_version()}\n/ship off - выключить.")
-        if not both:  # кнопки согласия — заново: вдруг старое сообщение потерялось
-            await _send_consent(message, db, pair)
-        return
-    if len(people) == 1 and message.from_user:
-        people.insert(0, (message.from_user.id, _name(message)))
-    (a_id, a_name), (b_id, b_name) = people[:2]
-    if a_id == b_id:
-        await message.answer("С самим собой не шипперю - нужен второй.")
-        return
-    old_pair = {u for u, _ in await _ship_pair(db, chat_id)}
-    await db.set_setting(_ship_key(chat_id), json.dumps([[a_id, a_name], [b_id, b_name]], ensure_ascii=False))
-    if old_pair != {a_id, b_id}:  # новая пара — согласия заново (старые были не про неё)
-        await db.set_setting(_ship_ok_key(chat_id), "")
-    _ship_state.pop(chat_id, None)  # новая пара — счёт и пауза заново
-    await message.answer(f"💞 Окей: {html.escape(a_name)} + {html.escape(b_name)} теперь парочка чата. "
-                         "Теперь шипперю жёстко, всегда. /ship off - выключить.")
-    await _send_consent(message, db, [(a_id, a_name), (b_id, b_name)])
-
-
 @router.message(Command("roast"))
 async def cmd_roast(message: Message, command: CommandObject, bot: Bot, db: Database) -> None:
     if not await _enabled(db):
@@ -1180,11 +799,6 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     if not optout and _PROMISE_HINT.search(message.text):
         _spawn(_check_promise(db, message))
 
-    rt0 = message.reply_to_message
-    if rt0 and rt0.from_user and rt0.from_user.id not in (user.id, bot.id):  # для /ship: дошло, но вдруг дальше не дойдёт
-        _ship_debug[chat_id] = (f"{_msk_time()} {_name(message)} → {rt0.from_user.first_name or rt0.from_user.id}: "
-                                "сообщение перехватил кто-то раньше (игра, рифма, заступничество, смех, обращение к боту)")
-
     # Пока идёт игра (Бункер, Мафия) — бот только запоминает, не встревает и не ставит реакции
     if _bunker_active(chat_id):
         return
@@ -1198,8 +812,7 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
         return
 
     # Рифма-отговорка: «и чё?» — «хуй через плечо», «ну» — «баранки гну» (тех, кто сделал /forget_me, не трогаем)
-    in_pair = user.id in {u for u, _ in await _ship_pair(db, chat_id)}
-    if not optout and not in_pair and await _maybe_rhyme(message, bot, config):
+    if not optout and await _maybe_rhyme(message, bot, config):
         return
 
     # Обращаются ли к боту?
@@ -1210,11 +823,6 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     mentioned = bool(me.username and f"@{me.username.lower()}" in text.lower())
     by_name = bool(_BOT_NAME.search(text))
     addressed = reply_to_bot or mentioned or by_name or bool(_BOT_WORD.search(text))
-    # «Парочка чата» (/ship): один ответил другому — бот иногда влезает в их переписку
-    if not addressed and optout and rt0 and rt0.from_user and rt0.from_user.id != bot.id:
-        _ship_debug[chat_id] = f"{_msk_time()} {_name(message)}: автор в /forget_me"
-    if not addressed and not optout and await _maybe_ship(message, bot, db):
-        return
     if not addressed:
         if not optout:  # /forget_me — «не трогаю»: без реакций
             _spawn(_maybe_react(bot, db, message, user.id == _father_id(config)))
@@ -1262,8 +870,6 @@ async def _maybe_laugh(message: Message, bot: Bot, db: Database, config) -> bool
         return False
     chat_id = message.chat.id
     await db.score_bot_line(chat_id, rt.message_id, 1)  # шутка зашла — пусть бот запомнит
-    if message.from_user and await _ship_partner(db, chat_id, message.from_user.id):
-        return False  # смеётся кто-то из пары /ship — ответ ему тоже шиппинг (дальше, как обращение к боту)
     is_father = bool(message.from_user and message.from_user.id == _father_id(config))
     if random.random() < 0.45:
         await _react(bot, chat_id, message.message_id, random.choice(["😎", "🔥", "🤝"]), force=True)
@@ -1362,15 +968,6 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     is_father = bool(who and who.id == _father_id(config))
     if is_father:  # бате иногда (≈1 из 3) можно нагрубить по-сыновьи, остальное — подъёб по-доброму
         ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)
-    await _set_ship(db, chat_id, who.id if who else None)
-    shipped = await _ship_partner(db, chat_id, who.id if who else None)
-    if shipped:  # пара /ship: любой ответ бота кому-то из них — жёсткий шиппинг (правило бати)
-        _ship_sent(chat_id)  # к боту обратились напрямую — отвечаем; собранная пачка «друг другу» уже не нужна
-        answer = await _ship_line(db, chat_id, shipped[0], shipped[1], text)
-        _ship_debug[chat_id] = f"{_msk_time()} {shipped[0]} (обратился к боту): шиппинг отправлен"
-        await _say_human(bot, chat_id, answer, reply_to=last_msg.message_id)
-        _ship_sent(chat_id)
-        return
 
     # Как человек: в затянувшейся перепалке отвечает всё реже, на пустое «да/и че» — реакцией
     if who and not is_father:
@@ -1727,17 +1324,12 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
     reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user
                         and message.reply_to_message.from_user.id == bot.id)
     addressed = reply_to_bot or bool(_BOT_NAME.search(caption) or _BOT_WORD.search(caption))
-    shipped = await _ship_partner(db, chat_id, user.id)
-    if shipped and not src:  # пара /ship: фото — повод для шиппинга, и ИИ смотрит на само фото
-        await _ship_photo(message, bot, db, shipped, addressed, (img, mime, descr), f"{what} {caption}".strip())
-        return
     if not addressed:
         if random.random() > PHOTO_CHANCE or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
             return
     is_father = user.id == _father_id(config)
     if is_father:
         ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)
-    await _set_ship(db, chat_id, user.id)
     try:
         await bot.send_chat_action(chat_id, "typing")
         await _remember_lines(db, chat_id)
@@ -1753,40 +1345,8 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
     except Exception as e:
         logger.warning("%s roast failed: %s", label, e)
         answer = ""
-    if shipped and not ai.shippy(answer, shipped[1]):  # пересланное от кого-то из пары — тоже шиппинг
-        answer = await _ship_line(db, chat_id, shipped[0], shipped[1], f"{what} {caption}".strip())
     if answer:
         await _say_human(bot, chat_id, ai.vary_father(answer) if is_father else answer, reply_to=message.message_id)
-        if shipped:
-            _ship_sent(chat_id)
-
-
-async def _ship_photo(message: Message, bot: Bot, db: Database, shipped: tuple[str, str], addressed: bool,
-                      media: tuple[bytes, str, str], said: str) -> None:
-    """Фото (кружок, видео) от кого-то из пары /ship. Ответил фото «половинке» — как ответ текстом: в общую
-    пачку, один подкол, но по картинке; просто кинул в чат — шиппинг по фото в 1 случае из 3; фото боту — всегда."""
-    chat_id = message.chat.id
-    _media_said[(chat_id, message.message_id)] = said
-    if len(_media_said) > 300:
-        _media_said.clear()
-        _media_said[(chat_id, message.message_id)] = said
-    rt = message.reply_to_message
-    partner_ids = {u for u, _ in await _ship_pair(db, chat_id)} - {message.from_user.id}
-    if not addressed and rt and rt.from_user and rt.from_user.id in partner_ids:
-        await _maybe_ship(message, bot, db, media=media)
-        return
-    if not addressed:
-        if random.random() >= SHIP_PHOTO_CHANCE or _ship_busy(chat_id):
-            return
-        if time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
-            return
-    _ship_sent(chat_id)  # пока пишем — другие пути паре не отвечают
-    img, mime, descr = media
-    async with _typing_on(bot, chat_id):
-        line = await _ship_line(db, chat_id, shipped[0], shipped[1], said, image=(img, mime), seen=descr)
-        _ship_debug[chat_id] = f"{_msk_time()} {shipped[0]} (фото): шиппинг отправлен"
-        await _say_human(bot, chat_id, line, reply_to=message.message_id)
-    _ship_sent(chat_id)
 
 
 # ---------- «Клоун дня» ----------
@@ -1899,21 +1459,6 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int, interval: int) -> No
                and _replyable(r[3])}
     if not new_ids:
         return
-    pair_ids = {u for u, _ in await _ship_pair(db, chat_id)}
-    from_pair = [r for r in rows if r[0] in new_ids and r[1] in pair_ids]
-    if len(pair_ids) == 2 and from_pair and _ship_busy(chat_id):
-        return  # паре только что ответили (или ответ собирается) — второй подкол им не нужен
-    if len(pair_ids) == 2 and from_pair:  # кто-то из пары /ship писал — подкол ему, и это жёсткий шиппинг
-        target = from_pair[-1]
-        shipped = await _ship_partner(db, chat_id, target[1])
-        if shipped:
-            text = await _ship_line(db, chat_id, shipped[0], shipped[1], target[3])
-            if chat_id in _pending or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
-                return
-            _ship_debug[chat_id] = f"{_msk_time()} {shipped[0]} (фоновый подкол): шиппинг отправлен"
-            await _say_human(bot, chat_id, text, reply_to=target[0])
-            _ship_sent(chat_id)
-            return
     await _remember_lines(db, chat_id)
     names = {r[2] for r in rows}
     dossiers = {n: d for n, d in (await db.chat_dossiers(chat_id)).items() if n in names}
@@ -1925,7 +1470,6 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int, interval: int) -> No
         target = next((r for r in rows if r[0] == reply_to), rows[-1])
         trigger = target[3]
         is_father = target[1] == _father_id(_cfg_ref[0] if _cfg_ref else None)
-        await _set_ship(db, chat_id, target[1])
         if is_father:  # подкол бате — в его режиме (иногда грубо, чаще по-доброму)
             ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)
         text = await ai.polish(result["text"], trigger, _as_dicts(rows),
@@ -1997,14 +1541,14 @@ async def background(bot: Bot, db: Database) -> None:
             if await _enabled(db) and ai.available():
                 if time.time() - last_heavy >= HEAVY_EVERY:
                     last_heavy = time.time()
-                    await asyncio.create_task(_heavy(bot, db))  # контекст (ship_note и т.п.) не утекает
+                    await asyncio.create_task(_heavy(bot, db))  # контекст (father_rude и т.п.) не утекает
                 try:
                     await _remind_promises(bot, db)
                 except Exception as e:
                     logger.warning("promise reminders failed: %s", e)
                 if interval > 0:
                     for chat_id in await db.active_chats(int(time.time()) - 86400):
-                        try:  # в своей задаче: ship_note/father_rude одного подкола не утекают в следующий
+                        try:  # в своей задаче: father_rude и т.п. одного подкола не утекают в следующий
                             await asyncio.create_task(_auto_roast(bot, db, chat_id, interval))
                         except Exception as e:
                             logger.warning("auto roast failed in %s: %s", chat_id, e)
