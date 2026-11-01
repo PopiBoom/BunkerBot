@@ -43,7 +43,7 @@ async def set_commands(bot: Bot, config, db: Database) -> None:
         return [BotCommand(command=c, description=d) for c, d in menu(sections)]
 
     admin_private = cmds(PRIVATE_SECTIONS[:-1] + [ADMIN_SECTION] + PRIVATE_SECTIONS[-1:])
-    admin_group = cmds(GROUP_SECTIONS)
+    admin_group = [BotCommand(command=c, description=d) for c, d in menu(GROUP_SECTIONS, separators=True)]
     try:
         await bot.set_my_commands(cmds(PUBLIC_PRIVATE_SECTIONS), scope=BotCommandScopeAllPrivateChats())
         if PUBLIC_GROUP_SECTIONS:
@@ -57,10 +57,15 @@ async def set_commands(bot: Bot, config, db: Database) -> None:
     import time as _time
     for chat_id in await db.active_chats(int(_time.time()) - 60 * 86400):
         for admin_id in config.admin_ids:
+            scope = BotCommandScopeChatMember(chat_id=chat_id, user_id=admin_id)
             try:
-                await bot.set_my_commands(admin_group, scope=BotCommandScopeChatMember(chat_id=chat_id, user_id=admin_id))
-            except Exception as e:
-                logger.info("меню админа в чате %s не поставилось: %s", chat_id, e)
+                await bot.set_my_commands(admin_group, scope=scope)
+            except Exception as e:  # вдруг Telegram не примет строки-разделители — тогда меню без них
+                logger.info("меню админа в чате %s с разделителями не поставилось: %s", chat_id, e)
+                try:
+                    await bot.set_my_commands(cmds(GROUP_SECTIONS), scope=scope)
+                except Exception as e2:
+                    logger.info("меню админа в чате %s не поставилось: %s", chat_id, e2)
 
 
 class AdminOnlyCommands(BaseMiddleware):
