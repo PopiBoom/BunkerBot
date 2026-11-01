@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import os
 import random
@@ -623,6 +624,70 @@ async def cmd_remember_me(message: Message, command: CommandObject, db: Database
         await message.reply(f"😈 {html.escape(name)} снова под наблюдением.")
 
 
+# ---------- шиппинг: бот иногда подкалывает двоих как «парочку чата» (просьба бати) ----------
+
+
+def _ship_key(chat_id: int) -> str:
+    return f"ship:{chat_id}"
+
+
+async def _ship_pair(db: Database, chat_id: int) -> list[tuple[int, str]]:
+    try:
+        pair = json.loads(await db.get_setting(_ship_key(chat_id), "") or "[]")
+        return [(int(u), str(n)) for u, n in pair][:2]
+    except (ValueError, TypeError):
+        return []
+
+
+async def _set_ship(db: Database, chat_id: int, *user_ids: int | None) -> None:
+    """Перед ответом: если ответ касается кого-то из пары — иногда (SHIP_CHANCE) просим ИИ их пошипперить."""
+    note = ""
+    pair = await _ship_pair(db, chat_id)
+    if len(pair) == 2 and any(u in {pid for pid, _ in pair} for u in user_ids if u):
+        if random.random() < ai.SHIP_CHANCE:
+            note = ai.ship_text(pair[0][1], pair[1][1])
+    ai.ship_note.set(note)
+
+
+@router.message(Command("ship"))
+async def cmd_ship(message: Message, command: CommandObject, db: Database) -> None:
+    """/ship @a @b — бот шипперит этих двоих; /ship @b (или ответом) — тебя и его; /ship off; /ship — кто сейчас."""
+    chat_id = message.chat.id
+    if message.chat.type == "private":
+        await message.answer("Шиппинг настраивается в чате: напиши там /ship @ник.")
+        return
+    args = (command.args or "").split()
+    if args and args[0].lower() in ("off", "выкл", "стоп"):
+        await db.set_setting(_ship_key(chat_id), "")
+        await message.answer("💔 Шиппинг выключен.")
+        return
+    people: list[tuple[int, str]] = []
+    rt = message.reply_to_message
+    if rt and rt.from_user and not rt.from_user.is_bot:
+        people.append((rt.from_user.id, rt.from_user.first_name or rt.from_user.username or "Аноним"))
+    for nick in [a for a in args if a.startswith("@")][:2]:
+        found = await db.find_user(chat_id, nick)
+        if not found:
+            await message.answer(f"Не знаю {html.escape(nick)}. Пусть сначала что-нибудь напишет в чат.")
+            return
+        people.append((found[0], found[1] or nick))
+    if not people:
+        pair = await _ship_pair(db, chat_id)
+        await message.answer(f"💞 Сейчас шипперю: {html.escape(pair[0][1])} + {html.escape(pair[1][1])}.\n"
+                             "/ship off - выключить." if len(pair) == 2 else
+                             "Шиппинг выключен. /ship @a @b - шипперить двоих, /ship @ник - тебя и его.")
+        return
+    if len(people) == 1 and message.from_user:
+        people.insert(0, (message.from_user.id, _name(message)))
+    (a_id, a_name), (b_id, b_name) = people[:2]
+    if a_id == b_id:
+        await message.answer("С самим собой не шипперю - нужен второй.")
+        return
+    await db.set_setting(_ship_key(chat_id), json.dumps([[a_id, a_name], [b_id, b_name]], ensure_ascii=False))
+    await message.answer(f"💞 Окей: {html.escape(a_name)} + {html.escape(b_name)} теперь парочка чата. "
+                         "Буду иногда подкалывать. /ship off - выключить.")
+
+
 @router.message(Command("roast"))
 async def cmd_roast(message: Message, command: CommandObject, bot: Bot, db: Database) -> None:
     if not await _enabled(db):
@@ -934,6 +999,7 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     is_father = bool(who and who.id == _father_id(config))
     if is_father:  # бате иногда (≈1 из 3) можно нагрубить по-сыновьи, остальное — подъёб по-доброму
         ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)
+    await _set_ship(db, chat_id, who.id if who else None)
 
     # Как человек: в затянувшейся перепалке отвечает всё реже, на пустое «да/и че» — реакцией
     if who and not is_father:
@@ -1294,6 +1360,7 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
     is_father = user.id == _father_id(config)
     if is_father:
         ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)
+    await _set_ship(db, chat_id, user.id)
     try:
         await bot.send_chat_action(chat_id, "typing")
         await _remember_lines(db, chat_id)
@@ -1434,6 +1501,7 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int, interval: int) -> No
         target = next((r for r in rows if r[0] == reply_to), rows[-1])
         trigger = target[3]
         is_father = target[1] == _father_id(_cfg_ref[0] if _cfg_ref else None)
+        await _set_ship(db, chat_id, target[1])
         if is_father:  # подкол бате — в его режиме (иногда грубо, чаще по-доброму)
             ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)
         text = await ai.polish(result["text"], trigger, _as_dicts(rows),

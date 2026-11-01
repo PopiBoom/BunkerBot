@@ -126,6 +126,9 @@ async def _complete(system: str, user: str, max_tokens: int = 4000, fast: bool =
     """
     client = _get_client()
     model = model or (FAST_MODEL if fast else MODEL)
+    note = ship_note.get()
+    if note and system.startswith(ROAST_SYSTEM[:60]):  # шиппинг — только в репликах стёб-бота
+        system = f"{system}\n{note}"
     kwargs = dict(
         model=model,
         max_tokens=max_tokens,
@@ -553,6 +556,20 @@ def _msgs_block(messages: list[dict], new_ids: set | None = None) -> str:
         f'{str(m["text"])[:400]}</msg>'
         for m in messages
     )
+
+
+# «Шиппинг» (просьба бати): пара участников чата, которых бот иногда подкалывает как «парочку».
+# handlers/roast.py ставит текст перед ответом одному из пары (не каждый раз — SHIP_CHANCE), иначе "".
+ship_note: contextvars.ContextVar[str] = contextvars.ContextVar("ship_note", default="")
+SHIP_CHANCE = 0.35
+
+
+def ship_text(a: str, b: str) -> str:
+    return (f"Шиппинг: «{a}» и «{b}» — «парочка чата» (так хочет батя). В ЭТОМ ответе подколи их как "
+            "парочку: давние супруги, милуются, ревнуют, ссорятся как семейная пара, «когда свадьба», "
+            "«опять твоя половинка» — можно упомянуть второго по имени. Без пошлости и секса, без шуток "
+            "про ориентацию; не объясняй, что это шиппинг, — просто шути. Шутка всё равно по их словам "
+            "из переписки.")
 
 
 # Последние реплики бота в текущем чате — чтобы не повторяться (ставит handlers/roast.py)
