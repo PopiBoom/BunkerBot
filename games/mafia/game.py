@@ -42,6 +42,7 @@ import ai
 from database import Database
 from ephemeral import delete_later, temp_reply
 
+from ..common import lobby_text
 from . import content as C
 from . import render as R
 
@@ -433,16 +434,10 @@ def must_delete(message: Message) -> bool:
 
 def _lobby_text(game: Game) -> str:
     n = len(game.players)
-    lines = ["🕵️ <b>МАФИЯ</b>", HR, "",
-             f"Игроков: <b>{n}</b> (нужно от {MIN_PLAYERS})",
-             f"Ведущий: {_mode_title(game)}", ""]
-    for p in game.players.values():
-        host = " (ведущий)" if p.user_id == game.host_id else ""
-        dm = " — <i>не открыл бота</i>" if not (p.dm_ok or p.is_bot) else ""
-        lines.append(f"• {_e(p.name)}{host}{dm}")
-    if n >= MIN_PLAYERS:
-        lines += ["", "<b>Состав</b>", C.composition_list(C.deal_roles(n))]
-    return "\n".join(lines)
+    return lobby_text("🕵️ МАФИЯ", [(p.name, p.user_id == game.host_id, p.dm_ok or p.is_bot)
+                                   for p in game.players.values()],
+                      MAX_PLAYERS, MIN_PLAYERS, _mode_title(game), "Состав",
+                      C.composition_list(C.deal_roles(max(n, MIN_PLAYERS))).split("\n"))
 
 
 def _lobby_kb(game: Game) -> InlineKeyboardMarkup:

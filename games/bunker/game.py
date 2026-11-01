@@ -41,6 +41,7 @@ import ai
 from database import Database
 from ephemeral import delete_later, temp_reply
 
+from ..common import lobby_text
 from . import content as C
 from . import render as R
 from .render import render_card
@@ -380,14 +381,12 @@ def _num(x: float) -> str:
 
 
 def _lobby_text(game: Game) -> str:
-    lines = ["🏚 <b>БУНКЕР</b>", HR, "",
-             f"👥 Сбор игроков: <b>{len(game.players)}/{MAX_PLAYERS}</b>",
-             f"🎭 Ведущий: {_mode_title(game)}", ""]
-    for p in game.players.values():
-        host = " 👑" if p.user_id == game.host_id else ""
-        dm = "" if p.dm_ok or p.is_bot else " <i>(не открыл бота)</i>"
-        lines.append(f"• {_e(p.name)}{host}{dm}")
-    return "\n".join(lines)
+    n = len(game.players)
+    spots = max(1, n // 2)  # как при старте партии
+    return lobby_text("🏚 БУНКЕР", [(p.name, p.user_id == game.host_id, p.dm_ok or p.is_bot)
+                                    for p in game.players.values()],
+                      MAX_PLAYERS, MIN_PLAYERS, _mode_title(game), "Расклад",
+                      [f"• Мест в бункере - {spots}", f"• Останутся за дверью - {n - spots}"])
 
 
 def _btn(text: str, data: str) -> InlineKeyboardButton:
