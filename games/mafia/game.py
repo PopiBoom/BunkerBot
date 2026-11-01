@@ -56,6 +56,7 @@ DOCTOR_TIME = 30          # сек на ход Доктора ночью (ран
 SHERIFF_TIME = 30         # сек на проверку Следователя
 MAFIA_TIME = 45           # сек мафии на выбор жертвы (и Дону — на проверку)
 VOTE_TIME = 60            # сек на дневное голосование (раньше — если все проголосовали)
+VERDICT_PAUSE = 6         # сек после приговора (было «по длине текста», до 25 — владельцу долго)
 LAST_WORD_MAX = 500       # символов в последнем слове
 LAST_WORD_SECONDS = 60    # голосовое или кружок — не длиннее
 SPEECH_TIME = 30          # сек на оправдания при ничьей
@@ -1669,7 +1670,8 @@ async def _vote(bot: Bot, game: Game) -> None:
         await _execute(bot, game, game.players[executed])
     else:
         game.timeline.append(f"День {game.no}: никого не казнили ({note})")
-        await _say(bot, game, f"<b>Сегодня никого не казнят</b> — {_e(note)}.")
+        await _send(bot, game.chat_id, f"<b>Сегодня никого не казнят</b> — {_e(note)}.")
+        await _pause(game, VERDICT_PAUSE / 2)
 
 
 async def _execute(bot: Bot, game: Game, p: Player) -> None:
@@ -1683,7 +1685,8 @@ async def _execute(bot: Bot, game: Game, p: Player) -> None:
         story = await _ai(ai.mafia_execution(game.city, game.no, p.name, C.title(p.role), right,
                                              await _dossier(game, p), _style(game)), "execution")
     story = story or C.executed_fallback(p.name, role, right)
-    await _say(bot, game, f"⚖️ <b>ПРИГОВОР</b>\n{HR}\n\nГород казнит: <b>{_e(p.name)}</b>\n\n{_host(game, story)}")
+    await _send(bot, game.chat_id, f"⚖️ <b>ПРИГОВОР</b>\n{HR}\n\nГород казнит: <b>{_e(p.name)}</b>\n\n{_host(game, story)}")
+    await _pause(game, VERDICT_PAUSE)
     if not _is_active(game):
         return
     await _send_card(bot, game, p, "executed",
