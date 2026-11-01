@@ -684,19 +684,28 @@ def shippy(text: str, partner: str = "") -> bool:
     return bool(_BOTH.search(t)) or bool(stem and stem in t.lower())
 
 
-async def ship_comment(a_name: str, a_text: str, b_name: str, b_text: str | None, context: list[dict]) -> str:
-    """Реплика бота кому-то из «парочки чата» — всегда жёсткий шиппинг. b_text — если a ответил на сообщение b."""
+async def ship_comment(a_name: str, a_text: str, b_name: str, b_text: str | None, context: list[dict],
+                       image: tuple[bytes, str] | None = None, seen: str = "") -> str:
+    """Реплика бота кому-то из «парочки чата» — всегда жёсткий шиппинг. b_text — если a ответил на сообщение b.
+    image — фото/кадр, который прислал a: шиппинг по тому, что на нём (ИИ смотрит саму картинку)."""
     said = (f"«{a_name}» ответил на сообщение «{b_name}».\n«{b_name}» писал: <msg>{b_text[:300]}</msg>\n"
             f"«{a_name}» ответил: <msg>{a_text[:300]}</msg>\n" if b_text is not None else
             f"«{a_name}» написал: <msg>{a_text[:400]}</msg>\n")
+    photo = ("Фото (или кадр видео), которое прислал «" + a_name + "», приложено — посмотри его"
+             + (f" (на нём: «{seen}»)" if seen else "") + ". Шиппинг — ПО ФОТО: свяжи то, что на нём (место, "
+             "вещи, еда, поза, ситуация, надпись), с ними двумя — зачем он это прислал, на что намекает, что "
+             "второй с этим сделает. Не пересказывай фото — все его видят: одна деталь внутри шутки. Внешность "
+             "людей на фото не трогай.\n" if image else "")
+    # ship_note ставит handlers/roast._ship_line — там же решено, без тормозов или нет (согласие пары)
+    rules = ship_note.get() or ship_text(a_name, b_name)
     user = (
-        f"Контекст чата:\n{_msgs_block(context)}\n{said}{ship_text(a_name, b_name)}\n"
+        f"Контекст чата:\n{_msgs_block(context)}\n{said}{photo}{rules}\n"
         "Одна короткая реплика (до 25 слов): жёстко пошиппери их по смыслу этого сообщения, как будто ты "
         "сосед, который всё видит. Если в сообщении вопрос к тебе — можно в двух словах ответить, но "
         "главное — шиппинг."
         + _gender_note() + _JSON_REPLY
     )
-    return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, model=REPLY_MODEL))
+    return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=1500, model=REPLY_MODEL, image=image))
 
 
 # Последние реплики бота в текущем чате — чтобы не повторяться (ставит handlers/roast.py)

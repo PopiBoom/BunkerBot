@@ -745,6 +745,10 @@ _ship_pending: dict[int, dict] = {}  # чат -> собираемая пачка
 _ship_last: dict[int, float] = {}    # чат -> когда бот последний раз шипперил пару
 
 
+_media_said: dict[tuple[int, int], str] = {}  # (чат, сообщение) -> «[фото: что на нём] подпись»
+SHIP_PHOTO_CHANCE = 1 / 3   # фото кого-то из пары просто в чат — шиппинг по фото в 1 случае из 3 (просьба бати)
+
+
 def _ship_busy(chat_id: int) -> bool:
     """Подкол паре уже собирается или был только что — второй не нужен."""
     return chat_id in _ship_pending or time.time() - _ship_last.get(chat_id, 0) < SHIP_GAP
@@ -825,7 +829,7 @@ async def _ship_partner(db: Database, chat_id: int, uid: int | None) -> tuple[st
 
 
 async def _ship_line(db: Database, chat_id: int, me: str, partner: str, text: str,
-                     replied: str | None = None) -> str:
+                     replied: str | None = None, image: tuple[bytes, str] | None = None, seen: str = "") -> str:
     """Реплика кому-то из пары — всегда жёсткий шиппинг; ИИ упал или редактор зарубил — запасная фраза.
 
     Редактор раньше переписывал шиппинг в обычный подкол «за слова» — теперь он видит ship_note,
@@ -838,9 +842,9 @@ async def _ship_line(db: Database, chat_id: int, me: str, partner: str, text: st
     try:
         await _remember_lines(db, chat_id)
         ctx = _as_dicts(await db.recent_messages(chat_id, limit=15))
-        draft = await ai.ship_comment(me, text, partner, replied, ctx)
-        if draft:
-            out = await ai.polish(draft, text, ctx, author=me)
+        draft = await ai.ship_comment(me, text, partner, replied, ctx, image=image, seen=seen)
+        if draft:  # редактор видит то же фото, что и автор
+            out = await ai.polish(draft, text, ctx, author=me, about_photo=image is not None, image=image, seen=seen)
             if not ai.shippy(out, partner):
                 logger.info("ship: editor lost the shipping (%r), draft: %r", out, draft)
                 safe = ai.scrub(draft)
@@ -852,8 +856,10 @@ async def _ship_line(db: Database, chat_id: int, me: str, partner: str, text: st
     return out or random.choice(SHIP_FALLBACK_EXPLICIT if explicit else SHIP_FALLBACK).format(a=me, b=partner)
 
 
-async def _maybe_ship(message: Message, bot: Bot, db: Database) -> bool:
-    """Один из «парочки» ответил на сообщение другого — иногда бот влезает: «опять милуетесь»."""
+async def _maybe_ship(message: Message, bot: Bot, db: Database,
+                      media: tuple[bytes, str, str] | None = None) -> bool:
+    """Один из «парочки» ответил на сообщение другого — бот влезает: «опять милуетесь».
+    media — (картинка, mime, описание), если ответили фото/кружком: ИИ шипперит по самой картинке."""
     rt = message.reply_to_message
     user = message.from_user
     if not (rt and rt.from_user and user) or rt.from_user.id == user.id:
@@ -887,6 +893,8 @@ async def _maybe_ship(message: Message, bot: Bot, db: Database) -> bool:
     pend = _ship_pending.get(chat_id)
     if pend is not None:  # уже собираем пачку — добавляем, ответим один раз на последнее
         pend["msgs"].append(message)
+        if media:
+            pend["media"][message.message_id] = media
         _ship_debug[chat_id] = f"{_msk_time()} {who}: склеил с предыдущим - отвечу один раз"
         return True
     if now - _ship_last.get(chat_id, 0) < SHIP_GAP:
@@ -899,11 +907,14 @@ async def _maybe_ship(message: Message, bot: Bot, db: Database) -> bool:
     st["last"] = now
     if st["n"] >= SHIP_STREAK:  # это пятый подряд — после него пауза
         st["n"], st["pause"] = 0, now + SHIP_PAUSE
-    mine = {"msgs": [message]}
+    mine = {"msgs": [message], "media": {message.message_id: media} if media else {}}
     _ship_pending[chat_id] = mine
     names = dict(pair)
 
     def said(m: Message) -> str:
+        seen = _media_said.get((chat_id, m.message_id))  # «[фото: что на нём] подпись» — бот уже рассмотрел
+        if seen:
+            return seen
         return m.text or m.caption or ("[гифка]" if m.animation else "[фото]" if m.photo else
                                        "[стикер]" if m.sticker else "[видео]" if m.video or m.video_note
                                        else "[голосовое]" if m.voice else "[без текста]")
@@ -924,7 +935,9 @@ async def _maybe_ship(message: Message, bot: Bot, db: Database) -> bool:
         # вся пачка — одним текстом: «Имя: …» по очереди, чтобы ИИ видел перепалку целиком
         text = (said(last) if len(msgs) == 1 else
                 "\n".join(f"{names.get(m.from_user.id if m.from_user else 0, _name(m))}: {said(m)}" for m in msgs))
-        line = await _ship_line(db, chat_id, a_name, b_name, text, b_text)
+        pic = next((mine["media"][m.message_id] for m in reversed(msgs) if m.message_id in mine["media"]), None)
+        line = await _ship_line(db, chat_id, a_name, b_name, text, b_text,
+                                image=(pic[0], pic[1]) if pic else None, seen=pic[2] if pic else "")
         logger.info("ship: %s -> %s in %s (%d msgs)", a_name, b_name, chat_id, len(msgs))
         try:
             await _say_human(bot, chat_id, line, reply_to=last.message_id)
@@ -1694,12 +1707,13 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
     reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user
                         and message.reply_to_message.from_user.id == bot.id)
     addressed = reply_to_bot or bool(_BOT_NAME.search(caption) or _BOT_WORD.search(caption))
+    shipped = await _ship_partner(db, chat_id, user.id)
+    if shipped and not src:  # пара /ship: фото — повод для шиппинга, и ИИ смотрит на само фото
+        await _ship_photo(message, bot, db, shipped, addressed, (img, mime, descr), f"{what} {caption}".strip())
+        return
     if not addressed:
         if random.random() > PHOTO_CHANCE or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
             return
-    shipped = await _ship_partner(db, chat_id, user.id)
-    if shipped and not addressed and _ship_busy(chat_id):
-        return  # паре только что ответили — на фото второй подкол не нужен
     is_father = user.id == _father_id(config)
     if is_father:
         ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)
@@ -1719,12 +1733,43 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
     except Exception as e:
         logger.warning("%s roast failed: %s", label, e)
         answer = ""
-    if shipped and not ai.shippy(answer, shipped[1]):  # пара /ship: и на фото — шиппинг, а не обычный подкол
+    if shipped and not ai.shippy(answer, shipped[1]):  # пересланное от кого-то из пары — тоже шиппинг
         answer = await _ship_line(db, chat_id, shipped[0], shipped[1], f"{what} {caption}".strip())
     if answer:
         await _say_human(bot, chat_id, ai.vary_father(answer) if is_father else answer, reply_to=message.message_id)
         if shipped:
             _ship_sent(chat_id)
+
+
+async def _ship_photo(message: Message, bot: Bot, db: Database, shipped: tuple[str, str], addressed: bool,
+                      media: tuple[bytes, str, str], said: str) -> None:
+    """Фото (кружок, видео) от кого-то из пары /ship. Ответил фото «половинке» — как ответ текстом: в общую
+    пачку, один подкол, но по картинке; просто кинул в чат — шиппинг по фото в 1 случае из 3; фото боту — всегда."""
+    chat_id = message.chat.id
+    _media_said[(chat_id, message.message_id)] = said
+    if len(_media_said) > 300:
+        _media_said.clear()
+        _media_said[(chat_id, message.message_id)] = said
+    rt = message.reply_to_message
+    partner_ids = {u for u, _ in await _ship_pair(db, chat_id)} - {message.from_user.id}
+    if not addressed and rt and rt.from_user and rt.from_user.id in partner_ids:
+        await _maybe_ship(message, bot, db, media=media)
+        return
+    if not addressed:
+        if random.random() >= SHIP_PHOTO_CHANCE or _ship_busy(chat_id):
+            return
+        if time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
+            return
+    _ship_sent(chat_id)  # пока пишем — другие пути паре не отвечают
+    try:
+        await bot.send_chat_action(chat_id, "typing")
+    except Exception:
+        pass
+    img, mime, descr = media
+    line = await _ship_line(db, chat_id, shipped[0], shipped[1], said, image=(img, mime), seen=descr)
+    _ship_debug[chat_id] = f"{_msk_time()} {shipped[0]} (фото): шиппинг отправлен"
+    await _say_human(bot, chat_id, line, reply_to=message.message_id)
+    _ship_sent(chat_id)
 
 
 # ---------- «Клоун дня» ----------
