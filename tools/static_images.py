@@ -1,6 +1,7 @@
 """Рисует постоянные картинки бота — один раз, бот потом шлёт готовые файлы:
   * assets/menu/*.jpg — /menu: главная и по одной на каждый раздел (из SECTIONS в handlers/menu.py);
-  * assets/lobby/*.jpg — карточки лобби Бункера и Мафии.
+  * assets/lobby/*.jpg — карточки лобби Бункера и Мафии;
+  * assets/mafia/*.jpg — фазы Мафии: night_N, morning_kill_N / morning_safe_N, day_N, vote_N (N = 1..10).
 
 Запускать вручную, когда что-то из этого меняется:  python tools/static_images.py
 Нужен цветной шрифт эмодзи (Noto Color Emoji: пакет fonts-noto-color-emoji). На сервере он не нужен —
@@ -15,7 +16,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from PIL import Image, ImageDraw, ImageFont  # noqa: E402
+import math  # noqa: E402
+import random  # noqa: E402
+
+from PIL import Image, ImageDraw, ImageFilter, ImageFont  # noqa: E402
 
 from games.bunker.render import _bold, _mono, _noise, _regular, _wrap  # noqa: E402
 from handlers.menu import IMAGES, ORDER, SECTIONS  # noqa: E402
@@ -93,7 +97,7 @@ def main_image() -> Image.Image:
 def section_image(key: str) -> Image.Image:
     s = SECTIONS[key]
     color = s["color"]
-    img = _noise(Image.new("RGB", (W, H), BG), hash(key) % 1000)
+    img = _noise(Image.new("RGB", (W, H), BG), sum(map(ord, key)))  # стабильный сид: без лишних диффов
     d = ImageDraw.Draw(img)
     _strip(d, color, tuple(c // 2 for c in color))
     _badge(img, s["emoji"], 64, 44, 140, color, 92)
@@ -182,6 +186,157 @@ def lobby_mafia() -> Image.Image:
     return img
 
 
+# ---------- фазы Мафии: ночь / утро (убили или все живы) / день / голосование, с номером ----------
+
+PHASES = ROOT / "assets" / "mafia"
+PHASE_MAX = 10   # дальше бот шлёт фазу текстом
+P_RED = (206, 38, 52)
+P_TEXT = (240, 238, 232)
+
+def _gradient(top, bottom) -> Image.Image:
+    img = Image.new("RGB", (W, H), top)
+    d = ImageDraw.Draw(img)
+    for y in range(H):
+        t = y / (H - 1)
+        d.line([(0, y), (W, y)], fill=tuple(int(top[i] * (1 - t) + bottom[i] * t) for i in range(3)))
+    return img
+
+
+def _skyline(img: Image.Image, body, lit, lit_share: float, glow=None) -> None:
+    """Силуэт города (одинаковый на всех картинках — сид фиксированный), окна горят с долей lit_share."""
+    rnd = random.Random(7)
+    d = ImageDraw.Draw(img)
+    x, base = -20, H
+    win_rnd = random.Random(int(lit_share * 1000) + 3)
+    while x < W:
+        bw = rnd.randint(70, 150)
+        bh = rnd.randint(120, 250)
+        top = base - bh
+        d.rectangle([x, top, x + bw, base], fill=body)
+        if rnd.random() < 0.3:  # антенна / крыша
+            d.rectangle([x + bw // 2 - 3, top - 30, x + bw // 2 + 3, top], fill=body)
+        for wy in range(top + 18, base - 20, 28):
+            for wx in range(x + 12, x + bw - 16, 24):
+                if win_rnd.random() < lit_share:
+                    d.rectangle([wx, wy, wx + 10, wy + 14], fill=lit)
+        x += bw + rnd.randint(-10, 6)
+    if glow:
+        haze = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(haze).rectangle([0, H - 120, W, H], fill=(*glow, 40))
+        img.paste(haze.filter(ImageFilter.GaussianBlur(30)), (0, 0), haze.filter(ImageFilter.GaussianBlur(30)))
+
+
+def _frame(img: Image.Image, color) -> None:
+    d = ImageDraw.Draw(img)
+    d.rectangle([14, 14, W - 15, H - 15], outline=color, width=6)
+    d.rectangle([30, 30, W - 31, H - 31], outline=tuple(c // 2 for c in color), width=2)
+
+
+def _titles(img: Image.Image, kicker: str, title: str, sub: str, kcolor) -> None:
+    # тень под текстом, чтобы читался на любом фоне
+    shade = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(shade).rectangle([40, 60, 760, 330], fill=(0, 0, 0, 110))
+    shade = shade.filter(ImageFilter.GaussianBlur(40))
+    img.paste(shade, (0, 0), shade)
+    d = ImageDraw.Draw(img)
+    d.text((64, 78), kicker, font=_mono(30), fill=kcolor)
+    d.text((58, 116), title, font=_bold(128), fill=P_TEXT)
+    d.text((64, 268), sub, font=_regular(36), fill=(214, 212, 206))
+
+
+def phase_night(n: int) -> Image.Image:
+    img = _gradient((6, 9, 26), (22, 26, 58))
+    d = ImageDraw.Draw(img)
+    rnd = random.Random(n)
+    for _ in range(140):  # звёзды
+        x, y, r = rnd.randint(0, W), rnd.randint(0, H - 260), rnd.choice([1, 1, 1, 2])
+        d.ellipse([x - r, y - r, x + r, y + r], fill=(220, 225, 255))
+    # луна-полумесяц
+    cx, cy, r = 1060, 150, 80
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(glow).ellipse([cx - 150, cy - 150, cx + 150, cy + 150], fill=(250, 235, 170, 60))
+    glow = glow.filter(ImageFilter.GaussianBlur(50))
+    img.paste(glow, (0, 0), glow)
+    moon = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(moon).ellipse([cx - r, cy - r, cx + r, cy + r], fill=(250, 238, 190, 255))
+    cut = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(cut).ellipse([cx - r + 38, cy - r - 18, cx + r + 38, cy + r - 18], fill=255)
+    alpha = moon.getchannel("A")
+    moon.putalpha(Image.composite(Image.new("L", (W, H), 0), alpha, cut))  # вырезаем — полумесяц
+    img.paste(moon, (0, 0), moon)
+    _skyline(img, (4, 5, 12), (250, 210, 110), 0.05)
+    _frame(img, (60, 70, 140))
+    _titles(img, "МАФИЯ · ГОРОД ЗАСЫПАЕТ", f"НОЧЬ {n}", "Мафия выходит на работу.", P_RED)
+    return _noise(img, n)
+
+
+def phase_morning(n: int, killed: bool = True) -> Image.Image:
+    """killed — ночью кого-то убили; иначе все живы (Доктор спас или мафия не договорилась)."""
+    img = _gradient((30, 20, 48), (236, 120, 60)) if killed else _gradient((44, 40, 78), (250, 168, 90))
+    d = ImageDraw.Draw(img)
+    cx, cy, r = 980, 470, 150
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(glow).ellipse([cx - 280, cy - 280, cx + 280, cy + 280], fill=(255, 190, 90, 90))
+    glow = glow.filter(ImageFilter.GaussianBlur(60))
+    img.paste(glow, (0, 0), glow)
+    d = ImageDraw.Draw(img)
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 206, 120))
+    _skyline(img, (28, 16, 30), (255, 220, 140), 0.18)
+    _frame(img, (236, 140, 70))
+    if killed:  # тревога: красный отсвет над городом
+        alarm = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(alarm).rectangle([0, H - 260, W, H], fill=(200, 20, 40, 70))
+        alarm = alarm.filter(ImageFilter.GaussianBlur(60))
+        img.paste(alarm, (0, 0), alarm)
+    _titles(img, "МАФИЯ · ГОРОД ПРОСЫПАЕТСЯ", f"УТРО {n}",
+           "Проснулись не все." if killed else "Сегодня проснулись все.", (255, 200, 110))
+    return _noise(img, 100 + n)
+
+
+def phase_day(n: int) -> Image.Image:
+    img = _gradient((40, 70, 110), (120, 150, 175))
+    d = ImageDraw.Draw(img)
+    cx, cy, r = 1080, 130, 70
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(glow).ellipse([cx - 190, cy - 190, cx + 190, cy + 190], fill=(255, 220, 120, 120))
+    glow = glow.filter(ImageFilter.GaussianBlur(55))
+    img.paste(glow, (0, 0), glow)
+    d = ImageDraw.Draw(img)
+    for k in range(12):  # лучи — чтобы солнце не путали с луной
+        a = k * math.pi / 6
+        d.line([(cx + math.cos(a) * (r + 14), cy + math.sin(a) * (r + 14)),
+                (cx + math.cos(a) * (r + 46), cy + math.sin(a) * (r + 46))], fill=(255, 214, 110), width=8)
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 214, 110))
+    _skyline(img, (34, 40, 52), (120, 140, 160), 0.25)
+    _frame(img, (200, 210, 225))
+    _titles(img, "МАФИЯ · ОБСУЖДЕНИЕ", f"ДЕНЬ {n}", "Кто из вас мафия?", (255, 225, 140))
+    return _noise(img, 200 + n)
+
+
+def phase_vote(n: int) -> Image.Image:
+    img = _gradient((40, 6, 12), (12, 4, 8))
+    d = ImageDraw.Draw(img)
+    # урна с бюллетенем
+    bx, by = 900, 250
+    d.polygon([(bx, by + 60), (bx + 260, by + 60), (bx + 240, by + 260), (bx + 20, by + 260)], fill=(90, 14, 24))
+    d.polygon([(bx - 10, by + 30), (bx + 270, by + 30), (bx + 260, by + 70), (bx, by + 70)], fill=(140, 24, 38))
+    d.rounded_rectangle([bx + 80, by + 42, bx + 180, by + 54], radius=5, fill=(30, 4, 8))  # прорезь
+    paper = Image.new("RGBA", (120, 150), (0, 0, 0, 0))
+    pd = ImageDraw.Draw(paper)
+    pd.rectangle([0, 0, 119, 149], fill=(240, 236, 228))
+    pd.line([(25, 30), (95, 100)], fill=P_RED, width=10)
+    pd.line([(95, 30), (25, 100)], fill=P_RED, width=10)
+    paper = paper.rotate(-12, expand=True, resample=Image.BICUBIC)
+    img.paste(paper, (bx + 62, by - 112), paper)
+    d = ImageDraw.Draw(img)
+    d.rectangle([bx + 60, by + 30, bx + 200, by + 46], fill=(140, 24, 38))  # бюллетень наполовину в урне
+    _skyline(img, (8, 2, 4), (180, 40, 50), 0.04)
+    _frame(img, P_RED)
+    _titles(img, f"МАФИЯ · ДЕНЬ {n}", "ГОЛОСУЕМ", "Кого казним? Голосование тайное.", P_RED)
+    return _noise(img, 300 + n)
+
+
+
 def save(img: Image.Image, name: str, folder: Path = IMAGES) -> None:
     folder.mkdir(parents=True, exist_ok=True)
     img.save(folder / f"{name}.jpg", format="JPEG", quality=90, optimize=True)
@@ -193,4 +348,11 @@ if __name__ == "__main__":
         save(section_image(key), key)
     save(lobby_bunker(), "bunker", LOBBY)
     save(lobby_mafia(), "mafia", LOBBY)
-    print("готово:", sorted(str(p.relative_to(ROOT)) for p in (*IMAGES.glob("*.jpg"), *LOBBY.glob("*.jpg"))))
+    for n in range(1, PHASE_MAX + 1):
+        save(phase_night(n), f"night_{n}", PHASES)
+        save(phase_morning(n, True), f"morning_kill_{n}", PHASES)
+        save(phase_morning(n, False), f"morning_safe_{n}", PHASES)
+        save(phase_day(n), f"day_{n}", PHASES)
+        save(phase_vote(n), f"vote_{n}", PHASES)
+    print("готово:", len(list(IMAGES.glob("*.jpg"))), "меню,", len(list(LOBBY.glob("*.jpg"))), "лобби,",
+          len(list(PHASES.glob("*.jpg"))), "фаз Мафии")

@@ -37,6 +37,10 @@ Telegram-бот на aiogram 3 + Claude API. Владелец общается �
   `games.is_comment`; id постов запоминает middleware в bot.py и `load_channel_posts` при старте игры. Ведущий (ИИ, `ai.mafia_*`, Sonnet; эпилог — Opus)
   ролей не знает — видит только публичное (иначе выдаст мафию). Таймеры — константы в начале `game.py`,
   для тестов `TIME_SCALE = 0.004`.
+- Мафия: фазы картинками — `assets/mafia/` (night_N, morning_kill_N / morning_safe_N — утро после убийства
+  или когда все живы, day_N, vote_N; N = 1..10, рисует `tools/static_images.py`). `_send_phase` шлёт картинку
+  с подписью (после первой — по file_id), номер > 10 или ошибка — текстом; правки таких сообщений —
+  `_edit_msg` (подпись), их id в `game.photo_msgs`. Переголосование — текстом.
 - Лобби Бункера и Мафии — картинкой (`assets/lobby/*.jpg`, тоже `tools/static_images.py`) с подписью:
   список игроков меняется через `_edit_lobby` (`edit_message_caption`); подсказок «жми Вступить…» в тексте
   нет — владелец убрал.

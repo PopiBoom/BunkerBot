@@ -110,6 +110,7 @@ class Game:
     bot_username: str = ""
     lobby_msg_id: int | None = None
     lobby_photo: bool = False  # лобби отправлено картинкой (правим подпись)
+    photo_msgs: set[int] = field(default_factory=set)  # сообщения фаз картинкой — правим подпись, не текст
     stop: asyncio.Event = field(default_factory=asyncio.Event)
     # ночь
     night_step: str = ""          # чей сейчас ход ночью: doctor | sheriff | mafia
@@ -349,6 +350,24 @@ async def _edit(bot: Bot, chat_id: int, message_id: int | None, text: str,
         return False
 
 
+async def _edit_msg(bot: Bot, game: Game, message_id: int | None, text: str,
+                    reply_markup: InlineKeyboardMarkup | None = None, retry: bool = True) -> bool:
+    """Правка сообщения партии: у картинки фазы — подпись, у обычного — текст."""
+    if message_id is None or message_id not in game.photo_msgs:
+        return await _edit(bot, game.chat_id, message_id, text, reply_markup, retry=retry)
+    try:
+        call = bot.edit_message_caption
+        kwargs = dict(chat_id=game.chat_id, message_id=message_id, caption=text[:MAX_CAPTION],
+                      reply_markup=reply_markup)
+        await (_retry(call, **kwargs) if retry else call(**kwargs))
+        return True
+    except TelegramBadRequest as e:
+        return "not modified" in str(e)
+    except Exception as e:
+        logger.debug("caption edit failed: %s", e)
+        return False
+
+
 async def _chat_edit(bot: Bot, game: Game, message_id: int | None, text, reply_markup=None,
                      ok=None, retry: bool = True) -> None:
     """Правка сообщения в чате под замком партии: правки идут строго по очереди, и устаревшая
@@ -356,8 +375,31 @@ async def _chat_edit(bot: Bot, game: Game, message_id: int | None, text, reply_m
     async with game.edit_lock:
         if ok is not None and not ok():
             return
-        await _edit(bot, game.chat_id, message_id, text() if callable(text) else text,
-                    reply_markup() if callable(reply_markup) else reply_markup, retry=retry)
+        await _edit_msg(bot, game, message_id, text() if callable(text) else text,
+                        reply_markup() if callable(reply_markup) else reply_markup, retry=retry)
+
+
+# ---------- картинки фаз (assets/mafia: night_N, morning_kill_N / morning_safe_N, day_N, vote_N) ----------
+
+PHASES = Path(__file__).resolve().parents[2] / "assets" / "mafia"
+_phase_ids: dict[str, str] = {}  # картинка -> file_id в Telegram: после первой отправки не грузим заново
+
+
+async def _send_phase(bot: Bot, game: Game, key: str, caption: str, text: str,
+                      reply_markup: InlineKeyboardMarkup | None = None) -> Message:
+    """Сообщение фазы картинкой с подписью caption; нет картинки (номер больше 10) — текстом text."""
+    path = PHASES / f"{key}.jpg"
+    if path.exists() and len(caption) <= MAX_CAPTION:
+        try:
+            msg = await _retry(bot.send_photo, game.chat_id, _phase_ids.get(key) or FSInputFile(path),
+                               caption=caption or None, reply_markup=reply_markup)
+            if msg.photo and key not in _phase_ids:
+                _phase_ids[key] = msg.photo[-1].file_id
+            game.photo_msgs.add(msg.message_id)
+            return msg
+        except Exception as e:
+            logger.info("phase picture %s failed, sending text: %s", key, e)
+    return await _send(bot, game.chat_id, text, reply_markup=reply_markup)
 
 
 async def _dm(bot: Bot, p: Player, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> Message | None:
@@ -1106,8 +1148,8 @@ async def _night(bot: Bot, game: Game) -> None:
     game.night_step = ""
     for p in game.players.values():
         p.night_msgs = {}
-    await _send(bot, game.chat_id, f"🌙 <b>НОЧЬ {game.no}</b>\n{HR}\n\nГород засыпает.",
-                reply_markup=_night_kb(game))
+    await _send_phase(bot, game, f"night_{game.no}", "", f"🌙 <b>НОЧЬ {game.no}</b>\n{HR}\n\nГород засыпает.",
+                      reply_markup=_night_kb(game))
     await _pause(game, 2)
     for step in ("doctor", "sheriff", "mafia"):
         if not _is_active(game):
@@ -1340,7 +1382,10 @@ async def _morning(bot: Bot, game: Game) -> None:
                                            C.title(victim.role) if victim else None, saved, dossier, _style(game)),
                           "morning")
     story = story or C.morning_fallback(victim.name if victim else None, role, saved)
-    await _say(bot, game, f"☀️ <b>УТРО {game.no}</b>\n{HR}\n\n{_host(game, story)}")
+    story_html = _host(game, story)
+    await _send_phase(bot, game, f"morning_{'kill' if victim else 'safe'}_{game.no}", story_html,
+                      f"☀️ <b>УТРО {game.no}</b>\n{HR}\n\n{story_html}")
+    await _pause(game, _read(story))
     if not victim or not _is_active(game):
         return
     await _send_card(bot, game, victim, "killed",
@@ -1352,9 +1397,10 @@ async def _morning(bot: Bot, game: Game) -> None:
 # ---------- день ----------
 
 
-def _day_text(game: Game, left: float | None = None) -> str:
+def _day_text(game: Game, left: float | None = None, header: bool = True) -> str:
+    """header=False — для картинки «День N»: заголовок уже на ней."""
     alive = _alive(game)
-    lines = [f"☀️ <b>ДЕНЬ {game.no}</b>", HR, "",
+    lines = ([f"☀️ <b>ДЕНЬ {game.no}</b>", HR, ""] if header else []) + [
              f"<b>В живых — {len(alive)}</b>"] + [f"• {_e(p.name)}" for p in alive] + ["",
              "Обсуждаем, кто мафия."]
     if left is not None:
@@ -1393,7 +1439,8 @@ async def _day(bot: Bot, game: Game) -> None:
     game.advance = asyncio.Event()
     since = time.time()
     total = day_time(len(_alive(game)))
-    msg = await _send(bot, game.chat_id, _day_text(game, total), reply_markup=_day_kb(game))
+    msg = await _send_phase(bot, game, f"day_{game.no}", _day_text(game, total, header=False),
+                            _day_text(game, total), reply_markup=_day_kb(game))
     game.day_msg_id = msg.message_id
     start = _now()
     ends, quip_at = start + total, start + total * 0.55
@@ -1413,7 +1460,8 @@ async def _day(bot: Bot, game: Game) -> None:
             _launch(bot, game, _day_quip(bot, game, since), fatal=False)
         left = ends - _now()
         if left > 1 and _is_active(game):
-            await _chat_edit(bot, game, game.day_msg_id, _day_text(game, left), _day_kb(game),
+            await _chat_edit(bot, game, game.day_msg_id,
+                             _day_text(game, left, header=game.day_msg_id not in game.photo_msgs), _day_kb(game),
                              ok=lambda: game.phase == "day", retry=False)
     if not _is_active(game):
         return
@@ -1459,7 +1507,8 @@ def _bars(game: Game) -> str:
     return "<code>" + "\n".join(lines) + "</code>"
 
 
-def _vote_text(game: Game, closed: bool = False) -> str:
+def _vote_text(game: Game, closed: bool = False, header: bool = True) -> str:
+    """header=False — для картинки голосования: заголовок «ГОЛОСУЕМ» уже на ней."""
     alive = _alive(game)
     revote = len(game.vote_targets) < len(alive)
     if closed:
@@ -1468,9 +1517,11 @@ def _vote_text(game: Game, closed: bool = False) -> str:
     if revote:
         names = _names([f"<b>{_e(game.players[u].name)}</b>" for u in game.vote_targets], " или ")
         lines = [f"⚖️ <b>ПЕРЕГОЛОСОВАНИЕ · ДЕНЬ {game.no}</b>", HR, "", f"Ничья. Выбираем между: {names}"]
-    else:
+    elif header:
         lines = [f"🗳 <b>ГОЛОСОВАНИЕ · ДЕНЬ {game.no}</b>", HR, "", "Кого казним? Голосование тайное."]
-    lines += ["", _bars(game), "", f"Проголосовали: {len(game.votes)}/{len(alive)}"]
+    else:
+        lines = []
+    lines += (["", _bars(game)] if lines else [_bars(game)]) + ["", f"Проголосовали: {len(game.votes)}/{len(alive)}"]
     return "\n".join(lines)
 
 
@@ -1489,7 +1540,8 @@ async def _refresh_vote(bot: Bot, game: Game) -> None:
     """Обновить счётчик голосов. Под замком и с проверкой стадии — устаревшая правка с кнопками
     не ляжет поверх закрытого голосования (иначе у всех снова появлялись бы кнопки)."""
     msg_id, stage = game.vote_msg_id, game.vote_stage
-    await _chat_edit(bot, game, msg_id, lambda: _vote_text(game), lambda: _vote_kb(game),
+    await _chat_edit(bot, game, msg_id, lambda: _vote_text(game, header=msg_id not in game.photo_msgs),
+                     lambda: _vote_kb(game),
                      ok=lambda: (game.phase == "vote" and game.vote_stage == stage and stage in ("open", "revote")
                                  and game.vote_msg_id == msg_id), retry=False)
 
@@ -1577,7 +1629,11 @@ async def _vote(bot: Bot, game: Game) -> None:
         game.vote_stage = "open" if attempt == 0 else "revote"
         game.advance = asyncio.Event()
         game.vote_ends = _now() + (VOTE_TIME if attempt == 0 else REVOTE_TIME)
-        msg = await _send(bot, game.chat_id, _vote_text(game), reply_markup=_vote_kb(game))
+        if attempt == 0:  # основное голосование — картинкой «ГОЛОСУЕМ · ДЕНЬ N»
+            msg = await _send_phase(bot, game, f"vote_{game.no}", _vote_text(game, header=False),
+                                    _vote_text(game), reply_markup=_vote_kb(game))
+        else:  # переголосование — текстом: на картинке не видно, между кем выбираем
+            msg = await _send(bot, game.chat_id, _vote_text(game), reply_markup=_vote_kb(game))
         game.vote_msg_id = msg.message_id
         if any(p.is_bot for p in _alive(game)):
             _launch(bot, game, _bots_vote(bot, game), fatal=False)
@@ -1586,7 +1642,7 @@ async def _vote(bot: Bot, game: Game) -> None:
             return
         async with game.edit_lock:  # закрываем после всех начатых правок — кнопки уже не вернутся
             game.vote_stage = "closed"
-            await _edit(bot, game.chat_id, game.vote_msg_id, _vote_text(game, closed=True))
+            await _edit_msg(bot, game, game.vote_msg_id, _vote_text(game, closed=True))
         if attempt == 0:
             _score_votes(game, game.votes)
         cands, top, skip = _tally(game)
