@@ -8,6 +8,10 @@ from __future__ import annotations
 # (раздел, [(команда, коротко для меню, подробно для /help)])
 # «Коротко» — до ~30 знаков: длиннее Telegram обрезает в меню на «…».
 GROUP_SECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
+    ("📋 Меню", [  # самым первым в «/» и капсом — так хочет владелец
+        ("menu", "МЕНЮ БОТА - ВСЁ КНОПКАМИ",
+         "меню с картинкой: разделы кнопками, внутри — действия (начать игру, рейтинг, опрос…) одним нажатием"),
+    ]),
     ("🏚 Бункер", [
         ("bunker", "начать (злой / добрый / кринж)",
          "собрать лобби и начать партию. Режим ведущего: /bunker злой, /bunker добрый, /bunker кринж"),
@@ -45,8 +49,6 @@ GROUP_SECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
          "/stats @ник — личная статистика"),
     ]),
     ("⚙️ Прочее", [
-        ("menu", "меню кнопками по разделам",
-         "меню с картинкой: разделы кнопками, внутри — действия (начать игру, рейтинг, опрос…) одним нажатием"),
         ("help", "все команды с описанием", "этот список"),
         ("forget_me", "забыть человека",
          "бот удалит всё о человеке в этом чате и перестанет его запоминать и трогать: ответь /forget_me на "
@@ -119,10 +121,11 @@ def menu(sections, separators: bool = False) -> list[tuple[str, str]]:
     out = []
     for title, items in sections:
         emoji = title.split()[0]
-        if separators and title in SEPARATORS:
+        sep = separators and title in SEPARATORS
+        if sep:
             out.append((SEPARATORS[title], f"━━ {title.upper()} ━━"))
-        for cmd, short, _long in items:
-            out.append((cmd, (short if separators else f"{emoji} {short}")[:256]))
+        for cmd, short, _long in items:  # под разделителем — без эмодзи, иначе (и у «Меню») — с ним
+            out.append((cmd, (short if sep else f"{emoji} {short}")[:256]))
     return out
 
 
