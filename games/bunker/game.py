@@ -838,7 +838,13 @@ async def cmd_bunker_stop(message: Message) -> None:
     if message.from_user and message.from_user.id != game.host_id:
         await message.answer("Остановить игру может только ведущий (кто её создал).")
         return
+    in_lobby = game.phase == "lobby"
     _end_game(game)
+    if in_lobby:  # остановили ещё в лобби — убираем его с кнопками, чтобы не висело
+        try:
+            await message.bot.delete_message(game.chat_id, game.lobby_msg_id)
+        except Exception:
+            pass
     if game.board_msg_id:
         try:
             await message.bot.unpin_chat_message(game.chat_id, message_id=game.board_msg_id)
@@ -913,15 +919,35 @@ async def _bunker_profile(message: Message, db: Database, user_id: int, name: st
 
 
 def _lobby_game(call: CallbackQuery) -> Game | None:
+    """Лобби, к которому относится нажатая кнопка, — только если это его сообщение (а не старого лобби)."""
     game = games.get(call.message.chat.id) if call.message else None
-    return game if game and game.phase == "lobby" else None
+    if game and game.phase == "lobby" and game.lobby_msg_id == call.message.message_id:
+        return game
+    return None
+
+
+async def _stale_lobby(call: CallbackQuery) -> None:
+    """Кнопка старого лобби (отменено, остановлено, уже есть новое): говорим и убираем это сообщение."""
+    game = games.get(call.message.chat.id) if call.message else None
+    if game and call.message and game.lobby_msg_id == call.message.message_id:
+        await call.answer("Игра уже началась.", show_alert=True)  # это лобби идущей партии — не трогаем
+        return
+    await call.answer("Это лобби уже закрыто.", show_alert=True)
+    if call.message:
+        try:
+            await call.message.delete()
+        except Exception:
+            try:
+                await call.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
 
 
 @router.callback_query(F.data == "bk:mode")
 async def cb_mode(call: CallbackQuery) -> None:
     game = _lobby_game(call)
     if not game:
-        await call.answer("Сейчас нельзя.", show_alert=True)
+        await _stale_lobby(call)
         return
     if call.from_user.id != game.host_id:
         await call.answer("Режим ведущего выбирает только тот, кто создал игру.", show_alert=True)
@@ -938,7 +964,7 @@ async def cb_mode(call: CallbackQuery) -> None:
 async def cb_leave(call: CallbackQuery) -> None:
     game = _lobby_game(call)
     if not game:
-        await call.answer("Сейчас нельзя выйти.", show_alert=True)
+        await _stale_lobby(call)
         return
     uid = call.from_user.id
     if uid not in game.players:
@@ -954,15 +980,12 @@ async def cb_leave(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "bk:cancel")
 async def cb_cancel(call: CallbackQuery) -> None:
-    game = games.get(call.message.chat.id) if call.message else None
+    game = _lobby_game(call)
     if not game:
-        await call.answer()
+        await _stale_lobby(call)
         return
     if call.from_user.id != game.host_id:
         await call.answer("Отменить может только ведущий.", show_alert=True)
-        return
-    if game.phase != "lobby":
-        await call.answer("Игра уже идёт — используйте /bunker_stop.", show_alert=True)
         return
     _end_game(game)
     await call.answer("Игра отменена.")
@@ -975,7 +998,7 @@ async def cb_cancel(call: CallbackQuery) -> None:
 async def cb_start(call: CallbackQuery) -> None:
     game = _lobby_game(call)
     if not game:
-        await call.answer("Сейчас нельзя начать.", show_alert=True)
+        await _stale_lobby(call)
         return
     if call.from_user.id != game.host_id:
         await call.answer("Начать игру может только ведущий.", show_alert=True)
