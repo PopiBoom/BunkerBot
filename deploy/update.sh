@@ -32,6 +32,7 @@ fi
 
 chmod +x "$DIR/deploy/update.sh"
 chown -R bunkerbot:bunkerbot "$DIR"
+VER="$("$DIR/.venv/bin/python" "$DIR/version.py" 2>/dev/null || echo "?")"  # 0.01, 0.02… (version.py)
 systemctl restart bunkerbot
-logger -t bunkerbot "обновлён до ${REMOTE:0:7}"
-echo "Обновлён: ${LOCAL:0:7} -> ${REMOTE:0:7}"
+logger -t bunkerbot "обновлён до ${REMOTE:0:7} (версия $VER)"
+echo "Обновлён: ${LOCAL:0:7} -> ${REMOTE:0:7} (версия $VER)"

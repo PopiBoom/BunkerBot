@@ -69,6 +69,29 @@ async def set_commands(bot: Bot, config, db: Database) -> None:
                     logger.info("меню админа в чате %s не поставилось: %s", chat_id, e2)
 
 
+VERSION_KEY = "bot_version"  # какую версию бот уже объявил в чатах
+
+
+async def announce_update(bot: Bot, db: Database) -> None:
+    """Новая версия кода — пишем в чаты «🔄 Бот обновлён до 0.0N» (раз на версию; перезапуск без обновления — молча)."""
+    import time as _time
+
+    import version
+
+    ver = await asyncio.to_thread(version.current)
+    if (await db.get_setting(VERSION_KEY, "")) == ver:
+        return
+    await db.set_setting(VERSION_KEY, ver)  # сразу: даже если отправка не удалась, не повторяем при каждом старте
+    logger.info("версия %s (%s) — объявляю в чатах", ver, await asyncio.to_thread(version.commit))
+    for chat_id in await db.active_chats(int(_time.time()) - 14 * 86400):
+        if chat_id >= 0:  # только группы
+            continue
+        try:
+            await bot.send_message(chat_id, f"🔄 Бот обновлён до {ver}")
+        except Exception as e:
+            logger.info("не смог объявить версию в %s: %s", chat_id, e)
+
+
 class AdminOnlyCommands(BaseMiddleware):
     """Команды — только админам. Кроме PUBLIC_COMMANDS (/start): чужие команды бот молча
     пропускает, будто их не было (а во время игры, где им не место, — удаляет).
@@ -148,6 +171,10 @@ async def main() -> None:
 
     me = await bot.get_me()
     logger.info("Бот @%s запущен. Требуемые чаты: %s", me.username, config.required_chats)
+    try:
+        await announce_update(bot, db)
+    except Exception as e:  # объявление — не критично
+        logger.warning("announce update failed: %s", e)
 
     await bot.delete_webhook(drop_pending_updates=True)
     # Фоновые задачи живут всё время работы; ссылки держим, чтобы их не собрал GC

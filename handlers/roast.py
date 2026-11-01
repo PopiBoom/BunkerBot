@@ -764,21 +764,9 @@ def _msk_time() -> str:
 
 
 def _version() -> str:
-    """Коммит, на котором сейчас работает бот (видно в /ship — проверить, доехало ли обновление)."""
-    try:
-        git = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".git")
-        head = open(os.path.join(git, "HEAD"), encoding="utf-8").read().strip()
-        if head.startswith("ref:"):
-            ref = head.split(maxsplit=1)[1]
-            path = os.path.join(git, ref)
-            if os.path.exists(path):
-                return open(path, encoding="utf-8").read().strip()[:7]
-            for line in open(os.path.join(git, "packed-refs"), encoding="utf-8"):
-                if line.strip().endswith(ref):
-                    return line[:7]
-        return head[:7]
-    except OSError:
-        return "?"
+    """Версия и коммит, на которых сейчас работает бот (видно в /ship — проверить, доехало ли обновление)."""
+    import version
+    return f"{version.current()} ({version.commit()})"
 
 
 SHIP_FALLBACK = [  # {a} — кому отвечаем, {b} — его «половинка»
