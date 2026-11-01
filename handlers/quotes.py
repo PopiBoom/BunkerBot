@@ -86,7 +86,7 @@ def render_quote(num: int, text: str, name: str, date: str) -> bytes:
 async def cmd_quote(message: Message, command: CommandObject, bot: Bot, db: Database) -> None:
     chat_id = message.chat.id
     if _bunker_active(chat_id):
-        await message.reply("Идёт Бункер — цитаты после партии 📜")
+        await message.reply("Идёт игра — цитаты после партии 📜")
         return
     rt = message.reply_to_message
     if rt is not None:

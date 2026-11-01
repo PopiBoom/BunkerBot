@@ -626,6 +626,11 @@ async def cmd_bunker(message: Message, command: CommandObject, db: Database) -> 
     if existing and existing.phase != "ended":
         await message.answer("В этом чате уже идёт игра в Бункер. Доиграйте или /bunker_stop.")
         return
+    from games import active
+
+    if active(chat_id) == "mafia":
+        await message.answer("В этом чате идёт Мафия. Доиграйте или /mafia_stop.")
+        return
 
     game = Game(chat_id=chat_id, host_id=user.id, db=db)
     arg = (command.args or "").strip().lower()

@@ -12,6 +12,14 @@ LOCAL="$("${G[@]}" rev-parse HEAD)"
 REMOTE="$("${G[@]}" rev-parse "origin/$BRANCH")"
 [ "$LOCAL" = "$REMOTE" ] && exit 0
 
+# Идёт игра (бот держит файл-флаг свежим) — не перезапускаемся, иначе партия оборвётся.
+# Флаг старше 2 минут — бот не работает или игр нет, тогда обновляемся.
+FLAG="$DIR/.game_running"
+if [ -f "$FLAG" ] && [ $(( $(date +%s) - $(stat -c %Y "$FLAG") )) -lt 120 ]; then
+  echo "Идёт игра — обновлюсь до ${REMOTE:0:7} после партии"
+  exit 0
+fi
+
 OLD_REQ="$("${G[@]}" show HEAD:requirements.txt | sha1sum)"
 "${G[@]}" reset -q --hard "origin/$BRANCH"
 NEW_REQ="$(sha1sum < "$DIR/requirements.txt")"

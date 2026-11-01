@@ -22,7 +22,7 @@ from commands import (ADMIN_SECTION, GROUP_SECTIONS, PRIVATE_SECTIONS, PUBLIC_CO
                       PUBLIC_PRIVATE_SECTIONS, command_name, menu)
 from config import load_config
 from database import Database
-from games import bunker_router
+from games import bunker_router, flag_loop, hush, mafia_router
 from handlers import (admin_router, compare_router, fun_router, help_router, quotes_router, roast_router,
                       stats_router, user_router)
 from handlers.admin import auto_backup_loop
@@ -63,8 +63,8 @@ async def set_commands(bot: Bot, config, db: Database) -> None:
 
 
 class AdminOnlyCommands(BaseMiddleware):
-    """Команды — только админам. Кроме PUBLIC_COMMANDS (/start, /forget_me, /remember_me):
-    чужие команды бот молча пропускает, будто их не было."""
+    """Команды — только админам. Кроме PUBLIC_COMMANDS (/start): чужие команды бот молча
+    пропускает, будто их не было (а во время игры, где им не место, — удаляет)."""
 
     async def __call__(self, handler, event: Message, data: dict):
         cmd = command_name(event.text or event.caption or "")
@@ -72,6 +72,11 @@ class AdminOnlyCommands(BaseMiddleware):
             cfg = data.get("config")
             user = event.from_user
             if not (cfg and user and cfg.is_admin(user.id)):
+                if hush(event):  # ночью Мафии / от мёртвых — удаляем и такое, чтобы не болтали через «/»
+                    try:
+                        await event.delete()
+                    except Exception:
+                        pass
                 return None
         return await handler(event, data)
 
@@ -97,12 +102,13 @@ async def main() -> None:
     dp["db"] = db
     dp["config"] = config
 
-    # Команды — только админам (кроме /start, /forget_me, /remember_me); проверка до всех роутеров
+    # Команды — только админам (кроме /start); проверка до всех роутеров
     dp.message.outer_middleware(AdminOnlyCommands())
     # admin_router раньше user_router: состояния FSM админа имеют приоритет
     dp.include_router(admin_router)
     dp.include_router(compare_router)
     dp.include_router(bunker_router)
+    dp.include_router(mafia_router)
     dp.include_router(user_router)
     dp.include_router(help_router)
     dp.include_router(quotes_router)
@@ -121,6 +127,7 @@ async def main() -> None:
     background = [
         asyncio.create_task(roast_background(bot, db)),
         asyncio.create_task(auto_backup_loop(bot, db, config)),  # ночной бэкап базы бате в личку
+        asyncio.create_task(flag_loop()),  # флаг «идёт игра»: пока он свежий, сервер не обновляется
     ]
     try:
         # message_reaction Telegram по умолчанию не присылает — просим все типы, что ловят обработчики

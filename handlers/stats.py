@@ -198,7 +198,7 @@ async def _user_stats(message: Message, db: Database, user_id: int, name: str) -
 async def cmd_stats(message: Message, command: CommandObject, bot: Bot, db: Database) -> None:
     chat_id = message.chat.id
     if _bunker_active(chat_id):
-        await message.reply("Идёт Бункер — статистика после партии 📊")
+        await message.reply("Идёт игра — статистика после партии 📊")
         return
     now = time.time()
     rt = message.reply_to_message

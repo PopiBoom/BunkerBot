@@ -103,7 +103,7 @@ async def cmd_poll(message: Message, bot: Bot, db: Database) -> None:
         await message.reply("Стёб-бот сейчас выключен.")
         return
     if R._bunker_active(chat_id):
-        await message.reply("Идёт Бункер — опросы после партии 🗳")
+        await message.reply("Идёт игра — опросы после партии 🗳")
         return
     if time.time() - _last_poll.get(chat_id, 0) < POLL_COOLDOWN:
         await message.reply("Один опрос уже висит — дождитесь итогов.")

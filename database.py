@@ -186,6 +186,29 @@ class Database:
                 )
                 """
             )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mafia_stats (
+                    user_id        INTEGER PRIMARY KEY,
+                    name           TEXT NOT NULL,
+                    games          INTEGER NOT NULL DEFAULT 0,
+                    wins           INTEGER NOT NULL DEFAULT 0,
+                    mafia_games    INTEGER NOT NULL DEFAULT 0,
+                    mafia_wins     INTEGER NOT NULL DEFAULT 0,
+                    town_wins      INTEGER NOT NULL DEFAULT 0,
+                    survived       INTEGER NOT NULL DEFAULT 0,
+                    first_victim   INTEGER NOT NULL DEFAULT 0,
+                    killed         INTEGER NOT NULL DEFAULT 0,
+                    executed       INTEGER NOT NULL DEFAULT 0,
+                    executed_town  INTEGER NOT NULL DEFAULT 0,
+                    sheriff_checks INTEGER NOT NULL DEFAULT 0,
+                    sheriff_hits   INTEGER NOT NULL DEFAULT 0,
+                    doc_saves      INTEGER NOT NULL DEFAULT 0,
+                    votes_right    INTEGER NOT NULL DEFAULT 0,
+                    votes_wrong    INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
             # Миграция: у «забытых» помним имя и @ник — чтобы админ мог вернуть их через /remember_me @ник
             cur = await db.execute("PRAGMA table_info(roast_optout)")
             ocols = {r[1] for r in await cur.fetchall()}
@@ -777,6 +800,45 @@ class Database:
                 return None
             prof = dict(zip(self._BUNKER_COLS, row))
             cur = await db.execute("SELECT COUNT(*) FROM bunker_stats WHERE survived > ?", (prof["survived"],))
+            prof["place"] = int((await cur.fetchone())[0]) + 1
+            return prof
+
+    # --- статистика Мафии ---
+
+    _MAFIA_COLS = ("user_id", "name", "games", "wins", "mafia_games", "mafia_wins", "town_wins", "survived",
+                   "first_victim", "killed", "executed", "executed_town", "sheriff_checks", "sheriff_hits",
+                   "doc_saves", "votes_right", "votes_wrong")
+    _MAFIA_SUM = _MAFIA_COLS[2:]  # всё, кроме id и имени, — счётчики
+
+    async def record_mafia_game(self, results: list[dict]) -> None:
+        """results: [{user_id, name, + любые счётчики из _MAFIA_SUM (games = 1)}]."""
+        cols = ", ".join(self._MAFIA_COLS)
+        marks = ", ".join("?" for _ in self._MAFIA_COLS)
+        upd = ", ".join(f"{c} = {c} + excluded.{c}" for c in self._MAFIA_SUM)
+        async with aiosqlite.connect(self.path) as db:
+            for r in results:
+                row = [r["user_id"], r["name"]] + [int(r.get(c, 0) or 0) for c in self._MAFIA_SUM]
+                await db.execute(
+                    f"INSERT INTO mafia_stats ({cols}) VALUES ({marks}) "
+                    f"ON CONFLICT(user_id) DO UPDATE SET name = excluded.name, {upd}", row)
+            await db.commit()
+
+    async def mafia_top(self, limit: int = 10) -> list[dict]:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                f"SELECT {', '.join(self._MAFIA_COLS)} FROM mafia_stats ORDER BY wins DESC, games ASC LIMIT ?",
+                (limit,))
+            return [dict(zip(self._MAFIA_COLS, r, strict=True)) for r in await cur.fetchall()]
+
+    async def mafia_profile(self, user_id: int) -> dict | None:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                f"SELECT {', '.join(self._MAFIA_COLS)} FROM mafia_stats WHERE user_id = ?", (user_id,))
+            row = await cur.fetchone()
+            if not row:
+                return None
+            prof = dict(zip(self._MAFIA_COLS, row, strict=True))
+            cur = await db.execute("SELECT COUNT(*) FROM mafia_stats WHERE wins > ?", (prof["wins"],))
             prof["place"] = int((await cur.fetchone())[0]) + 1
             return prof
 

@@ -218,10 +218,10 @@ def _as_dicts(rows: list[tuple]) -> list[dict]:
 
 
 def _bunker_active(chat_id: int) -> bool:
+    """Идёт игра — Бункер или Мафия, вместе с лобби: стёб-бот только запоминает и молчит."""
     try:
-        from games.bunker.game import games
-        g = games.get(chat_id)
-        return bool(g and g.phase != "ended")
+        from games import active
+        return active(chat_id) is not None
     except Exception:
         return False
 
@@ -630,7 +630,7 @@ async def cmd_roast(message: Message, command: CommandObject, bot: Bot, db: Data
         await message.reply("Для прожарки нужен ключ ИИ.")
         return
     if _bunker_active(message.chat.id):
-        await message.reply("Идёт Бункер — прожарю после партии 😈")
+        await message.reply("Идёт игра — прожарю после партии 😈")
         return
     chat_id = message.chat.id
     now = time.time()
@@ -697,7 +697,7 @@ async def cmd_week(message: Message, bot: Bot, db: Database) -> None:
         await message.reply("Стёб-бот сейчас выключен.")
         return
     if _bunker_active(message.chat.id):
-        await message.reply("Идёт Бункер — итоги недели после партии.")
+        await message.reply("Идёт игра — итоги недели после партии.")
         return
     now = time.time()
     if now - _last_week_cmd.get(message.chat.id, 0) < WEEK_COOLDOWN:
@@ -758,7 +758,7 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     if not optout and _PROMISE_HINT.search(message.text):
         _spawn(_check_promise(db, message))
 
-    # Пока идёт Бункер — бот только запоминает, не встревает и не ставит реакции
+    # Пока идёт игра (Бункер, Мафия) — бот только запоминает, не встревает и не ставит реакции
     if _bunker_active(chat_id):
         return
 

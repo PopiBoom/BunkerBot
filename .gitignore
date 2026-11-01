@@ -3,6 +3,7 @@
 *.db
 *.db-journal
 *.sqlite3
+.game_running
 
 # Python
 __pycache__/
