@@ -22,7 +22,7 @@ from commands import (ADMIN_SECTION, GROUP_SECTIONS, PRIVATE_SECTIONS, PUBLIC_CO
                       PUBLIC_PRIVATE_SECTIONS, command_name, menu)
 from config import load_config
 from database import Database
-from games import bunker_router, flag_loop, hush, mafia_router
+from games import bunker_router, flag_loop, hush, mafia_router, note_channel_post
 from handlers import (admin_router, compare_router, fun_router, help_router, quotes_router, roast_router,
                       stats_router, user_router)
 from handlers.admin import auto_backup_loop
@@ -67,6 +67,8 @@ class AdminOnlyCommands(BaseMiddleware):
     пропускает, будто их не было (а во время игры, где им не место, — удаляет)."""
 
     async def __call__(self, handler, event: Message, data: dict):
+        if event.is_automatic_forward:  # пост канала в чате — под ним комментарии, игры их не удаляют
+            note_channel_post(event.chat.id, event.message_id)
         cmd = command_name(event.text or event.caption or "")
         if cmd and cmd not in PUBLIC_COMMANDS:
             cfg = data.get("config")

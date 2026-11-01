@@ -408,6 +408,10 @@ def must_delete(message: Message) -> bool:
         return False
     if message.is_automatic_forward or message.sender_chat:  # посты канала и анонимные админы
         return False
+    from games import is_comment
+
+    if is_comment(message):  # комментарии к постам канала во время игры не удаляем
+        return False
     u = message.from_user
     if u is None or u.is_bot:
         return False
@@ -510,6 +514,9 @@ async def cmd_mafia(message: Message, command: CommandObject, db: Database) -> N
         await message.answer("В этом чате уже идёт " + ("Мафия. Доиграйте или /mafia_stop." if busy == "mafia"
                                                          else "Бункер. Доиграйте или /bunker_stop."))
         return
+    from games import load_channel_posts
+
+    await load_channel_posts(db, chat_id)  # чтобы не удалять комментарии к постам канала
     game = Game(chat_id=chat_id, host_id=user.id, db=db)
     saved = await db.get_setting(_mode_key(chat_id), "classic")
     game.mode = saved if saved in C.MODES else "classic"

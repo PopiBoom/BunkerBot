@@ -12,11 +12,46 @@ from pathlib import Path
 from .bunker import router as bunker_router
 from .mafia import router as mafia_router
 
-__all__ = ["bunker_router", "mafia_router", "active", "any_running", "hush", "flag_loop", "GAME_FLAG"]
+__all__ = ["bunker_router", "mafia_router", "active", "any_running", "hush", "flag_loop", "GAME_FLAG",
+           "is_comment", "note_channel_post", "load_channel_posts"]
 
 logger = logging.getLogger("games")
 GAME_FLAG = Path(__file__).resolve().parents[1] / ".game_running"  # свежий файл = идёт игра (см. update.sh)
 FLAG_EVERY = 10  # сек: как часто обновляем флаг (update.sh считает его устаревшим через 2 минуты)
+
+
+# Посты канала, пересланные в чат (их id = id ветки комментариев). Пополняется middleware в bot.py,
+# при старте игры — из памяти чата (посты, пришедшие до перезапуска бота).
+_channel_posts: dict[int, set[int]] = {}
+
+
+def note_channel_post(chat_id: int, message_id: int) -> None:
+    posts = _channel_posts.setdefault(chat_id, set())
+    posts.add(message_id)
+    if len(posts) > 2000:
+        for old in sorted(posts)[:1000]:
+            posts.discard(old)
+
+
+async def load_channel_posts(db, chat_id: int) -> None:
+    try:
+        for mid, uid, *_rest in await db.recent_messages(chat_id, limit=3000):
+            if uid == -1 and mid:  # так стёб-бот хранит посты канала (roast.CHANNEL_USER_ID)
+                note_channel_post(chat_id, mid)
+    except Exception as e:
+        logger.info("channel posts load failed: %s", e)
+
+
+def is_comment(message) -> bool:
+    """Комментарий к посту канала (в том числе ответ на чужой комментарий в той же ветке).
+    Игры такие сообщения не удаляют — ни ночью, ни от мёртвых и посторонних."""
+    rt = getattr(message, "reply_to_message", None)
+    if rt is not None:
+        sc = getattr(rt, "sender_chat", None)
+        if getattr(rt, "is_automatic_forward", False) or (sc is not None and getattr(sc, "type", "") == "channel"):
+            return True
+    tid = getattr(message, "message_thread_id", None)
+    return bool(tid) and tid in _channel_posts.get(message.chat.id, ())
 
 
 def active(chat_id: int) -> str | None:

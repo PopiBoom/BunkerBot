@@ -588,6 +588,10 @@ def _is_outsider(message: Message) -> bool:
         return False
     if message.sender_chat or message.is_automatic_forward:  # посты канала и анонимные админы
         return False
+    from games import is_comment
+
+    if is_comment(message):  # комментарии к постам канала во время игры не удаляем
+        return False
     u = message.from_user
     return bool(u and not u.is_bot and u.id not in game.players)
 
@@ -639,11 +643,12 @@ async def cmd_bunker(message: Message, command: CommandObject, db: Database) -> 
     if existing and existing.phase != "ended":
         await message.answer("В этом чате уже идёт игра в Бункер. Доиграйте или /bunker_stop.")
         return
-    from games import active
+    from games import active, load_channel_posts
 
     if active(chat_id) == "mafia":
         await message.answer("В этом чате идёт Мафия. Доиграйте или /mafia_stop.")
         return
+    await load_channel_posts(db, chat_id)  # чтобы не удалять комментарии к постам канала
 
     game = Game(chat_id=chat_id, host_id=user.id, db=db)
     arg = (command.args or "").strip().lower()
