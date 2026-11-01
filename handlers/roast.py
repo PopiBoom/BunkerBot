@@ -28,7 +28,8 @@ from datetime import datetime, timedelta, timezone
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Message, MessageReactionUpdated, ReactionTypeEmoji, ReplyParameters
+from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+                           MessageReactionUpdated, ReactionTypeEmoji, ReplyParameters)
 
 import ai
 import frames
@@ -36,7 +37,7 @@ import links
 import rhymes
 from database import Database
 
-from ephemeral import temp_reply
+from ephemeral import auto_delete, temp_reply
 
 logger = logging.getLogger("roast")
 router = Router(name="roast")
@@ -70,8 +71,11 @@ _RUDE = re.compile(
     r"(пош[её]л|иди|пиздуй|вали|катись|отъебись|отвали)\b.{0,12}(на\s*х|нах|в\s*жоп|в\s*пизд|нафиг)"
     r"|нахуй|\bнах\b|заткнись|завали\s*(еба|рот|хлеб)|отъебись|"
     r"\b(тупой|ебан\w*|ёбан\w*|сран\w*|долбан\w*|дебильн\w*|конченн?\w*)\s+бот"
-    r"|(бот\w*|\bты)\s*[-—,]?\s*(ты\s+)?(лох|дебил|тупо\w*|говно|хуйня|пидор\w*|чмо|идиот|долбо[её]б\w*"
-    r"|уеб\w*|мудак|клоун|кринж\w*)",
+    r"|(бот\w*|пиздю\w*|\bты)\s*[-—,]?\s*(ты\s+)?(?:(?:сам(?:ый|ая|ое)|такой|просто|реально|вообще|ебаный|ёбаный)\s+)?"
+    r"(лох|дебил|туп(?:ой|ая|ое|ые|ица|орыл\w*|ень|ня)\b|говно|хуйня|пидор\w*|пидар\w*|чмо|идиот\w*|долбо[её]б\w*|уеб\w*|уёб\w*|мудак\w*|клоун"
+    r"|кринж\w*|жирн\w*|толст\w*|урод\w*|страшн\w*|вонюч\w*|дур(?:ак|ачок|ень)\w*|придур\w*|ебан\w*|ёбан\w*"
+    r"|мраз\w*|твар\w*|гнид\w*|сук[аи]\b|ничтожеств\w*|бесполезн\w*|никч[её]мн\w*|убог\w*|позорищ\w*|хуйло"
+    r"|хуесос\w*|гандон\w*|гондон\w*|лошар\w*|чушпан\w*|бездар\w*|днище|отстой\w*|кусок\s+(?:говна|дерьма))",
     re.IGNORECASE,
 )
 _SEND_OFF = re.compile(r"на\s*хуй|нахуй|\bнах\b|в\s*жоп|в\s*пизд", re.IGNORECASE)
@@ -645,8 +649,92 @@ async def _set_ship(db: Database, chat_id: int, *user_ids: int | None) -> None:
     pair = await _ship_pair(db, chat_id)
     if len(pair) == 2 and any(u in {pid for pid, _ in pair} for u in user_ids if u):
         if random.random() < ai.SHIP_CHANCE:
-            note = ai.ship_text(pair[0][1], pair[1][1])
+            note = ai.ship_text(pair[0][1], pair[1][1], explicit=await _ship_explicit(db, chat_id))
     ai.ship_note.set(note)
+
+
+# ---------- согласие пары на шиппинг без тормозов (18+) ----------
+# Пошлое «кто кого чего хочет» — только если ОБА из пары сами нажали «Я за (мне 18+)». За другого
+# согласиться нельзя (и админу тоже): кнопка засчитывает только того, кто её нажал. «Я против» — сразу выкл.
+
+
+def _ship_ok_key(chat_id: int) -> str:
+    return f"ship_ok:{chat_id}"
+
+
+async def _ship_consent(db: Database, chat_id: int) -> set[int]:
+    try:
+        return {int(u) for u in json.loads(await db.get_setting(_ship_ok_key(chat_id), "") or "[]")}
+    except (ValueError, TypeError):
+        return set()
+
+
+async def _ship_explicit(db: Database, chat_id: int) -> bool:
+    pair = await _ship_pair(db, chat_id)
+    return len(pair) == 2 and {u for u, _ in pair} <= await _ship_consent(db, chat_id)
+
+
+def _consent_text(pair: list[tuple[int, str]], ok: set[int]) -> str:
+    both = {u for u, _ in pair} <= ok
+    lines = [f"🔞 <b>Шиппинг без тормозов</b>: {html.escape(pair[0][1])} + {html.escape(pair[1][1])}", "",
+             "Сейчас бот шипперит вас грубо, с матом («потрахайтесь уже»). Без тормозов — ещё и пошлые шутки, "
+             "кто кого и чего хочет. Включится, только если ОБА нажмут «Я за» сами (только если вам 18+). "
+             "Передумал — «Я против», и режим сразу выключится.", ""]
+    lines += [f"{'✅' if uid in ok else '⏳'} {html.escape(name)}" for uid, name in pair]
+    if both:
+        lines += ["", "Оба за — режим без тормозов включён."]
+    return "\n".join(lines)
+
+
+def _consent_kb(pair: list[tuple[int, str]]) -> InlineKeyboardMarkup:
+    ids = f"{pair[0][0]}:{pair[1][0]}"
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔞 Я за (мне 18+)", callback_data=f"shipok:{ids}:1"),
+        InlineKeyboardButton(text="🚫 Я против", callback_data=f"shipok:{ids}:0"),
+    ]])
+
+
+async def _send_consent(message: Message, db: Database, pair: list[tuple[int, str]]) -> None:
+    """Сообщение с кнопками согласия. Не служебное: /ship в TEMP_COMMANDS, а это должно остаться в чате."""
+    token = auto_delete.set(0)
+    try:
+        await message.answer(_consent_text(pair, await _ship_consent(db, message.chat.id)),
+                             reply_markup=_consent_kb(pair))
+    finally:
+        auto_delete.reset(token)
+
+
+@router.callback_query(F.data.startswith("shipok:"))
+async def cb_ship_consent(call: CallbackQuery, db: Database) -> None:
+    try:
+        _, a_s, b_s, yes_s = (call.data or "").split(":")
+        ids, yes = {int(a_s), int(b_s)}, yes_s == "1"
+    except ValueError:
+        await call.answer()
+        return
+    if call.message is None:
+        await call.answer()
+        return
+    chat_id = call.message.chat.id
+    pair = await _ship_pair(db, chat_id)
+    if len(pair) != 2 or {u for u, _ in pair} != ids:
+        await call.answer("Эта пара уже не актуальна.", show_alert=True)
+        return
+    uid = call.from_user.id
+    if uid not in ids:
+        await call.answer(f"Это решают только сами {pair[0][1]} и {pair[1][1]} - за другого согласиться нельзя.",
+                          show_alert=True)
+        return
+    ok = await _ship_consent(db, chat_id) & ids
+    (ok.add if yes else ok.discard)(uid)
+    await db.set_setting(_ship_ok_key(chat_id), json.dumps(sorted(ok)))
+    logger.info("ship consent in %s: %s -> %s (now %s)", chat_id, uid, yes, sorted(ok))
+    await call.answer("Записал: ты за." if yes else "Записал: ты против - без тормозов не будет.")
+    try:
+        await call.message.edit_text(_consent_text(pair, ok), reply_markup=_consent_kb(pair))
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e):
+            logger.debug("consent edit failed: %s", e)
 
 
 SHIP_REPLY_CHANCE = 1.0     # один из пары ответил другому — бот влезает с подколом КАЖДЫЙ раз (просьба бати)
@@ -682,13 +770,21 @@ SHIP_FALLBACK = [  # {a} — кому отвечаем, {b} — его «пол�
     "Да потрахайтесь вы уже, {a} и {b}, а то весь чат за вас переживает.",
     "{a}, {b}, снимите комнату, тут вообще-то люди.",
     "Напряжение между вами видно из космоса. Ебитесь уже, {a} и {b}.",
-    "Опять флиртуете при детях. {a}, забирай {b} в личку и не позорьтесь.",
+    "Опять флиртуете при детях. {a}, {b}, валите в личку и не позорьтесь.",
     "Ссоритесь как женатые, а ещё даже не ебались. Исправляйте, {a} и {b}.",
     "Весь чат уже ставки делает, когда {a} и {b} наконец потрахаются.",
-    "{a}, хватит строить из себя недотрогу, {b} же видно, что хочет. Ебитесь уже.",
+    "{a}, хватит строить из себя недотрогу - {b} тоже не из железа. Ебитесь уже.",
     "{a} и {b}, когда свадьба? Чат уже скинулся на презервативы.",
     "Вы двое переписываетесь как перед первым перепихоном. Давайте уже, {a} и {b}.",
-    "{a}, ты каждое сообщение {b} ждёшь, как нюдсы. Потрахайтесь и успокойтесь.",
+    "{a}, ты ответ ждёшь, как нюдсы. {b}, не мучай - потрахайтесь и успокойтесь.",
+]
+SHIP_FALLBACK_EXPLICIT = [  # оба сами согласились на «без тормозов» (18+)
+    "{a}, {b}, вы друг другу строчите, как перед минетом. Трахнитесь уже и не мучайте чат.",
+    "{a} и {b}, чат уже скинулся вам на смазку и стиральную машинку - сами знаете зачем.",
+    "{a}, ты пишешь так, будто уже стоишь на коленях. {b}, сжалься - потрахайтесь и успокойтесь.",
+    "Вы двое - сюжет дешёвого порно: начинается со ссоры в чате, кончается в стиральной машинке.",
+    "{a}, {b}, хватит дрочить друг на друга в переписке - идите уже отсосите друг другу и помиритесь.",
+    "{a}, у тебя каждое сообщение звучит как просьба отлизать. {b}, решайтесь уже, весь чат ждёт.",
 ]
 
 
@@ -710,7 +806,8 @@ async def _ship_line(db: Database, chat_id: int, me: str, partner: str, text: st
     """
     out = ""
     # и автор, и редактор знают: шутка про парочку — так надо; после — снимаем, чтобы не утекло
-    token = ai.ship_note.set(ai.ship_text(me, partner))
+    explicit = await _ship_explicit(db, chat_id)
+    token = ai.ship_note.set(ai.ship_text(me, partner, explicit=explicit))
     try:
         await _remember_lines(db, chat_id)
         ctx = _as_dicts(await db.recent_messages(chat_id, limit=15))
@@ -725,7 +822,7 @@ async def _ship_line(db: Database, chat_id: int, me: str, partner: str, text: st
         logger.warning("ship line failed: %s", e)
     finally:
         ai.ship_note.reset(token)
-    return out or random.choice(SHIP_FALLBACK).format(a=me, b=partner)
+    return out or random.choice(SHIP_FALLBACK_EXPLICIT if explicit else SHIP_FALLBACK).format(a=me, b=partner)
 
 
 async def _maybe_ship(message: Message, bot: Bot, db: Database) -> bool:
@@ -797,6 +894,7 @@ async def cmd_ship(message: Message, command: CommandObject, db: Database) -> No
     args = (command.args or "").split()
     if args and args[0].lower() in ("off", "выкл", "стоп"):
         await db.set_setting(_ship_key(chat_id), "")
+        await db.set_setting(_ship_ok_key(chat_id), "")  # согласия — только для этой пары
         _ship_state.pop(chat_id, None)
         await message.answer("💔 Шиппинг выключен.")
         return
@@ -817,6 +915,8 @@ async def cmd_ship(message: Message, command: CommandObject, db: Database) -> No
                                  "на сообщение - тебя и его.")
             return
         st = _ship_state.get(chat_id, {})
+        ok = await _ship_consent(db, chat_id)
+        both = {u for u, _ in pair} <= ok
         left = int(st.get("pause", 0) - time.time())
         last = _ship_debug.get(chat_id, "ответов друг другу пока не видел")
         await message.answer(f"💞 Сейчас шипперю: {html.escape(pair[0][1])} (id {pair[0][0]}) + "
@@ -824,7 +924,12 @@ async def cmd_ship(message: Message, command: CommandObject, db: Database) -> No
                              + (f"Пауза после {SHIP_STREAK} подколов подряд: ещё {left // 60 + 1} мин.\n" if left > 0
                                 else f"Подколов в этом потоке: {st.get('n', 0)} из {SHIP_STREAK}.\n")
                              + f"Последний ответ: {html.escape(last)}\n"
+                             + ("18+ без тормозов: включён (оба согласились сами).\n" if both else
+                                "18+ без тормозов: выключен - ждём кнопку от: "
+                                + ", ".join(html.escape(n) for u, n in pair if u not in ok) + " (кнопки ниже).\n")
                              + f"Версия бота: {_version()}\n/ship off - выключить.")
+        if not both:  # кнопки согласия — заново: вдруг старое сообщение потерялось
+            await _send_consent(message, db, pair)
         return
     if len(people) == 1 and message.from_user:
         people.insert(0, (message.from_user.id, _name(message)))
@@ -832,10 +937,14 @@ async def cmd_ship(message: Message, command: CommandObject, db: Database) -> No
     if a_id == b_id:
         await message.answer("С самим собой не шипперю - нужен второй.")
         return
+    old_pair = {u for u, _ in await _ship_pair(db, chat_id)}
     await db.set_setting(_ship_key(chat_id), json.dumps([[a_id, a_name], [b_id, b_name]], ensure_ascii=False))
+    if old_pair != {a_id, b_id}:  # новая пара — согласия заново (старые были не про неё)
+        await db.set_setting(_ship_ok_key(chat_id), "")
     _ship_state.pop(chat_id, None)  # новая пара — счёт и пауза заново
     await message.answer(f"💞 Окей: {html.escape(a_name)} + {html.escape(b_name)} теперь парочка чата. "
                          "Теперь шипперю жёстко, всегда. /ship off - выключить.")
+    await _send_consent(message, db, [(a_id, a_name), (b_id, b_name)])
 
 
 @router.message(Command("roast"))
