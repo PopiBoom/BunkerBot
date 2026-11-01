@@ -728,6 +728,7 @@ async def cmd_ship(message: Message, command: CommandObject, db: Database) -> No
     args = (command.args or "").split()
     if args and args[0].lower() in ("off", "выкл", "стоп"):
         await db.set_setting(_ship_key(chat_id), "")
+        _ship_state.pop(chat_id, None)
         await message.answer("💔 Шиппинг выключен.")
         return
     people: list[tuple[int, str]] = []
@@ -742,9 +743,16 @@ async def cmd_ship(message: Message, command: CommandObject, db: Database) -> No
         people.append((found[0], found[1] or nick))
     if not people:
         pair = await _ship_pair(db, chat_id)
+        if len(pair) != 2:
+            await message.answer("Шиппинг выключен. /ship @a @b - шипперить двоих, /ship @ник или ответом "
+                                 "на сообщение - тебя и его.")
+            return
+        st = _ship_state.get(chat_id, {})
+        left = int(st.get("pause", 0) - time.time())
         await message.answer(f"💞 Сейчас шипперю: {html.escape(pair[0][1])} + {html.escape(pair[1][1])}.\n"
-                             "/ship off - выключить." if len(pair) == 2 else
-                             "Шиппинг выключен. /ship @a @b - шипперить двоих, /ship @ник - тебя и его.")
+                             + (f"Пауза после {SHIP_STREAK} подколов подряд: ещё {left // 60 + 1} мин.\n" if left > 0
+                                else f"Подколов в этом потоке: {st.get('n', 0)} из {SHIP_STREAK}.\n")
+                             + "/ship off - выключить.")
         return
     if len(people) == 1 and message.from_user:
         people.insert(0, (message.from_user.id, _name(message)))
@@ -753,6 +761,7 @@ async def cmd_ship(message: Message, command: CommandObject, db: Database) -> No
         await message.answer("С самим собой не шипперю - нужен второй.")
         return
     await db.set_setting(_ship_key(chat_id), json.dumps([[a_id, a_name], [b_id, b_name]], ensure_ascii=False))
+    _ship_state.pop(chat_id, None)  # новая пара — счёт и пауза заново
     await message.answer(f"💞 Окей: {html.escape(a_name)} + {html.escape(b_name)} теперь парочка чата. "
                          "Буду иногда подкалывать. /ship off - выключить.")
 
