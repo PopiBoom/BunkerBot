@@ -61,13 +61,13 @@ def confirm_broadcast_keyboard() -> InlineKeyboardMarkup:
 
 
 def roast_interval_keyboard(current: int) -> InlineKeyboardMarkup:
-    """Выбор частоты, с которой стёб-бот сам встревает в разговор."""
-    from handlers.roast import INTERVALS
+    """Шанс, с которым стёб-бот сам встревает на обычное сообщение: «1 из N» (0 — выкл)."""
+    from handlers.roast import CHANCES
 
     builder = InlineKeyboardBuilder()
-    for sec, label, _ in INTERVALS:
-        mark = "✅ " if sec == current else ""
-        builder.button(text=f"{mark}{label}", callback_data=f"admin:roast_freq:{sec}")
+    for n, label in CHANCES:
+        mark = "✅ " if n == current else ""
+        builder.button(text=f"{mark}{label}", callback_data=f"admin:roast_freq:{n}")
     builder.adjust(3)
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:cancel"))
     return builder.as_markup()

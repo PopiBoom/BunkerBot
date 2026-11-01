@@ -45,14 +45,14 @@ router.message.filter(F.chat.type.in_({"group", "supergroup"}))
 
 ENABLED_KEY = "roast_enabled"
 KEEP_DAYS = 30                 # сколько хранить сырые сообщения
-INTERVAL_KEY = "roast_interval"  # как часто бот может сам встревать (сек, 0 — никогда)
-DEFAULT_INTERVAL = 5 * 60
-# (секунды, подпись, сколько новых сообщений нужно, чтобы был повод встрять)
-INTERVALS = [
-    (10, "10 сек", 1), (60, "1 мин", 2), (5 * 60, "5 мин", 3), (15 * 60, "15 мин", 5),
-    (30 * 60, "30 мин", 8), (60 * 60, "1 час", 12), (90 * 60, "1,5 часа", 15),
-    (3 * 3600, "3 часа", 20), (6 * 3600, "6 часов", 20), (0, "выкл", 0),
-]
+# Бот сам встревает НЕ по таймеру (раньше — ровно раз в N минут), а шансом: на каждое обычное сообщение
+# в чате — 1 из N, что он решит подколоть кого-то из свежих (просьба владельца, по умолчанию 1 из 20)
+CHANCE_KEY = "roast_chance"    # N; 0 — никогда
+DEFAULT_CHANCE = 20
+CHANCES = [(0, "выкл"), (50, "1 из 50"), (30, "1 из 30"), (20, "1 из 20"), (10, "1 из 10"), (5, "1 из 5")]
+AUTO_GAP = 2 * 60              # сек: два спонтанных подкола подряд — не чаще
+AUTO_FRESH = 15 * 60           # сек: подкалывать можно только свежие сообщения
+INTERVAL_KEY = "roast_interval"  # старая настройка (интервал): «0» там — значит, встревания были выключены
 HEAVY_EVERY = 10 * 60          # досье, чистка, итоги недели — раз в 10 минут
 ROAST_COOLDOWN = 30            # сек между /roast в одном чате
 WEEK_COOLDOWN = 3600           # /week не чаще раза в час
@@ -196,19 +196,18 @@ _last_roast: dict[int, float] = {}
 _last_week_cmd: dict[int, float] = {}
 
 
-async def get_interval(db: Database) -> int:
-    try:
-        return int(await db.get_setting(INTERVAL_KEY, str(DEFAULT_INTERVAL)))
-    except ValueError:
-        return DEFAULT_INTERVAL
+async def get_chance(db: Database) -> int:
+    """N из «1 из N» — шанс, что бот сам встрянет на обычное сообщение; 0 — выключено."""
+    raw = (await db.get_setting(CHANCE_KEY, "")).strip()
+    if raw.isdigit():
+        return int(raw)
+    if (await db.get_setting(INTERVAL_KEY, "")).strip() == "0":  # при интервалах было «выкл» — так и оставляем
+        return 0
+    return DEFAULT_CHANCE
 
 
-def interval_label(seconds: int) -> str:
-    return next((label for sec, label, _ in INTERVALS if sec == seconds), f"{seconds} сек")
-
-
-def _min_messages(seconds: int) -> int:
-    return next((n for sec, _, n in INTERVALS if sec == seconds), 10)
+def chance_label(n: int) -> str:
+    return next((label for v, label in CHANCES if v == n), f"1 из {n}")
 
 
 async def _enabled(db: Database) -> bool:
@@ -826,6 +825,7 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     if not addressed:
         if not optout:  # /forget_me — «не трогаю»: без реакций
             _spawn(_maybe_react(bot, db, message, user.id == _father_id(config)))
+        _spawn(_maybe_auto(bot, db, chat_id))  # иногда (1 из N) бот сам встревает — подколоть кого-то из свежих
         return
     if _RUDE.search(text):
         _spawn(_react(bot, chat_id, message.message_id, "🖕", force=True))
@@ -1436,23 +1436,30 @@ def _replyable(text: str) -> bool:
     return t.startswith(("[фото: ", "[альбом, ", "[кружок: ", "[видео: ")) and ": " in head
 
 
-async def _auto_roast(bot: Bot, db: Database, chat_id: int, interval: int) -> None:
+async def _maybe_auto(bot: Bot, db: Database, chat_id: int) -> None:
+    """Бот увидел обычное сообщение — с шансом 1 из N сам встревает (не по таймеру, просьба владельца)."""
+    n = await get_chance(db)
+    if n <= 0 or random.random() >= 1 / n:
+        return
+    await asyncio.sleep(random.uniform(2.0, 6.0))  # «прочитал» — и решил влезть
+    try:
+        await _auto_roast(bot, db, chat_id)
+    except Exception as e:
+        logger.warning("auto roast failed in %s: %s", chat_id, e)
+
+
+async def _auto_roast(bot: Bot, db: Database, chat_id: int) -> None:
     now = time.time()
-    last = _last_auto.get(chat_id)
-    if last is None:  # после перезапуска не набрасываемся сразу
-        _last_auto[chat_id] = now
+    if _bunker_active(chat_id) or chat_id in _pending or not await _enabled(db) or not ai.available():
         return
-    if now - last < interval or _bunker_active(chat_id) or chat_id in _pending:
+    if now - _last_auto.get(chat_id, 0) < AUTO_GAP or now - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
         return
-    if now - _last_bot_msg.get(chat_id, 0) < max(QUIET_AFTER_SPEAKING, interval):
-        return
-    if await db.count_messages_since(chat_id, int(last)) < _min_messages(interval):
-        return
+    last = _last_auto.get(chat_id, 0)
     _last_auto[chat_id] = now
     # Контекст — последние сообщения, отвечать можно только на новые (с прошлой проверки)
     rows = await db.recent_messages(chat_id, limit=30)
     answered = _answered.get(chat_id, set())
-    since = max(int(last), int(_last_bot_msg.get(chat_id, 0)))
+    since = max(int(last), int(_last_bot_msg.get(chat_id, 0)), int(now) - AUTO_FRESH)
     # Отвечать можно на живой текст и на фото, которое бот уже рассмотрел («[фото: что на нём]»).
     # На фото без описания, стикеры и пересланное — нет: ответил бы мимо, по прошлым сообщениям.
     new_ids = {r[0] for r in rows if r[4] >= since and r[0] not in answered and r[1] > 0
@@ -1532,12 +1539,11 @@ async def _heavy(bot: Bot, db: Database) -> None:
 
 
 async def background(bot: Bot, db: Database) -> None:
-    """Запускается из bot.py. Подколы — с частотой из /admin, тяжёлая работа — раз в 10 минут."""
+    """Запускается из bot.py: тяжёлая работа раз в 10 минут, обещания, посты, опросы. Спонтанные подколы —
+    не здесь, а шансом на каждое сообщение (_maybe_auto)."""
     last_heavy = 0.0
     while True:
-        interval = DEFAULT_INTERVAL
         try:
-            interval = await get_interval(db)
             if await _enabled(db) and ai.available():
                 if time.time() - last_heavy >= HEAVY_EVERY:
                     last_heavy = time.time()
@@ -1546,12 +1552,6 @@ async def background(bot: Bot, db: Database) -> None:
                     await _remind_promises(bot, db)
                 except Exception as e:
                     logger.warning("promise reminders failed: %s", e)
-                if interval > 0:
-                    for chat_id in await db.active_chats(int(time.time()) - 86400):
-                        try:  # в своей задаче: father_rude и т.п. одного подкола не утекают в следующий
-                            await asyncio.create_task(_auto_roast(bot, db, chat_id, interval))
-                        except Exception as e:
-                            logger.warning("auto roast failed in %s: %s", chat_id, e)
                 # Посты бота в канал (пока тестовый режим из /admin)
                 try:
                     from handlers import channel_posts
@@ -1574,7 +1574,7 @@ async def background(bot: Bot, db: Database) -> None:
         except Exception:
             logger.exception("roast background tick failed")
         # Проверяем чаще, чем интервал, но не реже раза в минуту
-        await asyncio.sleep(min(60, max(5, interval // 2)) if interval > 0 else 60)
+        await asyncio.sleep(30)
 
 
 # ---------- импорт истории из выгрузки Telegram Desktop ----------

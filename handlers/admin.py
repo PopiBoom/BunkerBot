@@ -196,21 +196,22 @@ async def admin_roast_freq(call: CallbackQuery, db: Database, config: Config) ->
     if not _is_admin(call.from_user.id, config):
         await call.answer(texts.ADMIN_ONLY, show_alert=True)
         return
-    from handlers.roast import get_interval, interval_label
+    from handlers.roast import chance_label, get_chance
     from keyboards import roast_interval_keyboard
 
-    current = await get_interval(db)
+    current = await get_chance(db)
     await call.answer()
     if call.message:
-        await call.message.answer(_freq_text(interval_label(current)), reply_markup=roast_interval_keyboard(current))
+        await call.message.answer(_freq_text(chance_label(current)), reply_markup=roast_interval_keyboard(current))
 
 
 def _freq_text(label: str) -> str:
     return (
         f"⏱ <b>Как часто стёб-бот сам встревает в разговор</b>\n\n"
         f"Сейчас: <b>{label}</b>\n\n"
-        "Бот встревает, только если с прошлого раза в чате появились новые сообщения: "
-        "чем чаще интервал, тем меньше их нужно. На ответы на грубость и обращения это не влияет."
+        "Не по таймеру: на каждое обычное сообщение в чате бот с этим шансом решает подколоть кого-то "
+        "из свежих (нет повода — промолчит), не чаще раза в 2 минуты. На ответы на грубость и обращения "
+        "это не влияет."
     )
 
 
@@ -219,24 +220,24 @@ async def admin_roast_freq_set(call: CallbackQuery, db: Database, config: Config
     if not _is_admin(call.from_user.id, config):
         await call.answer(texts.ADMIN_ONLY, show_alert=True)
         return
-    from handlers.roast import INTERVAL_KEY, INTERVALS, interval_label
+    from handlers.roast import CHANCE_KEY, CHANCES, chance_label
     from keyboards import roast_interval_keyboard
 
     try:
-        sec = int((call.data or "").rsplit(":", 1)[1])
+        n = int((call.data or "").rsplit(":", 1)[1])
     except ValueError:
         await call.answer()
         return
-    if sec not in {s for s, _, _ in INTERVALS}:
+    if n not in {v for v, _ in CHANCES}:
         await call.answer()
         return
-    await db.set_setting(INTERVAL_KEY, str(sec))
-    await call.answer(f"Готово: {interval_label(sec)}")
+    await db.set_setting(CHANCE_KEY, str(n))
+    await call.answer(f"Готово: {chance_label(n)}")
     if call.message:
         try:  # обновляем и текст «Сейчас: …», и галочку
-            await call.message.edit_text(_freq_text(interval_label(sec)), reply_markup=roast_interval_keyboard(sec))
+            await call.message.edit_text(_freq_text(chance_label(n)), reply_markup=roast_interval_keyboard(n))
         except Exception as e:
-            logger.warning("interval menu edit failed: %s", e)
+            logger.warning("chance menu edit failed: %s", e)
 
 
 @router.callback_query(F.data == "admin:roast_import")
