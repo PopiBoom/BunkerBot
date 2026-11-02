@@ -1395,6 +1395,7 @@ async def _video_frame(bot: Bot, media) -> bytes | None:
 
 DEMOT_CHANCE = 0.1   # фото (кадр видео/кружка) в чате — 1 из 10: бот сам делает из него демотиватор (вместо коммента)
 DEMOT_GAP = 10 * 60  # сек: сам — не чаще раза в 10 минут в чате
+DEMOT_HUSH = 2 * 60  # сек: после демотиватора бот сам не встревает (без «дополнительного сообщения»)
 _last_demot: dict[int, float] = {}
 
 
@@ -1403,8 +1404,14 @@ async def send_demotivator(bot: Bot, chat_id: int, reply_to: int, data: bytes, t
     jpg = await asyncio.to_thread(cards.render_demotivator, data, title, subtitle)
     sent = await bot.send_photo(chat_id, BufferedInputFile(jpg, filename="demotivator.jpg"),
                                 reply_parameters=ReplyParameters(message_id=reply_to, allow_sending_without_reply=True))
-    _last_bot_msg[chat_id] = time.time()
-    await db_add_own(chat_id, getattr(sent, "message_id", 0) or 0, f"[демотиватор: {title} - {subtitle}]")
+    # После демотиватора — ни слова (просьба владельца): на это фото больше никто не отвечает (ни коммент, ни
+    # фоновый подкол), и сам бот DEMOT_HUSH сек не встревает
+    _last_bot_msg[chat_id] = _last_demot[chat_id] = time.time()
+    _answered.setdefault(chat_id, set()).add(reply_to)
+    try:  # сбой записи в память уже не должен превращаться в лишнее сообщение
+        await db_add_own(chat_id, getattr(sent, "message_id", 0) or 0, f"[демотиватор: {title} - {subtitle}]")
+    except Exception as e:
+        logger.debug("save demotivator to memory failed: %s", e)
 
 
 async def _maybe_auto_demot(message: Message, bot: Bot, img: bytes, mime: str, caption: str) -> bool:
@@ -1457,6 +1464,8 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
     reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user
                         and message.reply_to_message.from_user.id == bot.id)
     addressed = reply_to_bot or bool(_BOT_NAME.search(caption) or _BOT_WORD.search(caption))
+    if message.message_id in _answered.get(chat_id, set()):  # на это фото уже ответили демотиватором
+        return
     if not addressed and await _maybe_auto_demot(message, bot, img, mime, caption):
         return
     if not addressed:
@@ -1613,6 +1622,8 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int) -> None:
     if _bunker_active(chat_id) or chat_id in _pending or not await _enabled(db) or not ai.available():
         return
     if now - _last_auto.get(chat_id, 0) < AUTO_GAP or now - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
+        return
+    if now - _last_demot.get(chat_id, 0) < DEMOT_HUSH:  # только что был демотиватор — без добавки
         return
     last = _last_auto.get(chat_id, 0)
     _last_auto[chat_id] = now
