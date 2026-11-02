@@ -1248,7 +1248,7 @@ async def on_group_gif(message: Message, bot: Bot, db: Database) -> None:
     if not await _enabled(db) or await db.is_optout(chat_id, user.id):
         return
     known = await db.add_sticker(chat_id, gif.file_unique_id, gif.file_id, None, None, "gif")
-    await db.add_media(chat_id, message.message_id, user.id, "video", gif.file_id)  # для /demot без ответа
+    await db.add_media(chat_id, message.message_id, user.id, "video", gif.file_id, gif.duration or 0)  # /demot, /vmem
     descr = await _sticker_descr(bot, db, gif.file_unique_id, known, gif.thumbnail, "гифка")
     caption = f" {message.caption}" if message.caption else ""
     await db.add_chat_message(chat_id, message.message_id, user.id, _name(message), user.username,
@@ -1374,7 +1374,7 @@ async def on_group_video(message: Message, bot: Bot, db: Database, config=None) 
         return
     media = message.video_note or message.video
     if (getattr(media, "file_size", 0) or 0) <= VIDEO_MAX:  # для /demot без ответа
-        await db.add_media(message.chat.id, message.message_id, user.id, "video", media.file_id)
+        await db.add_media(message.chat.id, message.message_id, user.id, "video", media.file_id, media.duration or 0)
     frame, speech, raw = None, "", None
     if ai.available() and (getattr(media, "file_size", 0) or 0) <= VIDEO_MAX:
         try:
@@ -1470,6 +1470,8 @@ async def send_demotivator(bot: Bot, chat_id: int, reply_to: int, data: bytes, t
     _last_bot_msg[chat_id] = _last_demot[chat_id] = _last_pic[chat_id] = time.time()
     _answered.setdefault(chat_id, set()).add(reply_to)
     try:  # сбой записи в память уже не должен превращаться в лишнее сообщение
+        if _db_ref:  # из этого фото демотиватор уже был — /demot без ответа его больше не возьмёт
+            await _db_ref[0].mark_media_used(chat_id, reply_to, "demot")
         await db_add_own(chat_id, getattr(sent, "message_id", 0) or 0, f"[демотиватор: {title} - {subtitle}]")
     except Exception as e:
         logger.debug("save demotivator to memory failed: %s", e)
@@ -1557,6 +1559,11 @@ async def send_video_meme(bot: Bot, chat_id: int, reply_to: int | None, data: by
         sent = await bot.send_animation(chat_id, file, width=w, height=h, **_reply_kw(reply_to))
     else:
         sent = await bot.send_video(chat_id, file, width=w, height=h, supports_streaming=True, **_reply_kw(reply_to))
+    if reply_to and _db_ref:  # из этого видео мем уже был — /vmem без ответа его больше не возьмёт
+        try:
+            await _db_ref[0].mark_media_used(chat_id, reply_to, "vmem")
+        except Exception as e:
+            logger.debug("mark media used failed: %s", e)
     await _after_pic(chat_id, reply_to, sent, f"[видео-мем: {caption}]", kind, caption)
 
 

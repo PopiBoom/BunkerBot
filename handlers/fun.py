@@ -218,10 +218,10 @@ async def _media_bytes(bot: Bot, rt: Message) -> bytes | None:
 
 
 async def _pick_media(bot: Bot, db: Database, chat_id: int) -> tuple[int, bytes] | None:
-    """/demot без ответа: бот сам берёт свежее фото, видео, кружок, стикер или гифку из чата (за 3 дня)."""
-    rows = await db.recent_media(chat_id, int(time.time()) - 3 * 86400, limit=40)
-    random.shuffle(rows)
-    for msg_id, kind, file_id in rows[:5]:  # файл могли удалить — пробуем несколько
+    """/demot без ответа: бот сам берёт самое свежее фото, видео, кружок, стикер или гифку из чата (за 3 дня),
+    из которого ещё не делал демотиватор (раньше брал случайное — и одно и то же по кругу)."""
+    rows = await db.recent_media(chat_id, int(time.time()) - 3 * 86400, limit=5, unused_for="demot")
+    for msg_id, kind, file_id in rows:  # файл могли удалить — пробуем несколько
         try:
             raw = (await bot.download(file_id)).read()
             if kind == "video":
@@ -253,7 +253,8 @@ async def cmd_demot(message: Message, command: CommandObject, bot: Bot, db: Data
     else:  # ничего не выбрано — сам выбирает, что демотивировать
         picked = await _pick_media(bot, db, chat_id)
         if picked is None:
-            await temp_reply(message, "В чате за 3 дня нет фото или стикеров - ответь /demot на картинку.")
+            await temp_reply(message, "Новых фото и стикеров за 3 дня нет (из прошлых демотиваторы уже были) - "
+                                      "ответь /demot на нужную картинку.")
             return
         (target, data), caption = picked, ""
     if not data:
@@ -367,14 +368,16 @@ async def cmd_meme(message: Message, command: CommandObject, bot: Bot, db: Datab
 
 
 async def _pick_video(bot: Bot, db: Database, chat_id: int) -> tuple[int, bytes] | None:
-    """/vmem без ответа: свежее видео, кружок или гифка из чата (за 3 дня)."""
-    rows = [r for r in await db.recent_media(chat_id, int(time.time()) - 3 * 86400, limit=40) if r[1] == "video"]
-    random.shuffle(rows)
-    for msg_id, _kind, file_id in rows[:4]:
+    """/vmem без ответа: самое свежее видео, кружок или гифка чата (за 3 дня, до 60 сек), из которого ещё не
+    делали видео-мем. Раньше брал случайное и не помнил, какое уже было, — один кружок три раза подряд."""
+    rows = await db.recent_media(chat_id, int(time.time()) - 3 * 86400, limit=4, kind="video",
+                                 unused_for="vmem", max_dur=memes.VIDEO_MAX_SEC)
+    for msg_id, _kind, file_id in rows:
         try:
             data = (await bot.download(file_id)).read()
             if 0 < await asyncio.to_thread(memes.video_duration, data) <= memes.VIDEO_MAX_SEC:
                 return msg_id, data
+            await db.mark_media_used(chat_id, msg_id, "vmem")  # старая запись без длины, а видео длинное
         except Exception as e:
             logger.info("vmem pick %s failed: %s", msg_id, e)
     return None
@@ -417,7 +420,8 @@ async def cmd_vmem(message: Message, command: CommandObject, bot: Bot, db: Datab
     else:
         picked = await _pick_video(bot, db, chat_id)
         if picked is None:
-            await temp_reply(message, "В чате за 3 дня нет видео - ответь /vmem на видео, кружок или гифку.")
+            await temp_reply(message, "Новых видео за 3 дня нет (из прошлых мемы уже были) - ответь /vmem на "
+                                      "нужное видео, кружок или гифку.")
             return
         (target, data), label = picked, "видео"
     text = (command.args or "").strip()

@@ -253,6 +253,13 @@ class Database:
             for col in ("streak", "best_streak", "votes_against", "heroes", "deaths", "lucky"):
                 if col not in bcols:
                     await db.execute(f"ALTER TABLE bunker_stats ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+            # Миграция: медиа чата — длительность и «уже было в демотиваторе / видео-меме» (без ответа бот брал
+            # одно и то же видео по кругу)
+            cur = await db.execute("PRAGMA table_info(chat_media)")
+            mcols = {r[1] for r in await cur.fetchall()}
+            for col in ("dur", "demot_used", "vmem_used"):
+                if col not in mcols:
+                    await db.execute(f"ALTER TABLE chat_media ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
             # Миграция: в старых базах у stickers нет описания и вида (стикер / гифка)
             cur = await db.execute("PRAGMA table_info(stickers)")
             cols = {r[1] for r in await cur.fetchall()}
@@ -767,22 +774,44 @@ class Database:
 
     # --- медиа чата (для /demot без ответа) ---
 
-    async def add_media(self, chat_id: int, msg_id: int, user_id: int, kind: str, file_id: str) -> None:
-        """kind: image — картинку можно качать как есть; video — нужен кадр из середины."""
+    async def add_media(self, chat_id: int, msg_id: int, user_id: int, kind: str, file_id: str, dur: int = 0) -> None:
+        """kind: image — картинку можно качать как есть; video — нужен кадр из середины. dur — секунды (видео)."""
         async with aiosqlite.connect(self.path) as db:
-            await db.execute("INSERT OR REPLACE INTO chat_media (chat_id, msg_id, user_id, kind, file_id, ts) "
-                             "VALUES (?, ?, ?, ?, ?, ?)", (chat_id, msg_id, user_id, kind, file_id, int(time.time())))
+            await db.execute("INSERT INTO chat_media (chat_id, msg_id, user_id, kind, file_id, ts, dur) "
+                             "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (chat_id, msg_id) DO UPDATE SET "
+                             "file_id = excluded.file_id",
+                             (chat_id, msg_id, user_id, kind, file_id, int(time.time()), int(dur or 0)))
             await db.execute("DELETE FROM chat_media WHERE ts < ?", (int(time.time()) - 14 * 86400,))
             await db.commit()
 
-    async def recent_media(self, chat_id: int, since: int, limit: int = 40) -> list[tuple]:
-        """[(msg_id, kind, file_id)] — свежие медиа чата (без «забытых»), новые первыми."""
+    async def recent_media(self, chat_id: int, since: int, limit: int = 40, kind: str | None = None,
+                           unused_for: str | None = None, max_dur: int = 0) -> list[tuple]:
+        """[(msg_id, kind, file_id)] — свежие медиа чата (без «забытых»), новые первыми.
+        unused_for: "demot" / "vmem" — только те, из которых ещё не делали демотиватор / видео-мем;
+        max_dur — не длиннее (0 у старых записей — длина неизвестна, берём)."""
+        sql = ("SELECT m.msg_id, m.kind, m.file_id FROM chat_media m WHERE m.chat_id = ? AND m.ts >= ? "
+               "AND NOT EXISTS (SELECT 1 FROM roast_optout o WHERE o.chat_id = m.chat_id AND o.user_id = m.user_id)")
+        args: list = [chat_id, since]
+        if kind:
+            sql += " AND m.kind = ?"
+            args.append(kind)
+        if unused_for in ("demot", "vmem"):
+            sql += f" AND m.{unused_for}_used = 0"
+        if max_dur:
+            sql += " AND m.dur <= ?"
+            args.append(max_dur)
         async with aiosqlite.connect(self.path) as db:
-            cur = await db.execute(
-                "SELECT m.msg_id, m.kind, m.file_id FROM chat_media m WHERE m.chat_id = ? AND m.ts >= ? "
-                "AND NOT EXISTS (SELECT 1 FROM roast_optout o WHERE o.chat_id = m.chat_id AND o.user_id = m.user_id) "
-                "ORDER BY m.ts DESC LIMIT ?", (chat_id, since, limit))
+            cur = await db.execute(sql + " ORDER BY m.ts DESC LIMIT ?", (*args, limit))
             return list(await cur.fetchall())
+
+    async def mark_media_used(self, chat_id: int, msg_id: int, what: str) -> None:
+        """Из этого фото/видео уже сделали демотиватор (what="demot") или видео-мем ("vmem")."""
+        if what not in ("demot", "vmem"):
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(f"UPDATE chat_media SET {what}_used = 1 WHERE chat_id = ? AND msg_id = ?",
+                             (chat_id, msg_id))
+            await db.commit()
 
     # --- лог ответов бота (/log) ---
 
