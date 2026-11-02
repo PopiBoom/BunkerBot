@@ -108,8 +108,8 @@ def section_image(key: str) -> Image.Image:
     d.text((232, 178), s["tagline"], font=_regular(28), fill=MUTED)
 
     rows = s["rows"]
-    y, gap = 232, 12
-    rh = 88 if len(rows) >= 4 else 104  # трёх строк меньше — делаем их выше, чтобы картинка не пустела
+    y, gap = 232, (10 if len(rows) >= 6 else 12)
+    rh = 62 if len(rows) >= 6 else 88 if len(rows) >= 4 else 104  # мало строк — выше, много — ниже (влезть в 720)
     for em, name, desc, cmd, action in rows:
         d.rounded_rectangle([64, y, W - 64, y + rh], radius=18, fill=PANEL, outline=LINE, width=2)
         if action:  # действие есть кнопкой — полоска цвета раздела

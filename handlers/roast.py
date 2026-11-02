@@ -35,6 +35,7 @@ import ai
 import cards
 import frames
 import links
+import memes
 import rhymes
 from database import Database
 
@@ -378,12 +379,13 @@ async def _typing(bot: Bot, chat_id: int, text: str, lo: float, hi: float) -> No
 
 
 @contextlib.asynccontextmanager
-async def _typing_on(bot: Bot, chat_id: int):
-    """«Печатает…» сразу и всё время, пока бот думает (Telegram гасит его через ~5 сек — обновляем)."""
+async def _typing_on(bot: Bot, chat_id: int, action: str = "typing"):
+    """«Печатает…» сразу и всё время, пока бот думает (Telegram гасит его через ~5 сек — обновляем).
+    action — upload_photo / upload_video для мемов: «отправляет фото/видео…», пока рисует и монтирует."""
     async def keep() -> None:
         while True:
             try:
-                await bot.send_chat_action(chat_id, "typing")
+                await bot.send_chat_action(chat_id, action)
             except Exception:
                 pass
             await asyncio.sleep(4)
@@ -1398,8 +1400,9 @@ async def _video_frame(bot: Bot, media) -> bytes | None:
 
 DEMOT_CHANCE = 0.1   # фото (кадр видео/кружка) в чате — 1 из 10: бот сам делает из него демотиватор (вместо коммента)
 DEMOT_GAP = 10 * 60  # сек: сам — не чаще раза в 10 минут в чате
-DEMOT_HUSH = 2 * 60  # сек: после демотиватора бот сам не встревает (без «дополнительного сообщения»)
+DEMOT_HUSH = 2 * 60  # сек: после демотиватора или мема бот сам не встревает (без «дополнительного сообщения»)
 _last_demot: dict[int, float] = {}
+_last_pic: dict[int, float] = {}   # когда бот последний раз ответил картинкой/видео-мемом (для DEMOT_HUSH)
 
 
 async def send_demotivator(bot: Bot, chat_id: int, reply_to: int, data: bytes, title: str, subtitle: str) -> None:
@@ -1409,7 +1412,7 @@ async def send_demotivator(bot: Bot, chat_id: int, reply_to: int, data: bytes, t
                                 reply_parameters=ReplyParameters(message_id=reply_to, allow_sending_without_reply=True))
     # После демотиватора — ни слова (просьба владельца): на это фото больше никто не отвечает (ни коммент, ни
     # фоновый подкол), и сам бот DEMOT_HUSH сек не встревает
-    _last_bot_msg[chat_id] = _last_demot[chat_id] = time.time()
+    _last_bot_msg[chat_id] = _last_demot[chat_id] = _last_pic[chat_id] = time.time()
     _answered.setdefault(chat_id, set()).add(reply_to)
     try:  # сбой записи в память уже не должен превращаться в лишнее сообщение
         await db_add_own(chat_id, getattr(sent, "message_id", 0) or 0, f"[демотиватор: {title} - {subtitle}]")
@@ -1437,6 +1440,113 @@ async def _maybe_auto_demot(message: Message, bot: Bot, img: bytes, mime: str, c
         return True
     except Exception as e:
         logger.warning("auto demotivator failed: %s", e)
+        return False
+
+
+# ---------- мемы (memes.py): по шаблону и видео с плашкой «когда…» ----------
+
+MEME_SHARE = 0.2       # сам встревает — иногда (1 из 5) мемом по шаблону вместо текста
+MEME_GAP = 30 * 60     # сам мем по шаблону — не чаще раза в 30 мин в чате
+VMEM_CHANCE = 0.1      # видео или кружок в чате — 1 из 10: сам делает из него видео-мем (вместо коммента)
+VMEM_GAP = 20 * 60     # сам видео-мем — не чаще раза в 20 мин в чате
+VMEM_AUTO_SEC = 30     # сам — только короткие видео (перекодирование грузит процессор сервера)
+_last_meme: dict[int, float] = {}
+_last_vmem: dict[int, float] = {}
+_recent_memes: dict[int, list[str]] = {}   # последние шаблоны в чате — ИИ просим взять другой
+_vmem_lock = asyncio.Lock()                 # видео перекодируем по одному
+
+
+def recent_templates(chat_id: int) -> list[str]:
+    return _recent_memes.get(chat_id, [])[-5:]
+
+
+async def _after_pic(chat_id: int, reply_to: int | None, sent, memory: str, kind: str, draft: str = "") -> None:
+    """После картинки/видео-мема: без добавки текстом, сообщение отвечено, запись в память и в /log."""
+    _last_bot_msg[chat_id] = _last_pic[chat_id] = time.time()
+    if reply_to:
+        _answered.setdefault(chat_id, set()).add(reply_to)
+    try:
+        msg_id = getattr(sent, "message_id", 0) or 0
+        await db_add_own(chat_id, msg_id, memory)
+        if _db_ref:
+            await _db_ref[0].add_bot_log(chat_id, msg_id, kind, reply_to, draft or None)
+    except Exception as e:
+        logger.debug("save meme to memory failed: %s", e)
+
+
+def _reply_kw(reply_to: int | None) -> dict:
+    return ({"reply_parameters": ReplyParameters(message_id=reply_to, allow_sending_without_reply=True)}
+            if reply_to else {})
+
+
+async def send_meme(bot: Bot, chat_id: int, reply_to: int | None, tid: str, lines: list[str], kind: str) -> None:
+    """Мем по шаблону (memes.render_meme) ответом на сообщение, про которое он."""
+    jpg = await asyncio.to_thread(memes.render_meme, tid, lines)
+    sent = await bot.send_photo(chat_id, BufferedInputFile(jpg, filename="meme.jpg"), **_reply_kw(reply_to))
+    rec = _recent_memes.setdefault(chat_id, [])
+    rec.append(tid)
+    del rec[:-10]
+    await _after_pic(chat_id, reply_to, sent, f"[мем «{tid}»: {' / '.join(lines)}]", kind, " / ".join(lines))
+
+
+async def send_video_meme(bot: Bot, chat_id: int, reply_to: int | None, data: bytes, caption: str, kind: str,
+                          as_gif: bool | None = None) -> None:
+    """Видео-мем: белая плашка с подписью над видео (memes.make_video_meme), ответом на исходное видео.
+    as_gif: гифка — гифкой (крутится по кругу); None — гифкой, если в видео нет звука."""
+    async with _vmem_lock, _typing_on(bot, chat_id, "upload_video"):
+        mp4, w, h, sound = await asyncio.to_thread(memes.make_video_meme, data, caption)
+    file = BufferedInputFile(mp4, filename="meme.mp4")
+    if as_gif or (as_gif is None and not sound):
+        sent = await bot.send_animation(chat_id, file, width=w, height=h, **_reply_kw(reply_to))
+    else:
+        sent = await bot.send_video(chat_id, file, width=w, height=h, supports_streaming=True, **_reply_kw(reply_to))
+    await _after_pic(chat_id, reply_to, sent, f"[видео-мем: {caption}]", kind, caption)
+
+
+async def _maybe_auto_meme(bot: Bot, chat_id: int, rows: list[tuple], dossiers: dict[str, str],
+                           new_ids: set) -> bool:
+    """Сам встрял — иногда мемом по шаблону про одно из новых сообщений. True — мем ушёл."""
+    now = time.time()
+    if random.random() >= MEME_SHARE or now - _last_meme.get(chat_id, 0) < MEME_GAP:
+        return False
+    _last_meme[chat_id] = now
+    try:
+        res = await ai.meme(_as_dicts(rows), dossiers, new_ids=new_ids, avoid=recent_templates(chat_id))
+        if not res or res.get("reply_to") not in new_ids:
+            return False
+        if chat_id in _pending or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
+            return True  # пока думали, бот уже ответил кому-то — молчим (и текстом тоже)
+        await bot.send_chat_action(chat_id, "upload_photo")
+        await send_meme(bot, chat_id, res["reply_to"], res["template"], res["lines"], "сам мем")
+        logger.info("сам мем в %s: %s %s", chat_id, res["template"], res["lines"])
+        return True
+    except Exception as e:
+        logger.warning("auto meme failed in %s: %s", chat_id, e)
+        return False
+
+
+async def _maybe_auto_vmem(message: Message, bot: Bot, img: bytes, mime: str, caption: str, label: str) -> bool:
+    """Видео или кружок в чате — иногда бот сам отвечает видео-мемом по нему. True — ответил."""
+    chat_id = message.chat.id
+    media = message.video or message.video_note
+    now = time.time()
+    if media is None or random.random() >= VMEM_CHANCE or now - _last_vmem.get(chat_id, 0) < VMEM_GAP:
+        return False
+    if (media.duration or 0) > VMEM_AUTO_SEC or (media.file_size or 0) > VIDEO_MAX or _vmem_lock.locked():
+        return False
+    if now - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
+        return False
+    _last_vmem[chat_id] = now
+    try:
+        cap = await ai.video_caption(img, mime, label, _name(message), caption)
+        if not cap:
+            return False
+        data = (await bot.download(media)).read()
+        await send_video_meme(bot, chat_id, message.message_id, data, cap, f"сам видео-мем ({label})", as_gif=False)
+        logger.info("сам видео-мем в %s: %s", chat_id, cap)
+        return True
+    except Exception as e:
+        logger.warning("auto video meme failed: %s", e)
         return False
 
 
@@ -1470,6 +1580,9 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
     if message.message_id in _answered.get(chat_id, set()):  # на это фото уже ответили демотиватором
         return
     if not addressed and await _maybe_auto_demot(message, bot, img, mime, caption):
+        return
+    if not addressed and label in ("видео", "кружок") and await _maybe_auto_vmem(message, bot, img, mime,
+                                                                                    caption, label):
         return
     if not addressed:
         if random.random() > PHOTO_CHANCE or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
@@ -1626,7 +1739,7 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int) -> None:
         return
     if now - _last_auto.get(chat_id, 0) < AUTO_GAP or now - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
         return
-    if now - _last_demot.get(chat_id, 0) < DEMOT_HUSH:  # только что был демотиватор — без добавки
+    if now - _last_pic.get(chat_id, 0) < DEMOT_HUSH:  # только что был демотиватор или мем — без добавки
         return
     last = _last_auto.get(chat_id, 0)
     _last_auto[chat_id] = now
@@ -1643,6 +1756,8 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int) -> None:
     await _remember_lines(db, chat_id)
     names = {r[2] for r in rows}
     dossiers = {n: d for n, d in (await db.chat_dossiers(chat_id)).items() if n in names}
+    if await _maybe_auto_meme(bot, chat_id, rows, dossiers, new_ids):
+        return
     result = await ai.roast_auto(_as_dicts(rows), dossiers, new_ids, await db.style_sample(chat_id))
     if chat_id in _pending or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
         return  # пока думали, бот уже успел ответить кому-то — молчим

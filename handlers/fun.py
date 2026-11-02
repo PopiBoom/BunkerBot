@@ -1,4 +1,5 @@
-"""Развлечения чата: опрос «Кто из нас…» (/poll), «вопрос дня», когда в чате тихо, и демотиватор (/demot).
+"""Развлечения чата: опрос «Кто из нас…» (/poll), «вопрос дня», когда в чате тихо, демотиватор (/demot)
+и мемы: по шаблону (/mem) и видео-мем с плашкой «когда…» (/vmem).
 
   * /poll — ИИ придумывает вопрос по досье и переписке («Кто из нас первым сольётся с зала?»),
     варианты — самые активные участники за неделю, опрос открытый (видно, кто за кого).
@@ -23,6 +24,8 @@ from aiogram.types import Message, ReplyParameters
 
 import ai
 import cards
+import frames
+import memes
 from database import Database
 from handlers import roast as R
 
@@ -281,3 +284,152 @@ async def cmd_demot(message: Message, command: CommandObject, bot: Bot, db: Data
     except Exception as e:
         logger.warning("demot failed: %s", e)
         await temp_reply(message, "Не вышло отправить демотиватор - попробуй ещё раз.")
+
+
+# ---------- мемы: /mem — по шаблону про переписку, /vmem — видео с плашкой «когда…» ----------
+
+
+def _own_meme(args: str) -> tuple[str, list[str]] | None:
+    """«/mem верх | низ» или «/mem drake | строка | строка» — свой текст, без ИИ."""
+    parts = [x.strip() for x in args.split("|")]
+    tid = parts.pop(0).lower() if len(parts) > 1 and parts[0].lower() in memes.TEMPLATES else None
+    parts = [x for x in parts if x]
+    if not parts:
+        return None
+    top_bottom = [t for t in memes.TEMPLATES if memes.TEMPLATES[t][1] == memes._TB]
+    if len(parts) == 1:  # одна фраза — на картинку с подписью сверху и снизу, поровну
+        words = parts[0].split()
+        parts = [" ".join(words[:len(words) // 2]), " ".join(words[len(words) // 2:])] if len(words) > 1 else ["", parts[0]]
+        tid = tid or random.choice(top_bottom)
+    if tid is None:
+        tid = random.choice([t for t in memes.TEMPLATES if memes.lines_count(t) == len(parts)] or top_bottom)
+    n = memes.lines_count(tid)
+    return tid, (parts + [""] * n)[:n]
+
+
+@router.message(Command("mem", "meme"))
+async def cmd_meme(message: Message, command: CommandObject, bot: Bot, db: Database) -> None:
+    """Мем по шаблону (Drake, «две кнопки», «план Грю»…) про переписку: ответом — про это сообщение и его
+    автора, без ответа — ИИ сам ищет момент в свежей переписке. /mem верх | низ — свой текст."""
+    chat_id = message.chat.id
+    if R._bunker_active(chat_id):
+        await temp_reply(message, "Идёт игра - мемы после партии.")
+        return
+    if not R._db_ref:
+        R._db_ref.append(db)
+    rt = message.reply_to_message
+    own = (command.args or "").strip()
+    if own:
+        made = _own_meme(own)
+        if made is None:
+            await temp_reply(message, "Формат: /mem верх | низ")
+            return
+        await R.send_meme(bot, chat_id, rt.message_id if rt else None, *made, "мем /mem (свой текст)")
+        return
+    if not ai.available():
+        await temp_reply(message, "Для мемов от ИИ нужен ключ. Можно своим текстом: /mem верх | низ")
+        return
+    about, new_ids = "", None
+    if rt is not None and rt.from_user and not rt.from_user.is_bot:
+        u = rt.from_user
+        if await db.is_optout(chat_id, u.id):
+            await temp_reply(message, "Этого человека просили не трогать.")
+            return
+        rows = await db.recent_messages(chat_id, limit=40, user_id=u.id)
+        about = u.first_name or u.username or ""
+        if any(r[0] == rt.message_id for r in rows):
+            new_ids = {rt.message_id}  # мем — именно про это сообщение
+    else:
+        rows = await db.recent_messages(chat_id, limit=60, since=int(time.time()) - 2 * 86400)
+    rows = [r for r in rows if r[1] > 0 or r[2] == R.BOT_SELF][-60:]
+    if sum(1 for r in rows if r[1] > 0) < 3:
+        await temp_reply(message, "Мало переписки для мема - пусть сначала поболтают.")
+        return
+    names = {r[2] for r in rows}
+    dossiers = {n: d for n, d in (await db.chat_dossiers(chat_id)).items() if n in names}
+    async with R._typing_on(bot, chat_id, "upload_photo"):
+        res = await ai.meme(R._as_dicts(rows), dossiers, about=about, new_ids=new_ids,
+                            avoid=R.recent_templates(chat_id))
+    if not res:
+        await temp_reply(message, "Не придумался мем - попробуй ещё раз.")
+        return
+    target = rt.message_id if rt is not None else res["reply_to"]
+    try:
+        await R.send_meme(bot, chat_id, target, res["template"], res["lines"], "мем /mem")
+    except Exception as e:
+        logger.warning("meme failed: %s", e)
+        await temp_reply(message, "Не вышло отправить мем - попробуй ещё раз.")
+
+
+async def _pick_video(bot: Bot, db: Database, chat_id: int) -> tuple[int, bytes] | None:
+    """/vmem без ответа: свежее видео, кружок или гифка из чата (за 3 дня)."""
+    rows = [r for r in await db.recent_media(chat_id, int(time.time()) - 3 * 86400, limit=40) if r[1] == "video"]
+    random.shuffle(rows)
+    for msg_id, _kind, file_id in rows[:4]:
+        try:
+            data = (await bot.download(file_id)).read()
+            if 0 < await asyncio.to_thread(memes.video_duration, data) <= memes.VIDEO_MAX_SEC:
+                return msg_id, data
+        except Exception as e:
+            logger.info("vmem pick %s failed: %s", msg_id, e)
+    return None
+
+
+@router.message(Command("vmem", "vmeme"))
+async def cmd_vmem(message: Message, command: CommandObject, bot: Bot, db: Database) -> None:
+    """Видео-мем: ответом на видео, кружок или гифку — сверху белая плашка с подписью «когда…» от ИИ;
+    без ответа — бот сам берёт свежее видео чата. /vmem текст — своя подпись."""
+    chat_id = message.chat.id
+    if R._bunker_active(chat_id):
+        await temp_reply(message, "Идёт игра - мемы после партии.")
+        return
+    if not R._db_ref:
+        R._db_ref.append(db)
+    if R._vmem_lock.locked():
+        await temp_reply(message, "Уже монтирую другое видео - подожди минуту.")
+        return
+    rt = message.reply_to_message
+    media = (rt.video or rt.video_note or rt.animation) if rt is not None else None
+    author, caption, as_gif = "", "", None
+    if media is not None:
+        if (media.file_size or 0) > R.VIDEO_MAX:
+            await temp_reply(message, "Видео больше 20 МБ - Telegram не даёт боту его скачать.")
+            return
+        if (media.duration or 0) > memes.VIDEO_MAX_SEC:
+            await temp_reply(message, f"Видео длиннее {memes.VIDEO_MAX_SEC} сек - выбери покороче.")
+            return
+        label = "гифка" if rt.animation else "кружок" if rt.video_note else "видео"
+        as_gif = bool(rt.animation)
+        author = (rt.from_user.first_name or rt.from_user.username or "") if rt.from_user else ""
+        caption = rt.caption or ""
+        target = rt.message_id
+        try:
+            data = (await bot.download(media)).read()
+        except Exception as e:
+            logger.warning("vmem download failed: %s", e)
+            await temp_reply(message, "Не смог скачать это видео.")
+            return
+    else:
+        picked = await _pick_video(bot, db, chat_id)
+        if picked is None:
+            await temp_reply(message, "В чате за 3 дня нет видео - ответь /vmem на видео, кружок или гифку.")
+            return
+        (target, data), label = picked, "видео"
+    text = (command.args or "").strip()
+    if not text:
+        if not ai.available():
+            await temp_reply(message, "Для подписи от ИИ нужен ключ. Можно своей: /vmem когда…")
+            return
+        async with R._typing_on(bot, chat_id, "upload_video"):
+            frame = await asyncio.to_thread(frames.middle_frame, data)
+            if frame:
+                context = R._as_dicts(await db.recent_messages(chat_id, limit=15))
+                text = await ai.video_caption(frame, "image/jpeg", label, author, caption, context)
+        if not text:
+            await temp_reply(message, "Не придумалась подпись - попробуй ещё раз или напиши свою: /vmem когда…")
+            return
+    try:
+        await R.send_video_meme(bot, chat_id, target, data, text, f"видео-мем /vmem ({label})", as_gif=as_gif)
+    except Exception as e:
+        logger.warning("vmem failed: %s", e)
+        await temp_reply(message, "Не вышло смонтировать видео - попробуй другое.")

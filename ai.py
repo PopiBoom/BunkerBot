@@ -1497,6 +1497,97 @@ DEMOT_FALLBACK = [
 ]
 
 
+# ---------- мемы: по шаблону и видео с плашкой «когда…» ----------
+
+
+async def meme(messages: list[dict], dossiers: dict[str, str], about: str = "", new_ids: set | None = None,
+               avoid: list[str] | None = None) -> dict:
+    """Мем по шаблону про реальный момент из переписки: {"template", "lines", "reply_to"} или {} — не вышло.
+
+    about — про кого мем (ответом на его сообщение); new_ids — мем только про эти сообщения (сам встрял);
+    avoid — шаблоны, что были недавно (не повторять)."""
+    import memes
+
+    ids = {m.get("id") for m in messages}
+    focus = (f"Мем — про «{about}», по его сообщениям. " if about else "")
+    if new_ids:
+        focus += "Мем — про одно из НОВЫХ сообщений (new=\"1\"), остальные — контекст. "
+    user = (
+        f"Досье участников:\n{_dossiers_block(dossiers) or 'пусто'}\nПереписка чата:\n{_msgs_block(messages, new_ids)}\n\n"
+        "Сделай смешной мем по одному из шаблонов про конкретный момент из переписки: слова, обещание, понты, "
+        "нытьё, спор, тупое заявление. " + focus + "Шаблоны — id (сколько строк): что значит каждая строка:\n"
+        + memes.menu_for_ai() + "\n\n"
+        "Сначала найди, что в этом моменте смешного: противоречие, понты против реальности, двойные стандарты, "
+        "тупой вывод, слитое обещание. Потом выбери шаблон, у которого именно такой контраст — суть мема (а не "
+        "притянутый), и напиши строки по порядку. Мем смешной поворотом и выводом; переписать реплики из чата "
+        "в клетки шаблона без поворота — провал. Строки — как в настоящих мемах: коротко (каждая до 8 слов), "
+        "разговорно, с именами, можно мат; по реальным словам и поступкам людей, ничего не выдумывай. Шутка "
+        "понятна с первого взгляда тем, кто был в чате. Без кавычек вокруг строк, без эмодзи. "
+        + (f"Эти шаблоны были недавно — возьми другой: {', '.join(avoid)}. " if avoid else "")
+        + "reply_to — id сообщения, про которое мем. Нет хорошего повода — template пустой. " + _SAFE_TOPICS + "\n"
+        'Верни СТРОГО JSON: {"template": "<id>", "lines": ["...", "..."], "reply_to": <id>}'
+    )
+    for attempt in range(2):
+        try:
+            data = _extract_json(await _complete(
+                ROAST_SYSTEM + " Сейчас ты делаешь мем-картинку. Отвечаешь строго JSON.",
+                user + ("\nБез внешности и тела — даже в шутку." if attempt else ""),
+                max_tokens=5000, model=MODEL, effort="medium"))
+        except Exception as e:
+            logger.warning("meme attempt %s failed: %s", attempt + 1, e)
+            continue
+        tid = str(data.get("template") or "").strip()
+        if not tid:
+            return {}
+        if tid not in memes.TEMPLATES:
+            continue
+        lines = [scrub(str(x).strip().strip("«»\"")) for x in (data.get("lines") or []) if str(x).strip()]
+        lines = [x[:120] for x in lines][:memes.lines_count(tid)]
+        joined = " ".join(lines)
+        if len(lines) < memes.lines_count(tid) or about_looks(joined) or _garbled(joined):
+            logger.info("meme rejected (attempt %s): %s %s", attempt + 1, tid, lines)
+            continue
+        try:
+            reply_to = int(data.get("reply_to"))
+        except (TypeError, ValueError):
+            reply_to = None
+        if reply_to not in ids or (new_ids and reply_to not in new_ids):
+            reply_to = None
+        return {"template": tid, "lines": lines, "reply_to": reply_to}
+    return {}
+
+
+async def video_caption(frame: bytes, mime: str, kind: str, author: str = "", caption: str = "",
+                        context: list[dict] | None = None) -> str:
+    """Подпись для видео-мема (белая плашка над видео): «когда…», «я, когда…», «POV: …». "" — не вышло."""
+    kind = {"кружок": "кружка (видеосообщения)", "гифка": "гифки"}.get(kind, kind)
+    user = (
+        f"Это кадр из середины {kind}"
+        + (f", которое прислал {author}" if author else "")
+        + (f" с подписью <msg>{caption[:200]}</msg>" if caption else "") + ".\n"
+        + (f"Свежая переписка чата (контекст, можно зацепиться):\n{_msgs_block(context[-15:])}\n" if context else "")
+        + "Напиши подпись для видео-мема, как в тиктоке: белая плашка над видео, в которой ситуация, на которую "
+        "это видео — идеальная реакция («когда…», «я, когда…», «POV: …», «мы с пацанами, когда…»). Смешно — в "
+        "неожиданной жизненной ситуации, а не в описании видео: НЕ пересказывай, что на кадре. Можно зацепиться "
+        "за переписку и имена, можно мат. До 14 слов, одна фраза, без кавычек и эмодзи. "
+        + _SAFE_TOPICS + " Людей на видео за внешность не трогай.\n"
+        'Верни СТРОГО JSON: {"caption": "..."}'
+    )
+    for attempt in range(2):
+        try:
+            data = _extract_json(await _complete(
+                ROAST_SYSTEM + " Сейчас ты подписываешь видео-мем. Отвечаешь строго JSON.",
+                user + ("\nБез слов про лицо, тело, вес." if attempt else ""),
+                max_tokens=3000, model=MODEL, image=(frame, mime), effort="medium"))
+        except Exception as e:
+            logger.warning("video caption attempt %s failed: %s", attempt + 1, e)
+            continue
+        cap = scrub(str(data.get("caption") or "").strip().strip("«»\""))[:160]
+        if cap and not about_looks(cap) and not _garbled(cap):
+            return cap
+    return ""
+
+
 # ---------- посты канала бати ----------
 
 
