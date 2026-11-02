@@ -1647,10 +1647,18 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int) -> None:
             await _say_human(bot, chat_id, text, reply_to=reply_to)
 
 
+DOSSIER_VERSION_KEY = "dossier_version"
+DOSSIER_VERSION = "2"  # 2 — Sonnet, только факты с датами и цитатами (было: Haiku «своими словами»)
+
+
 async def _heavy(bot: Bot, db: Database) -> None:
     """Раз в 10 минут: чистка старого, досье, итоги недели."""
     await db.purge_old_messages(int(time.time()) - KEEP_DAYS * 86400)
-    for chat_id, user_id, name, old in await db.users_needing_dossier():
+    if (await db.get_setting(DOSSIER_VERSION_KEY, "")) != DOSSIER_VERSION:  # новый формат — пересобрать все
+        await db.reset_dossier_times()
+        await db.set_setting(DOSSIER_VERSION_KEY, DOSSIER_VERSION)
+        logger.info("досье: пересобираю все в новом формате (%s)", DOSSIER_VERSION)
+    for chat_id, user_id, name, old in await db.users_needing_dossier(limit=8):
         msgs = await db.messages_since_dossier(chat_id, user_id)
         if not msgs:
             continue
@@ -1795,7 +1803,7 @@ async def import_history(db: Database, data: dict, progress=None) -> tuple[int, 
                 await progress(f"🧠 Составляю досье: {name} ({i + 1}/{len(by_user)})…")
             old = await db.get_dossier(chat_id, user_id)
             try:
-                text = await ai.update_dossier(name, old, [r[3] for r in items[-150:]])
+                text = await ai.update_dossier(name, old, [(r[3], r[4]) for r in items[-150:]])
                 if text:
                     await db.set_dossier(chat_id, user_id, name, text)
                     built += 1

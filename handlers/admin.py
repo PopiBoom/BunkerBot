@@ -597,7 +597,8 @@ async def admin_ai_costs(call: CallbackQuery, db: Database, config: Config) -> N
     lines += [
         "",
         f"⚙️ Бункер (сценарий, вердикт), прожарки, эпилог Мафии: <code>{ai.MODEL}</code>",
-        f"💬 Ответы в чате, ведущий Мафии, редактор: <code>{ai.REPLY_MODEL}</code>",
+        f"💬 Ответы в чате (стёб): <code>{ai.REPLY_MODEL}</code> · обдумывание {ai.REPLY_EFFORT}",
+        f"🕵️ Ведущий Мафии, досье: <code>{ai.EDIT_MODEL}</code>",
         f"⚡️ Реплики ведущего Бункера, описания фото и стикеров: <code>{ai.FAST_MODEL}</code>",
         "",
         "<i>Оценка по ценам Anthropic, без налогов. Точный счёт и баланс — "

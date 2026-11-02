@@ -646,18 +646,25 @@ class Database:
             )
             return [(r[0], r[1], r[2], r[3]) for r in await cur.fetchall()]
 
-    async def messages_since_dossier(self, chat_id: int, user_id: int, limit: int = 120) -> list[str]:
+    async def messages_since_dossier(self, chat_id: int, user_id: int, limit: int = 120) -> list[tuple[str, int]]:
+        """[(текст, ts)] — новые сообщения человека с прошлого досье (дата нужна, чтобы досье было с датами)."""
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
                 """
-                SELECT m.text FROM chat_messages m
+                SELECT m.text, m.ts FROM chat_messages m
                 LEFT JOIN dossiers d ON d.chat_id = m.chat_id AND d.user_id = m.user_id
                 WHERE m.chat_id = ? AND m.user_id = ? AND m.ts > COALESCE(d.updated, 0)
                 ORDER BY m.ts DESC LIMIT ?
                 """,
                 (chat_id, user_id, limit),
             )
-            return [r[0] for r in await cur.fetchall()][::-1]
+            return [(r[0], r[1]) for r in await cur.fetchall()][::-1]
+
+    async def reset_dossier_times(self) -> None:
+        """Пересобрать все досье заново (новый формат): «давно не обновлялись» — их подхватит _heavy."""
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("UPDATE dossiers SET updated = 0")
+            await db.commit()
 
     async def set_dossier(self, chat_id: int, user_id: int, name: str, text: str) -> None:
         async with aiosqlite.connect(self.path) as db:
