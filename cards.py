@@ -191,6 +191,20 @@ def _serif(size: int, bold: bool = False):
     return _font("DejaVuSerif-Bold.ttf" if bold else "DejaVuSerif.ttf", size)
 
 
+def to_jpeg(data: bytes, max_side: int = 1280) -> bytes:
+    """Любая картинка (WebP-стикер, превью анимации, PNG с прозрачностью) → обычный JPEG: первый кадр,
+    прозрачное — на белом. И ИИ, и демотиватор получают один понятный формат (на стикерах бывал сбой)."""
+    img = Image.open(io.BytesIO(data))
+    img.seek(0)
+    img = img.convert("RGBA")
+    flat = Image.new("RGB", img.size, (255, 255, 255))
+    flat.paste(img, mask=img.split()[3])
+    flat.thumbnail((max_side, max_side))
+    buf = io.BytesIO()
+    flat.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
 def render_demotivator(photo: bytes, title: str, subtitle: str) -> bytes:
     """Классический демотиватор: чёрный фон, фото в белой рамке, КРУПНЫЙ заголовок и подпись под ним."""
     src = Image.open(io.BytesIO(photo)).convert("RGB")

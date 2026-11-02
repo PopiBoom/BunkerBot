@@ -213,6 +213,20 @@ class Database:
                 )
                 """
             )
+            # Медиа чата (только id файлов в Telegram): /demot без ответа сам берёт отсюда свежее фото/стикер
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_media (
+                    chat_id INTEGER NOT NULL,
+                    msg_id  INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    kind    TEXT NOT NULL,
+                    file_id TEXT NOT NULL,
+                    ts      INTEGER NOT NULL,
+                    PRIMARY KEY (chat_id, msg_id)
+                )
+                """
+            )
             # Почему бот сказал то, что сказал: ветка ответа, на какое сообщение, черновик до редактора (для /log)
             await db.execute(
                 """
@@ -749,6 +763,25 @@ class Database:
                 (keep_last, older_than),
             )
             await db.commit()
+
+    # --- медиа чата (для /demot без ответа) ---
+
+    async def add_media(self, chat_id: int, msg_id: int, user_id: int, kind: str, file_id: str) -> None:
+        """kind: image — картинку можно качать как есть; video — нужен кадр из середины."""
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("INSERT OR REPLACE INTO chat_media (chat_id, msg_id, user_id, kind, file_id, ts) "
+                             "VALUES (?, ?, ?, ?, ?, ?)", (chat_id, msg_id, user_id, kind, file_id, int(time.time())))
+            await db.execute("DELETE FROM chat_media WHERE ts < ?", (int(time.time()) - 14 * 86400,))
+            await db.commit()
+
+    async def recent_media(self, chat_id: int, since: int, limit: int = 40) -> list[tuple]:
+        """[(msg_id, kind, file_id)] — свежие медиа чата (без «забытых»), новые первыми."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT m.msg_id, m.kind, m.file_id FROM chat_media m WHERE m.chat_id = ? AND m.ts >= ? "
+                "AND NOT EXISTS (SELECT 1 FROM roast_optout o WHERE o.chat_id = m.chat_id AND o.user_id = m.user_id) "
+                "ORDER BY m.ts DESC LIMIT ?", (chat_id, since, limit))
+            return list(await cur.fetchall())
 
     # --- лог ответов бота (/log) ---
 

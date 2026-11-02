@@ -1393,16 +1393,40 @@ async def demotivator(image: bytes, mime: str, caption: str = "") -> dict:
         "трогай вообще.\n"
         'Верни СТРОГО JSON: {"title": "...", "subtitle": "..."}'
     )
-    for _ in range(2):  # шутка про внешность или мусор — ещё одна попытка
-        # Opus: на тех же картинках у Sonnet выходили милые открытки, у Opus — злые и смешные (≈$0.01 за штуку)
-        out = await _complete(DEMOT_SYSTEM, user, max_tokens=3000, model=MODEL, image=(image, mime),
-                              effort="medium")
-        data = _extract_json(out)
+    for attempt in range(3):  # шутка про внешность, мусор или сбой — ещё попытка
+        try:
+            # Opus: на тех же картинках у Sonnet выходили милые открытки, у Opus — злые и смешные (≈$0.01 за штуку)
+            out = await _complete(DEMOT_SYSTEM, user + ("\nНе используй слова про лицо, морду, тело, вес — даже про "
+                                                        "нарисованных персонажей." if attempt else ""),
+                                  max_tokens=3000, model=MODEL, image=(image, mime), effort="medium")
+            data = _extract_json(out)
+        except Exception as e:
+            logger.warning("demotivator attempt %s failed: %s", attempt + 1, e)
+            continue
         title = scrub(str(data.get("title", "")).strip().strip("«»\""))[:40]
         sub = scrub(str(data.get("subtitle", "")).strip().strip("«»\""))[:160]
         if title and not about_looks(f"{title} {sub}") and not _garbled(f"{title} {sub}"):
             return {"title": title, "subtitle": sub}
-    return {"title": "", "subtitle": ""}
+        logger.info("demotivator rejected (attempt %s): %s - %s", attempt + 1, title, sub)
+    title, sub = random.choice(DEMOT_FALLBACK)  # ИИ так и не дал подписи — классика, а не «не придумалось»
+    return {"title": title, "subtitle": sub}
+
+
+# Если ИИ упал или трижды выдал не то — классические демотиваторы (подходят к любой картинке)
+DEMOT_FALLBACK = [
+    ("СТАБИЛЬНОСТЬ", "каждый понедельник начинаешь новую жизнь, каждый вторник её хоронишь"),
+    ("ВЗРОСЛАЯ ЖИЗНЬ", "пошёл за хлебом, вернулся с кредитом"),
+    ("ОПТИМИЗМ", "это когда не знаешь всех подробностей"),
+    ("ПЛАНИРОВАНИЕ", "месяц на задачу, ночь на панику, утро на враньё"),
+    ("МОТИВАЦИЯ", "приходит ровно тогда, когда уже поздно"),
+    ("НАДЕЖДА", "умирает последней, но умирает, сука"),
+    ("ОПЫТ", "это когда наступаешь на те же грабли, но уже профессионально"),
+    ("ПЯТНИЦА", "единственный день, когда врёшь себе, что выходные будут продуктивными"),
+    ("ДРУЖБА", "это когда тебя обосрут, но только свои"),
+    ("СИЛА ВОЛИ", "есть у всех, просто у большинства она в отпуске с рождения"),
+    ("СМЫСЛ ЖИЗНИ", "нашёлся, но ты как раз отвернулся"),
+    ("ПОРЯДОК", "это хаос, который ещё не успел развалиться"),
+]
 
 
 # ---------- посты канала бати ----------

@@ -1220,6 +1220,9 @@ async def on_group_sticker(message: Message, bot: Bot, db: Database) -> None:
     if not await _enabled(db) or await db.is_optout(chat_id, user.id):
         return
     known = await db.add_sticker(chat_id, st.file_unique_id, st.file_id, st.emoji, st.set_name, "sticker")
+    pic = st.thumbnail if (st.is_animated or st.is_video) else st
+    if pic is not None:  # для /demot без ответа
+        await db.add_media(chat_id, message.message_id, user.id, "image", pic.file_id)
     # обычный стикер — смотрим сам файл (webp); анимированный и видео — их превью
     src = st.thumbnail if (st.is_animated or st.is_video) else st
     descr = await _sticker_descr(bot, db, st.file_unique_id, known, src, "стикер", st.emoji or "")
@@ -1239,6 +1242,7 @@ async def on_group_gif(message: Message, bot: Bot, db: Database) -> None:
     if not await _enabled(db) or await db.is_optout(chat_id, user.id):
         return
     known = await db.add_sticker(chat_id, gif.file_unique_id, gif.file_id, None, None, "gif")
+    await db.add_media(chat_id, message.message_id, user.id, "video", gif.file_id)  # для /demot без ответа
     descr = await _sticker_descr(bot, db, gif.file_unique_id, known, gif.thumbnail, "гифка")
     caption = f" {message.caption}" if message.caption else ""
     await db.add_chat_message(chat_id, message.message_id, user.id, _name(message), user.username,
@@ -1344,6 +1348,7 @@ async def on_group_photo(message: Message, bot: Bot, db: Database, config=None) 
     # берём не самый большой размер — модели хватит, а качать быстрее
     sizes = sorted(message.photo, key=lambda p: p.width)
     photo = next((p for p in reversed(sizes) if p.width <= 1280), sizes[0])
+    await db.add_media(message.chat.id, message.message_id, user.id, "image", photo.file_id)  # для /demot
     label = f"альбом, {count} фото" if count > 1 else "фото"
     await _visual(message, bot, db, config, photo, label, "фото", caption, count)
 
@@ -1362,6 +1367,8 @@ async def on_group_video(message: Message, bot: Bot, db: Database, config=None) 
     if not leader:
         return
     media = message.video_note or message.video
+    if (getattr(media, "file_size", 0) or 0) <= VIDEO_MAX:  # для /demot без ответа
+        await db.add_media(message.chat.id, message.message_id, user.id, "video", media.file_id)
     frame = await _video_frame(bot, media) if ai.available() else None
     if message.video_note:
         label, kind = "кружок", "кружок (видеосообщение; ты видишь один кадр из середины)"
@@ -1411,7 +1418,8 @@ async def _maybe_auto_demot(message: Message, bot: Bot, img: bytes, mime: str, c
     _last_demot[chat_id] = now
     try:
         await bot.send_chat_action(chat_id, "upload_photo")
-        text = await ai.demotivator(img, mime, caption)
+        img = await asyncio.to_thread(cards.to_jpeg, img)
+        text = await ai.demotivator(img, "image/jpeg", caption)
         if not text["title"]:
             return False
         await send_demotivator(bot, chat_id, message.message_id, img, text["title"], text["subtitle"])

@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -21,6 +22,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, ReplyParameters
 
 import ai
+import cards
 from database import Database
 from handlers import roast as R
 
@@ -212,46 +214,70 @@ async def _media_bytes(bot: Bot, rt: Message) -> bytes | None:
     return None
 
 
+async def _pick_media(bot: Bot, db: Database, chat_id: int) -> tuple[int, bytes] | None:
+    """/demot без ответа: бот сам берёт свежее фото, видео, кружок, стикер или гифку из чата (за 3 дня)."""
+    rows = await db.recent_media(chat_id, int(time.time()) - 3 * 86400, limit=40)
+    random.shuffle(rows)
+    for msg_id, kind, file_id in rows[:5]:  # файл могли удалить — пробуем несколько
+        try:
+            raw = (await bot.download(file_id)).read()
+            if kind == "video":
+                from frames import middle_frame
+                raw = await asyncio.to_thread(middle_frame, raw)
+            if raw:
+                return msg_id, raw
+        except Exception as e:
+            logger.info("demot pick %s failed: %s", msg_id, e)
+    return None
+
+
 @router.message(Command("demot", "demotivator"))
 async def cmd_demot(message: Message, command: CommandObject, bot: Bot, db: Database) -> None:
-    """Ответом на фото — демотиватор: чёрная рамка, КРУПНЫЙ заголовок и злая подпись от ИИ.
-    /demot ЗАГОЛОВОК | подпись — своими словами (без ИИ)."""
+    """Ответом на фото (видео, кружок, гифку, стикер) — демотиватор с подписью от ИИ; без ответа — бот сам
+    берёт свежее медиа из чата. /demot ЗАГОЛОВОК | подпись — своими словами (без ИИ)."""
     chat_id = message.chat.id
-    rt = message.reply_to_message
-    if rt is None or not (rt.photo or rt.video or rt.video_note or rt.animation or rt.sticker):
-        await temp_reply(message, "Ответь /demot на фото (или видео, кружок, гифку, стикер).")
-        return
     if R._bunker_active(chat_id):
         await temp_reply(message, "Идёт игра - демотиваторы после партии.")
         return
-    try:
-        data = await _media_bytes(bot, rt)
-    except Exception as e:
-        logger.warning("demot download failed: %s", e)
-        data = None
+    rt = message.reply_to_message
+    data = None
+    if rt is not None and (rt.photo or rt.video or rt.video_note or rt.animation or rt.sticker):
+        target, caption = rt.message_id, rt.caption or ""
+        try:
+            data = await _media_bytes(bot, rt)
+        except Exception as e:
+            logger.warning("demot download failed: %s", e)
+    else:  # ничего не выбрано — сам выбирает, что демотивировать
+        picked = await _pick_media(bot, db, chat_id)
+        if picked is None:
+            await temp_reply(message, "В чате за 3 дня нет фото или стикеров - ответь /demot на картинку.")
+            return
+        (target, data), caption = picked, ""
     if not data:
         await temp_reply(message, "Не смог достать картинку из этого сообщения.")
+        return
+    try:
+        data = await asyncio.to_thread(cards.to_jpeg, data)  # WebP-стикеры, анимации, прозрачность — в JPEG
+    except Exception as e:
+        logger.warning("demot image open failed: %s", e)
+        await temp_reply(message, "Картинка не открылась - пришли обычное фото.")
         return
     own = (command.args or "").strip()
     if own:  # своими словами: «заголовок | подпись»
         title, _, sub = own.partition("|")
         text = {"title": title.strip(), "subtitle": sub.strip()}
-    elif ai.available():
-        try:
-            await bot.send_chat_action(chat_id, "upload_photo")
-            text = await ai.demotivator(data, ai.image_mime(data) or "image/jpeg", rt.caption or "")
-        except Exception as e:
-            logger.warning("demot text failed: %s", e)
-            text = {"title": "", "subtitle": ""}
     else:
-        text = {"title": "", "subtitle": ""}
-    if not text["title"]:
-        await temp_reply(message, "Не придумалось. Попробуй ещё раз или напиши сам: /demot ЗАГОЛОВОК | подпись")
-        return
+        if ai.available():
+            await bot.send_chat_action(chat_id, "upload_photo")
+            text = await ai.demotivator(data, "image/jpeg", caption)  # не вышло у ИИ — классика из запаса
+        else:
+            text = {"title": "", "subtitle": ""}
+        if not text["title"]:
+            text = dict(zip(("title", "subtitle"), random.choice(ai.DEMOT_FALLBACK), strict=True))
     if not R._db_ref:
         R._db_ref.append(db)
     try:
-        await R.send_demotivator(bot, chat_id, rt.message_id, data, text["title"], text["subtitle"])
+        await R.send_demotivator(bot, chat_id, target, data, text["title"], text["subtitle"])
     except Exception as e:
         logger.warning("demot failed: %s", e)
-        await temp_reply(message, "Картинка не открылась - пришли обычное фото.")
+        await temp_reply(message, "Не вышло отправить демотиватор - попробуй ещё раз.")
