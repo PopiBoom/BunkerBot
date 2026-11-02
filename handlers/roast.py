@@ -868,8 +868,9 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
                 _link_notes.clear()
     if not optout:
         note = f"[переслано из {src[0]}] " if src else ""
+        said = (f"[голосовое: {message.text}]" if (chat_id, message.message_id) in _heard else message.text)
         await db.add_chat_message(chat_id, message.message_id, user.id, _name(message),
-                                  user.username, (note + message.text + (f" {link}" if link else ""))[:1000])
+                                  user.username, (note + said + (f" {link}" if link else ""))[:1000])
         if not src:  # «я пошёл / я пошла» — запоминаем пол по его же словам
             m, f = ai.gender_hits(message.text)
             if m or f:
@@ -1374,13 +1375,67 @@ async def on_group_video(message: Message, bot: Bot, db: Database, config=None) 
     media = message.video_note or message.video
     if (getattr(media, "file_size", 0) or 0) <= VIDEO_MAX:  # для /demot без ответа
         await db.add_media(message.chat.id, message.message_id, user.id, "video", media.file_id)
-    frame = await _video_frame(bot, media) if ai.available() else None
+    frame, speech, raw = None, "", None
+    if ai.available() and (getattr(media, "file_size", 0) or 0) <= VIDEO_MAX:
+        try:
+            raw = (await bot.download(media)).read()
+            frame = await asyncio.to_thread(frames.middle_frame, raw)
+            if not _bunker_active(message.chat.id):
+                speech = await _hear(raw)  # что в кружке/видео говорят (бот «слушает»)
+        except Exception as e:
+            logger.debug("video download failed: %s", e)
     if message.video_note:
         label, kind = "кружок", "кружок (видеосообщение; ты видишь один кадр из середины)"
     else:
         label, kind = "видео", "видео (ты видишь один кадр из середины)"
     await _visual(message, bot, db, config, getattr(media, "thumbnail", None), label, kind, caption, count,
-                  data=frame)
+                  data=frame, speech=speech, video=raw)
+
+
+# ---------- слух: голосовые, кружки, видео ----------
+
+HEAR_MAX_SEC = 3 * 60  # слушаем первые 3 минуты записи (длиннее — запрос больше 6 МБ и дольше ждать)
+_heard: set[tuple[int, int]] = set()  # голосовые, которые пришли в обработку текста расшифровкой
+
+
+async def _hear(data: bytes) -> str:
+    """Расшифровка речи из голосового/кружка/видео ("" — нет речи, нет ключа OpenRouter или сбой)."""
+    if not ai.openrouter_available():
+        return ""
+    wav = await asyncio.to_thread(frames.audio_wav, data, HEAR_MAX_SEC)
+    return await ai.transcribe(wav) if wav else ""
+
+
+@router.message(F.voice)
+async def on_group_voice(message: Message, bot: Bot, db: Database, config=None) -> None:
+    """Голосовые: бот их слушает (ai.transcribe) — и дальше это обычное сообщение: в память, досье, ответы,
+    обещания, рифмы. Обращение к боту голосом («Пиздюк, …» или ответом на него) — отвечает."""
+    user = message.from_user
+    if user is None or user.is_bot or message.voice is None:
+        return
+    if not _db_ref:
+        _db_ref.append(db)
+    chat_id = message.chat.id
+    if not await _enabled(db) or await db.is_optout(chat_id, user.id):
+        return
+    voice = message.voice
+    speech = ""
+    if (voice.file_size or 0) <= VIDEO_MAX and not _bunker_active(chat_id):
+        try:
+            speech = await _hear((await bot.download(voice)).read())
+        except Exception as e:
+            logger.warning("voice download failed: %s", e)
+    if not speech:  # не расслышал (нет ключа, тишина) — хотя бы помним, что было голосовое
+        await db.add_chat_message(chat_id, message.message_id, user.id, _name(message), user.username,
+                                  f"[голосовое, {voice.duration or 0} сек]")
+        return
+    logger.info("голосовое в %s от %s: %s", chat_id, _name(message), speech[:120])
+    key = (chat_id, message.message_id)
+    _heard.add(key)
+    if len(_heard) > 500:
+        _heard.clear()
+        _heard.add(key)
+    await on_group_message(message.model_copy(update={"text": speech}), bot, db, config)
 
 
 VIDEO_MAX = 20 * 1024 * 1024  # больше Telegram боту скачать не даст
@@ -1479,14 +1534,16 @@ def _reply_kw(reply_to: int | None) -> dict:
             if reply_to else {})
 
 
-async def send_meme(bot: Bot, chat_id: int, reply_to: int | None, tid: str, lines: list[str], kind: str) -> None:
+async def send_meme(bot: Bot, chat_id: int, reply_to: int | None, tid: str, lines: list[str], kind: str,
+                    joke: str = "") -> None:
     """Мем по шаблону (memes.render_meme) ответом на сообщение, про которое он."""
     jpg = await asyncio.to_thread(memes.render_meme, tid, lines)
     sent = await bot.send_photo(chat_id, BufferedInputFile(jpg, filename="meme.jpg"), **_reply_kw(reply_to))
     rec = _recent_memes.setdefault(chat_id, [])
     rec.append(tid)
     del rec[:-10]
-    await _after_pic(chat_id, reply_to, sent, f"[мем «{tid}»: {' / '.join(lines)}]", kind, " / ".join(lines))
+    await _after_pic(chat_id, reply_to, sent, f"[мем «{tid}»: {' / '.join(lines)}]", kind,
+                     " / ".join(lines) + (f" | шутка: {joke}" if joke else ""))
 
 
 async def send_video_meme(bot: Bot, chat_id: int, reply_to: int | None, data: bytes, caption: str, kind: str,
@@ -1517,7 +1574,7 @@ async def _maybe_auto_meme(bot: Bot, chat_id: int, rows: list[tuple], dossiers: 
         if chat_id in _pending or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
             return True  # пока думали, бот уже ответил кому-то — молчим (и текстом тоже)
         await bot.send_chat_action(chat_id, "upload_photo")
-        await send_meme(bot, chat_id, res["reply_to"], res["template"], res["lines"], "сам мем")
+        await send_meme(bot, chat_id, res["reply_to"], res["template"], res["lines"], "сам мем", res.get("joke", ""))
         logger.info("сам мем в %s: %s %s", chat_id, res["template"], res["lines"])
         return True
     except Exception as e:
@@ -1525,12 +1582,13 @@ async def _maybe_auto_meme(bot: Bot, chat_id: int, rows: list[tuple], dossiers: 
         return False
 
 
-async def _maybe_auto_vmem(message: Message, bot: Bot, img: bytes, mime: str, caption: str, label: str) -> bool:
+async def _maybe_auto_vmem(message: Message, bot: Bot, data: bytes | None, caption: str, label: str,
+                           speech: str = "") -> bool:
     """Видео или кружок в чате — иногда бот сам отвечает видео-мемом по нему. True — ответил."""
     chat_id = message.chat.id
     media = message.video or message.video_note
     now = time.time()
-    if media is None or random.random() >= VMEM_CHANCE or now - _last_vmem.get(chat_id, 0) < VMEM_GAP:
+    if media is None or not data or random.random() >= VMEM_CHANCE or now - _last_vmem.get(chat_id, 0) < VMEM_GAP:
         return False
     if (media.duration or 0) > VMEM_AUTO_SEC or (media.file_size or 0) > VIDEO_MAX or _vmem_lock.locked():
         return False
@@ -1538,10 +1596,12 @@ async def _maybe_auto_vmem(message: Message, bot: Bot, img: bytes, mime: str, ca
         return False
     _last_vmem[chat_id] = now
     try:
-        cap = await ai.video_caption(img, mime, label, _name(message), caption)
+        shots = await asyncio.to_thread(frames.strip, data)
+        if not shots:
+            return False
+        cap = await ai.video_caption(shots, "image/jpeg", label, _name(message), caption, speech=speech, must=False)
         if not cap:
             return False
-        data = (await bot.download(media)).read()
         await send_video_meme(bot, chat_id, message.message_id, data, cap, f"сам видео-мем ({label})", as_gif=False)
         logger.info("сам видео-мем в %s: %s", chat_id, cap)
         return True
@@ -1551,7 +1611,8 @@ async def _maybe_auto_vmem(message: Message, bot: Bot, img: bytes, mime: str, ca
 
 
 async def _visual(message: Message, bot: Bot, db: Database, config, src_file, label: str, kind: str,
-                  caption: str, count: int, data: bytes | None = None) -> None:
+                  caption: str, count: int, data: bytes | None = None, speech: str = "",
+                  video: bytes | None = None) -> None:
     """Общее для фото, кружков и видео: рассмотреть, запомнить, иногда прокомментировать."""
     user = message.from_user
     chat_id = message.chat.id
@@ -1570,19 +1631,22 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
             logger.warning("%s describe failed: %s", label, e)
             img = None
     what = f"[{label}: {descr}]" if descr else f"[{label}]"
+    if speech:  # речь — за скобкой: внутри скобки только то, что видно (по нему ловим пересказ картинки)
+        what += f" говорит: «{speech}»"
     await db.add_chat_message(chat_id, message.message_id, user.id, _name(message), user.username,
                               f"{note}{what} {caption}".strip()[:1000])
     if img is None or _bunker_active(chat_id):
         return
     reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user
                         and message.reply_to_message.from_user.id == bot.id)
-    addressed = reply_to_bot or bool(_BOT_NAME.search(caption) or _BOT_WORD.search(caption))
+    heard = f"{caption} {speech}"  # «Пиздюк, глянь» голосом в кружке — тоже обращение
+    addressed = reply_to_bot or bool(_BOT_NAME.search(heard) or _BOT_WORD.search(heard))
     if message.message_id in _answered.get(chat_id, set()):  # на это фото уже ответили демотиватором
         return
     if not addressed and await _maybe_auto_demot(message, bot, img, mime, caption):
         return
-    if not addressed and label in ("видео", "кружок") and await _maybe_auto_vmem(message, bot, img, mime,
-                                                                                    caption, label):
+    if not addressed and label in ("видео", "кружок") and await _maybe_auto_vmem(message, bot, video, caption,
+                                                                                    label, speech):
         return
     if not addressed:
         if random.random() > PHOTO_CHANCE or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
@@ -1596,7 +1660,7 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
         draft = await ai.roast_photo(img, mime, _name(message), caption, is_father,
                                      await db.style_sample(chat_id), forwarded_from=src[0] if src else None,
                                      count=count, father_channel=_forwarded_from_father_channel(message),
-                                     seen=descr, media_kind=kind)
+                                     seen=descr, media_kind=kind, speech=speech)
         author = ai.FATHER_NAME if is_father else _name(message)
         _mark(f"коммент к {label}" + (" (обратились)" if addressed else ""), draft)
         answer = await ai.polish(draft, caption or f"[{label}]",
@@ -1718,7 +1782,7 @@ def _replyable(text: str) -> bool:
     if not t.startswith("["):
         return not _trivial(t)
     head = t.split("]", 1)[0]
-    return t.startswith(("[фото: ", "[альбом, ", "[кружок: ", "[видео: ")) and ": " in head
+    return t.startswith(("[фото: ", "[альбом, ", "[кружок: ", "[видео: ", "[голосовое: ")) and ": " in head
 
 
 async def _maybe_auto(bot: Bot, db: Database, chat_id: int) -> None:

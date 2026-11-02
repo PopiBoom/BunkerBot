@@ -1312,7 +1312,7 @@ async def drop_retell(reply: str, seen: str, author: str = "", max_words: int = 
 async def roast_photo(image: bytes, mime: str, name: str, caption: str = "", is_father: bool = False,
                       samples: list[str] | None = None, forwarded_from: str | None = None,
                       count: int = 1, father_channel: bool = False, seen: str = "",
-                      media_kind: str = "фото") -> str:
+                      media_kind: str = "фото", speech: str = "") -> str:
     what = f"альбом из {count} фото (ты видишь первое)" if count > 1 else media_kind
     if father_channel:
         head = f"«{name}» переслал(а) в чат {what} из канала бати {FATHER_NAME} — это батин пост"
@@ -1325,7 +1325,9 @@ async def roast_photo(image: bytes, mime: str, name: str, caption: str = "", is_
     user = (
         head
         + (f" с подписью: <msg>{caption[:300]}</msg>" if caption else "") + ".\n"
-        "Внимательно рассмотри фото и пойми, что на нём (еда, место, вещи, надписи, ситуация). "
+        + (f"Что в нём говорят (расшифровка звука): <said>{speech[:1200]}</said>\nГлавное здесь — его СЛОВА: "
+           "подкалывай прежде всего за то, что и как он говорит; кадр — фон.\n" if speech else "")
+        + "Внимательно рассмотри фото и пойми, что на нём (еда, место, вещи, надписи, ситуация). "
         "Прокомментируй коротко и токсично, зацепившись за конкретную деталь: высмей ситуацию, "
         "обстановку, еду, бардак, вещи, сам факт, что это выложили, подпись. Не пересказывай и не перечисляй, что на фото, — все в чате его видят; НЕ начинай с описания («закат и лодка.», «фиолетовая лента и бетонная стена.»). Сразу шутка, как живой человек в чате, а деталь с фото вплети внутрь неё. Не пиши «что-то "
         "непонятное», если на фото можно понять, что это. Не стеби за отсутствие подписи — "
@@ -1502,10 +1504,13 @@ DEMOT_FALLBACK = [
 
 async def meme(messages: list[dict], dossiers: dict[str, str], about: str = "", new_ids: set | None = None,
                avoid: list[str] | None = None) -> dict:
-    """Мем по шаблону про реальный момент из переписки: {"template", "lines", "reply_to"} или {} — не вышло.
+    """Мем по шаблону про реальный момент из переписки: {"template", "lines" (на все места картинки),
+    "reply_to", "joke"} или {} — не вышло. about — про кого мем (ответом на его сообщение); new_ids — мем
+    только про эти сообщения (сам встрял); avoid — шаблоны, что были недавно (не повторять).
 
-    about — про кого мем (ответом на его сообщение); new_ids — мем только про эти сообщения (сам встрял);
-    avoid — шаблоны, что были недавно (не повторять)."""
+    Раньше ИИ клеил в один мем два несвязанных факта и путал устройство шаблона (Кермит без «не моё дело»,
+    у Грю на 4-й картинке новый текст) — поэтому готовые строки ставит код (memes.fill), а ИИ пишет
+    только свои и объясняет шутку (joke — в /log)."""
     import memes
 
     ids = {m.get("id") for m in messages}
@@ -1514,25 +1519,33 @@ async def meme(messages: list[dict], dossiers: dict[str, str], about: str = "", 
         focus += "Мем — про одно из НОВЫХ сообщений (new=\"1\"), остальные — контекст. "
     user = (
         f"Досье участников:\n{_dossiers_block(dossiers) or 'пусто'}\nПереписка чата:\n{_msgs_block(messages, new_ids)}\n\n"
-        "Сделай смешной мем по одному из шаблонов про конкретный момент из переписки: слова, обещание, понты, "
-        "нытьё, спор, тупое заявление. " + focus + "Шаблоны — id (сколько строк): что значит каждая строка:\n"
-        + memes.menu_for_ai() + "\n\n"
-        "Сначала найди, что в этом моменте смешного: противоречие, понты против реальности, двойные стандарты, "
-        "тупой вывод, слитое обещание. Потом выбери шаблон, у которого именно такой контраст — суть мема (а не "
-        "притянутый), и напиши строки по порядку. Мем смешной поворотом и выводом; переписать реплики из чата "
-        "в клетки шаблона без поворота — провал. Строки — как в настоящих мемах: коротко (каждая до 8 слов), "
-        "разговорно, с именами, можно мат; по реальным словам и поступкам людей, ничего не выдумывай. Шутка "
-        "понятна с первого взгляда тем, кто был в чате. Без кавычек вокруг строк, без эмодзи. "
+        "Сделай смешной мем-картинку по одному из шаблонов про ОДИН конкретный момент из переписки. " + focus
+        + "Шаблоны — id, что на картинке, сколько строк пишешь ты и что значит каждая (остальной текст "
+        "картинки код вставит сам):\n" + memes.menu_for_ai() + "\n\n"
+        "Как делать:\n"
+        "1) Найди один момент, где есть смешное: противоречие (говорит одно — делает другое), понты против "
+        "реальности, слитое обещание, тупой вывод, двойные стандарты.\n"
+        "2) Выбери шаблон, у которого шутка устроена ровно так же, и заполни строки строго по их смыслу.\n"
+        "3) Все строки — про ЭТОТ момент и этих людей и вместе читаются как одна шутка с поворотом. "
+        "Склеить два разных факта из переписки («Даша спросила X» + «ходит в зал покурить») — провал. "
+        "Переписать реплики в клетки без поворота — тоже провал.\n"
+        "4) Мем понятен без чтения переписки: из строк ясно, кто и что сказал или сделал.\n"
+        "5) Текст в «[фото: …]», «[кружок: …]», «[видео: …]» — твоё описание чужой картинки, а не слова людей: "
+        "оттуда не бери названия, бренды и детали.\n"
+        "Строки — как в настоящих мемах: коротко (до 8 слов), разговорно, с именами, можно мат; только по "
+        "реальным словам и поступкам, ничего не выдумывай. Без кавычек вокруг строк, без эмодзи. "
         + (f"Эти шаблоны были недавно — возьми другой: {', '.join(avoid)}. " if avoid else "")
-        + "reply_to — id сообщения, про которое мем. Нет хорошего повода — template пустой. " + _SAFE_TOPICS + "\n"
-        'Верни СТРОГО JSON: {"template": "<id>", "lines": ["...", "..."], "reply_to": <id>}'
+        + "joke — одной фразой, почему это смешно (для проверки). Перед ответом прочитай свои строки вместе "
+        "с картинкой шаблона: если шутку надо объяснять или строки не связаны — смени момент или шаблон. "
+        "reply_to — id сообщения, про которое мем. Нет хорошего повода — template пустой. " + _SAFE_TOPICS + "\n"
+        'Верни СТРОГО JSON: {"template": "<id>", "lines": ["...", "..."], "joke": "...", "reply_to": <id>}'
     )
     for attempt in range(2):
         try:
             data = _extract_json(await _complete(
                 ROAST_SYSTEM + " Сейчас ты делаешь мем-картинку. Отвечаешь строго JSON.",
                 user + ("\nБез внешности и тела — даже в шутку." if attempt else ""),
-                max_tokens=5000, model=MODEL, effort="medium"))
+                max_tokens=6000, model=MODEL, effort="medium"))
         except Exception as e:
             logger.warning("meme attempt %s failed: %s", attempt + 1, e)
             continue
@@ -1542,9 +1555,9 @@ async def meme(messages: list[dict], dossiers: dict[str, str], about: str = "", 
         if tid not in memes.TEMPLATES:
             continue
         lines = [scrub(str(x).strip().strip("«»\"")) for x in (data.get("lines") or []) if str(x).strip()]
-        lines = [x[:120] for x in lines][:memes.lines_count(tid)]
+        lines = [x[:120] for x in lines][:memes.slots(tid)]
         joined = " ".join(lines)
-        if len(lines) < memes.lines_count(tid) or about_looks(joined) or _garbled(joined):
+        if len(lines) < memes.slots(tid) or about_looks(joined) or _garbled(joined):
             logger.info("meme rejected (attempt %s): %s %s", attempt + 1, tid, lines)
             continue
         try:
@@ -1553,23 +1566,37 @@ async def meme(messages: list[dict], dossiers: dict[str, str], about: str = "", 
             reply_to = None
         if reply_to not in ids or (new_ids and reply_to not in new_ids):
             reply_to = None
-        return {"template": tid, "lines": lines, "reply_to": reply_to}
+        return {"template": tid, "lines": memes.fill(tid, lines), "reply_to": reply_to,
+                "joke": str(data.get("joke") or "").strip()[:300]}
     return {}
 
 
-async def video_caption(frame: bytes, mime: str, kind: str, author: str = "", caption: str = "",
-                        context: list[dict] | None = None) -> str:
-    """Подпись для видео-мема (белая плашка над видео): «когда…», «я, когда…», «POV: …». "" — не вышло."""
+async def video_caption(frames_jpg: bytes, mime: str, kind: str, author: str = "", caption: str = "",
+                        context: list[dict] | None = None, speech: str = "", must: bool = True) -> str:
+    """Подпись для видео-мема (белая плашка над видео): «когда…», «я, когда…», «POV: …». "" — не вышло.
+
+    frames_jpg — кадры начала, середины и конца в одну полосу (frames.strip); speech — что в видео говорят
+    (расшифровка звука). По одному смазанному кадру и с «можно зацепиться за переписку» ИИ приклеивал к
+    видео посторонние темы чата (кружок у автоматов → «гости Евы на вписоне…») — теперь подпись про то,
+    что в самом видео; переписка — только если она про то же. must=False — можно промолчать (сам встрял)."""
     kind = {"кружок": "кружка (видеосообщения)", "гифка": "гифки"}.get(kind, kind)
     user = (
-        f"Это кадр из середины {kind}"
-        + (f", которое прислал {author}" if author else "")
-        + (f" с подписью <msg>{caption[:200]}</msg>" if caption else "") + ".\n"
-        + (f"Свежая переписка чата (контекст, можно зацепиться):\n{_msgs_block(context[-15:])}\n" if context else "")
+        f"Это кадры из {kind} — начало, середина и конец"
+        + (f"; прислал {author}" if author else "")
+        + (f"; подпись к нему: <msg>{caption[:200]}</msg>" if caption else "") + ".\n"
+        + (f"Что в нём говорят (расшифровка звука): <said>{speech[:1500]}</said>\nЛучшая подпись обыгрывает "
+           "именно эти слова: придумай ситуацию, в которой они звучат смешнее всего.\n" if speech else
+           "Речи в нём нет или её не слышно.\n")
+        + (f"Свежая переписка чата (только для понимания, кто есть кто):\n{_msgs_block(context[-12:])}\n"
+           if context else "")
         + "Напиши подпись для видео-мема, как в тиктоке: белая плашка над видео, в которой ситуация, на которую "
-        "это видео — идеальная реакция («когда…», «я, когда…», «POV: …», «мы с пацанами, когда…»). Смешно — в "
-        "неожиданной жизненной ситуации, а не в описании видео: НЕ пересказывай, что на кадре. Можно зацепиться "
-        "за переписку и имена, можно мат. До 14 слов, одна фраза, без кавычек и эмодзи. "
+        "ЭТО видео — идеальная реакция («когда…», «я, когда…», «POV: …», «мы с пацанами, когда…»). Сначала пойми, "
+        "что в видео происходит: что делают, куда идут, что говорят и каким тоном. Шутка — про ЭТО: "
+        "неожиданная жизненная ситуация, которая объясняет, почему человек так себя ведёт или так говорит. "
+        "Переписку чата тяни в подпись, только если видео явно про то же (та же тема, те же слова); иначе — "
+        "не трогай её, посторонняя тема чата на чужом видео — провал. Не пересказывай кадры. Можно мат и имена. "
+        "До 14 слов, одна фраза, без кавычек и эмодзи. "
+        + ("" if must else "Если смешной подписи нет — верни пустую. ")
         + _SAFE_TOPICS + " Людей на видео за внешность не трогай.\n"
         'Верни СТРОГО JSON: {"caption": "..."}'
     )
@@ -1578,11 +1605,13 @@ async def video_caption(frame: bytes, mime: str, kind: str, author: str = "", ca
             data = _extract_json(await _complete(
                 ROAST_SYSTEM + " Сейчас ты подписываешь видео-мем. Отвечаешь строго JSON.",
                 user + ("\nБез слов про лицо, тело, вес." if attempt else ""),
-                max_tokens=3000, model=MODEL, image=(frame, mime), effort="medium"))
+                max_tokens=4000, model=MODEL, image=(frames_jpg, mime), effort="medium"))
         except Exception as e:
             logger.warning("video caption attempt %s failed: %s", attempt + 1, e)
             continue
         cap = scrub(str(data.get("caption") or "").strip().strip("«»\""))[:160]
+        if not cap and not must:
+            return ""
         if cap and not about_looks(cap) and not _garbled(cap):
             return cap
     return ""
@@ -1942,17 +1971,26 @@ def is_openrouter(model: str | None) -> bool:
     return bool(model) and "/" in model
 
 
-async def _complete_openrouter(system: str, user: str, model: str, max_tokens: int = 8000) -> str:
-    """Один запрос к модели через OpenRouter (их API совместим с OpenAI chat completions)."""
+async def _complete_openrouter(system: str, user: str, model: str, max_tokens: int = 8000,
+                               audio: tuple[bytes, str] | None = None) -> str:
+    """Один запрос к модели через OpenRouter (их API совместим с OpenAI chat completions).
+    audio — (байты, формат «wav»/«mp3»): звук в том же сообщении, что и текст (для расшифровки речи)."""
     import aiohttp
 
     key = openrouter_key()
     if not key:
         raise AIUnavailable("ключ OpenRouter не задан (.env или /setkey)")
+    content: str | list = user
+    if audio is not None:
+        import base64
+
+        content = [{"type": "text", "text": user},
+                   {"type": "input_audio", "input_audio": {"data": base64.standard_b64encode(audio[0]).decode(),
+                                                           "format": audio[1]}}]
     body = {
         "model": model,
         "max_tokens": max_tokens,
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
         "usage": {"include": True},  # вернёт стоимость запроса в долларах — для «Расходов ИИ»
     }
     headers = {"Authorization": f"Bearer {key}", "X-Title": "BunkerBot"}
@@ -1976,6 +2014,34 @@ async def _complete_openrouter(system: str, user: str, model: str, max_tokens: i
     if not text:  # всё ушло на «размышления» или модель промолчала — пусть вызывающий увидит ошибку
         raise AIUnavailable(f"{model} вернула пустой ответ (finish={choice.get('finish_reason')})")
     return text
+
+
+# ---------- слух: голосовые, кружки и видео — в текст ----------
+
+# Claude звук не принимает — расшифровывает Gemini через OpenRouter (ключ тот же, что для постов: .env или
+# /setkey). Минута речи ≈ 2000 звуковых токенов ≈ $0.002. Без ключа бот, как раньше, звука не слышит.
+HEAR_MODEL = os.getenv("AI_MODEL_HEAR", "").strip() or "google/gemini-3.8-flash"
+HEAR_SYSTEM = (
+    "Ты расшифровываешь речь из голосовых сообщений и видео в дружеском русском чате. Пиши ДОСЛОВНО, что "
+    "сказано, как есть: со сленгом, матом, ошибками и словами-паразитами, без цензуры, без пересказа и без "
+    "пояснений. Разные голоса — каждая реплика с новой строки через «— ». Неразборчивое место — […]. Речи "
+    "нет (тишина, шум, только музыка) — верни ровно «-». Если поёт песню — пиши «(поёт) …» и слова."
+)
+_NO_SPEECH = {"-", "—", "–", "[…]", "[...]", "…", "(тишина)", "тишина", "нет речи"}
+
+
+async def transcribe(wav: bytes) -> str:
+    """Что сказано в записи (WAV) — текстом; "" — речи нет, ключа нет или сбой."""
+    if not openrouter_available() or not wav:
+        return ""
+    try:
+        text = await _complete_openrouter(HEAR_SYSTEM, "Расшифруй речь в этой записи.", HEAR_MODEL,
+                                          max_tokens=4000, audio=(wav, "wav"))
+    except Exception as e:
+        logger.warning("transcribe failed: %s", e)
+        return ""
+    text = text.strip().strip("«»\"")
+    return "" if text.lower() in _NO_SPEECH else text[:2000]
 
 
 async def complete_any(system: str, user: str, model: str, max_tokens: int = 8000, effort: str = "high") -> str:

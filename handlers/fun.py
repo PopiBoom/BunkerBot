@@ -296,15 +296,20 @@ def _own_meme(args: str) -> tuple[str, list[str]] | None:
     parts = [x for x in parts if x]
     if not parts:
         return None
-    top_bottom = [t for t in memes.TEMPLATES if memes.TEMPLATES[t][1] == memes._TB]
+    if tid is not None:  # шаблон назван: свои строки — на свободные места, готовые (Кермит, Грю…) — код
+        n = memes.lines_count(tid)
+        return tid, memes.fill(tid, parts) if len(parts) == memes.slots(tid) else (parts + [""] * n)[:n]
     if len(parts) == 1:  # одна фраза — на картинку с подписью сверху и снизу, поровну
         words = parts[0].split()
-        parts = [" ".join(words[:len(words) // 2]), " ".join(words[len(words) // 2:])] if len(words) > 1 else ["", parts[0]]
-        tid = tid or random.choice(top_bottom)
-    if tid is None:
-        tid = random.choice([t for t in memes.TEMPLATES if memes.lines_count(t) == len(parts)] or top_bottom)
-    n = memes.lines_count(tid)
-    return tid, (parts + [""] * n)[:n]
+        tid = random.choice([t for t, v in memes.TEMPLATES.items() if v[2] == memes._TB and not v[4]])
+        return tid, [" ".join(words[:len(words) // 2]), " ".join(words[len(words) // 2:])] if len(words) > 1 else ["", parts[0]]
+    fits = [t for t in memes.TEMPLATES if memes.slots(t) == len(parts)]
+    if not fits:  # строк больше, чем мест в любом шаблоне — склеиваем в верх и низ
+        half = len(parts) // 2
+        parts = [" ".join(parts[:half]), " ".join(parts[half:])]
+        fits = [t for t, v in memes.TEMPLATES.items() if v[2] == memes._TB and not v[4]]
+    tid = random.choice(fits)
+    return tid, memes.fill(tid, parts)
 
 
 @router.message(Command("mem", "meme"))
@@ -355,7 +360,7 @@ async def cmd_meme(message: Message, command: CommandObject, bot: Bot, db: Datab
         return
     target = rt.message_id if rt is not None else res["reply_to"]
     try:
-        await R.send_meme(bot, chat_id, target, res["template"], res["lines"], "мем /mem")
+        await R.send_meme(bot, chat_id, target, res["template"], res["lines"], "мем /mem", res.get("joke", ""))
     except Exception as e:
         logger.warning("meme failed: %s", e)
         await temp_reply(message, "Не вышло отправить мем - попробуй ещё раз.")
@@ -421,10 +426,11 @@ async def cmd_vmem(message: Message, command: CommandObject, bot: Bot, db: Datab
             await temp_reply(message, "Для подписи от ИИ нужен ключ. Можно своей: /vmem когда…")
             return
         async with R._typing_on(bot, chat_id, "upload_video"):
-            frame = await asyncio.to_thread(frames.middle_frame, data)
-            if frame:
-                context = R._as_dicts(await db.recent_messages(chat_id, limit=15))
-                text = await ai.video_caption(frame, "image/jpeg", label, author, caption, context)
+            shots = await asyncio.to_thread(frames.strip, data)  # начало, середина, конец — а не один кадр
+            if shots:
+                speech = await R._hear(data)  # что в видео говорят
+                context = R._as_dicts(await db.recent_messages(chat_id, limit=12))
+                text = await ai.video_caption(shots, "image/jpeg", label, author, caption, context, speech=speech)
         if not text:
             await temp_reply(message, "Не придумалась подпись - попробуй ещё раз или напиши свою: /vmem когда…")
             return

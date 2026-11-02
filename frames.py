@@ -22,14 +22,20 @@ def _brightness(img: Image.Image) -> float:
 
 
 def _grab(container, stream, frac: float) -> Image.Image | None:
+    """Кадр на доле frac длины видео. seek прыгает на опорный кадр ДО нужного места (в коротком кружке он часто
+    один — самый первый, тёмный), поэтому после seek докручиваем до нужного времени."""
     duration = container.duration  # в микросекундах (AV_TIME_BASE)
     if not duration and stream.duration and stream.time_base:
         duration = int(stream.duration * stream.time_base * 1_000_000)
+    target = duration * frac / 1_000_000 if duration else 0.0
     if duration:
         container.seek(int(duration * frac), any_frame=False, backward=True)
+    last = None
     for frame in container.decode(stream):
-        return frame.to_image()
-    return None
+        last = frame
+        if frame.time is None or frame.time >= target:
+            break
+    return last.to_image() if last is not None else None
 
 
 def middle_frame(data: bytes) -> bytes | None:
@@ -62,4 +68,79 @@ def middle_frame(data: bytes) -> bytes | None:
     best.thumbnail((MAX_SIDE, MAX_SIDE))
     buf = io.BytesIO()
     best.convert("RGB").save(buf, format="JPEG", quality=88)
+    return buf.getvalue()
+
+
+def strip(data: bytes, n: int = 3) -> bytes | None:
+    """Несколько кадров (начало, середина, конец) в одну полосу JPEG — ИИ видит, что в видео происходит, а не
+    один смазанный кадр (по одному кадру кружка у автоматов ИИ придумал подпись мимо). None — не вышло."""
+    try:
+        import av
+    except ImportError:
+        return None
+    shots = []
+    try:
+        for frac in [(i + 1) / (n + 1) for i in range(n)]:
+            with av.open(io.BytesIO(data)) as c:
+                if not c.streams.video:
+                    return None
+                img = _grab(c, c.streams.video[0], frac)
+            if img is not None:
+                img.thumbnail((512, 512))
+                shots.append(img.convert("RGB"))
+    except Exception as e:
+        logger.debug("strip failed: %s", e)
+    if not shots:
+        return None
+    h = max(i.height for i in shots)
+    out = Image.new("RGB", (sum(i.width for i in shots) + 8 * (len(shots) - 1), h), "white")
+    x = 0
+    for img in shots:
+        out.paste(img, (x, (h - img.height) // 2))
+        x += img.width + 8
+    buf = io.BytesIO()
+    out.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+AUDIO_RATE = 16000  # речи хватает, файл маленький (минута ≈ 1.9 МБ WAV)
+
+
+def audio_wav(data: bytes, max_sec: int = 300) -> bytes | None:
+    """Звук из голосового (OGG/Opus), кружка или видео — в WAV 16 кГц моно (для расшифровки речи).
+    None — звука нет или не вышло."""
+    try:
+        import av
+    except ImportError:
+        return None
+    import wave
+
+    pcm = bytearray()
+    try:
+        with av.open(io.BytesIO(data)) as c:
+            if not c.streams.audio:
+                return None
+            res = av.AudioResampler(format="s16", layout="mono", rate=AUDIO_RATE)
+            limit = max_sec * AUDIO_RATE * 2
+            for frame in c.decode(c.streams.audio[0]):
+                frame.pts = None
+                for rf in res.resample(frame):
+                    pcm += bytes(rf.planes[0])[:rf.samples * 2]
+                if len(pcm) >= limit:
+                    break
+            for rf in res.resample(None):
+                pcm += bytes(rf.planes[0])[:rf.samples * 2]
+    except Exception as e:
+        logger.debug("audio extract failed: %s", e)
+        if not pcm:
+            return None
+    pcm = pcm[:max_sec * AUDIO_RATE * 2]
+    if len(pcm) < AUDIO_RATE:  # меньше полсекунды — нечего слушать
+        return None
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(AUDIO_RATE)
+        w.writeframes(bytes(pcm))
     return buf.getvalue()
