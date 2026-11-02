@@ -424,22 +424,24 @@ async def cmd_vmem(message: Message, command: CommandObject, bot: Bot, db: Datab
                                       "нужное видео, кружок или гифку.")
             return
         (target, data), label = picked, "видео"
-    text = (command.args or "").strip()
+    text, scene = (command.args or "").strip(), ""
     if not text:
         if not ai.available():
             await temp_reply(message, "Для подписи от ИИ нужен ключ. Можно своей: /vmem когда…")
             return
         async with R._typing_on(bot, chat_id, "upload_video"):
-            shots = await asyncio.to_thread(frames.strip, data)  # начало, середина, конец — а не один кадр
+            shots = await asyncio.to_thread(frames.strip, data, 4)  # 4 кадра от начала до конца, а не один
             if shots:
                 speech = await R._hear(data)  # что в видео говорят
                 context = R._as_dicts(await db.recent_messages(chat_id, limit=12))
-                text = await ai.video_caption(shots, "image/jpeg", label, author, caption, context, speech=speech)
+                text, scene = await ai.video_caption(shots, "image/jpeg", label, author, caption, context,
+                                                     speech=speech)
         if not text:
             await temp_reply(message, "Не придумалась подпись - попробуй ещё раз или напиши свою: /vmem когда…")
             return
     try:
-        await R.send_video_meme(bot, chat_id, target, data, text, f"видео-мем /vmem ({label})", as_gif=as_gif)
+        await R.send_video_meme(bot, chat_id, target, data, text, f"видео-мем /vmem ({label})", as_gif=as_gif,
+                                scene=scene)
     except Exception as e:
         logger.warning("vmem failed: %s", e)
         await temp_reply(message, "Не вышло смонтировать видео - попробуй другое.")

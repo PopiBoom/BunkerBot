@@ -1549,7 +1549,7 @@ async def send_meme(bot: Bot, chat_id: int, reply_to: int | None, tid: str, line
 
 
 async def send_video_meme(bot: Bot, chat_id: int, reply_to: int | None, data: bytes, caption: str, kind: str,
-                          as_gif: bool | None = None) -> None:
+                          as_gif: bool | None = None, scene: str = "") -> None:
     """Видео-мем: белая плашка с подписью над видео (memes.make_video_meme), ответом на исходное видео.
     as_gif: гифка — гифкой (крутится по кругу); None — гифкой, если в видео нет звука."""
     async with _vmem_lock, _typing_on(bot, chat_id, "upload_video"):
@@ -1564,7 +1564,8 @@ async def send_video_meme(bot: Bot, chat_id: int, reply_to: int | None, data: by
             await _db_ref[0].mark_media_used(chat_id, reply_to, "vmem")
         except Exception as e:
             logger.debug("mark media used failed: %s", e)
-    await _after_pic(chat_id, reply_to, sent, f"[видео-мем: {caption}]", kind, caption)
+    await _after_pic(chat_id, reply_to, sent, f"[видео-мем: {caption}]", kind,
+                     caption + (f" | ИИ увидел: {scene}" if scene else ""))
 
 
 async def _maybe_auto_meme(bot: Bot, chat_id: int, rows: list[tuple], dossiers: dict[str, str],
@@ -1603,13 +1604,15 @@ async def _maybe_auto_vmem(message: Message, bot: Bot, data: bytes | None, capti
         return False
     _last_vmem[chat_id] = now
     try:
-        shots = await asyncio.to_thread(frames.strip, data)
+        shots = await asyncio.to_thread(frames.strip, data, 4)
         if not shots:
             return False
-        cap = await ai.video_caption(shots, "image/jpeg", label, _name(message), caption, speech=speech, must=False)
+        cap, scene = await ai.video_caption(shots, "image/jpeg", label, _name(message), caption, speech=speech,
+                                            must=False)
         if not cap:
             return False
-        await send_video_meme(bot, chat_id, message.message_id, data, cap, f"сам видео-мем ({label})", as_gif=False)
+        await send_video_meme(bot, chat_id, message.message_id, data, cap, f"сам видео-мем ({label})", as_gif=False,
+                              scene=scene)
         logger.info("сам видео-мем в %s: %s", chat_id, cap)
         return True
     except Exception as e:

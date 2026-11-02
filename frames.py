@@ -86,7 +86,7 @@ def strip(data: bytes, n: int = 3) -> bytes | None:
                     return None
                 img = _grab(c, c.streams.video[0], frac)
             if img is not None:
-                img.thumbnail((512, 512))
+                img.thumbnail((max(320, 1560 // n), 640))  # вся полоса ≈ 1560 px — больше Claude всё равно ужмёт
                 shots.append(img.convert("RGB"))
     except Exception as e:
         logger.debug("strip failed: %s", e)
