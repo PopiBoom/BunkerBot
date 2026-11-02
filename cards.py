@@ -207,7 +207,8 @@ def to_jpeg(data: bytes, max_side: int = 1280) -> bytes:
 
 def render_demotivator(photo: bytes, title: str, subtitle: str, side: int = 1000) -> bytes:
     """Классический демотиватор, КВАДРАТНЫЙ (просьба владельца): чёрный фон, фото в белой рамке, КРУПНЫЙ
-    заголовок и подпись. Фото не обрезается — целиком уменьшается под место над текстом (узкое — с полями)."""
+    заголовок и подпись. Фото не обрезается и не вписывается с полями, а сжимается/растягивается ровно под
+    рамку (непропорционально), чтобы всё вместе было квадратом."""
     src = Image.open(io.BytesIO(photo)).convert("RGB")
     margin, gap, border = 70, 12, 3
     probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
@@ -221,8 +222,8 @@ def render_demotivator(photo: bytes, title: str, subtitle: str, side: int = 1000
     text_h = 40 + len(t_lines) * int(size * 1.2) + (14 + len(s_lines) * 46 if s_lines else 0)
     pad = gap + border
     box_w, box_h = width - 2 * pad, side - 2 * 40 - text_h - 2 * pad  # место под фото (поля сверху и снизу — 40)
-    scale = min(box_w / src.width, box_h / src.height, 2.0)  # мелкое (превью стикера) — не больше чем в 2 раза
-    pw, ph = max(1, int(src.width * scale)), max(1, int(src.height * scale))
+    # фото СЖИМАЕТСЯ/растягивается ровно под рамку, без полей — пусть и непропорционально (так хочет владелец)
+    pw, ph = box_w, box_h
     src = src.resize((pw, ph), Image.LANCZOS)
     top = (side - (ph + 2 * pad + text_h)) // 2  # рамка + текст — по центру квадрата
     img = Image.new("RGB", (side, side), (0, 0, 0))
