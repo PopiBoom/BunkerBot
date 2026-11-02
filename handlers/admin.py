@@ -142,6 +142,76 @@ async def _openrouter_balance(key: str) -> float | None:
         return None
 
 
+LOG_DEFAULT, LOG_MAX = 100, 500
+
+
+@router.message(Command("log"))
+async def cmd_log(message: Message, command: CommandObject, bot: Bot, db: Database, config: Config) -> None:
+    """/log [сколько] — файл: последние сообщения чата, у каждого ответа бота — почему он так ответил
+    (ветка, на какое сообщение, черновик до редактора), в конце досье участников. Только админ, в личке."""
+    if message.from_user is None or not _is_admin(message.from_user.id, config):
+        await message.answer(texts.ADMIN_ONLY)
+        return
+    import time as _t
+    from datetime import datetime, timedelta, timezone
+
+    from aiogram.types import BufferedInputFile
+
+    arg = (command.args or "").split()
+    n = max(10, min(LOG_MAX, int(arg[0]))) if arg and arg[0].isdigit() else LOG_DEFAULT
+    chat_id = int(arg[1]) if len(arg) > 1 and arg[1].lstrip("-").isdigit() else None
+    if chat_id is None:  # самый живой групповой чат за неделю
+        best = 0
+        for c in await db.active_chats(int(_t.time()) - 7 * 86400):
+            if c < 0 and (cnt := await db.count_messages_since(c, int(_t.time()) - 7 * 86400)) > best:
+                best, chat_id = cnt, c
+    if chat_id is None:
+        await message.answer("Не нашёл чата с перепиской за неделю.")
+        return
+    msk = timezone(timedelta(hours=3))
+    rows = await db.recent_messages(chat_id, limit=n)
+    by_id = {mid: (name or "?", str(text)) for mid, _uid, name, text, _ts in rows}
+    bot_ids = [mid for mid, uid, *_r in rows if uid == 0 and mid]
+    why = await db.bot_log_for(chat_id, bot_ids)
+    missing = [r for _k, r, _d in why.values() if r and r not in by_id]
+    by_id.update(await db.messages_by_id(chat_id, missing))
+    out = [f"ЛОГ ЧАТА {chat_id} · последние {len(rows)} сообщений · время МСК · версия {_ver()}",
+           "Строки 🤖 — ответы бота: [ветка; на что ответил] и черновик до редактора, если редактор его менял.", ""]
+    for mid, uid, name, text, ts in rows:
+        when = datetime.fromtimestamp(ts, msk).strftime("%d.%m %H:%M")
+        if uid != 0:
+            who = "📢 канал" if uid < 0 else (name or "?")
+            out.append(f"{when} [{mid}] {who}: {text}")
+            continue
+        kind, reply_to, draft = why.get(mid, ("не записано (ответ до /log)", None, ""))
+        target = ""
+        if reply_to:
+            t_name, t_text = by_id.get(reply_to, ("?", "сообщение не сохранилось"))
+            target = f"; ответ на [{reply_to}] {t_name}: «{t_text[:120]}»"
+        out.append(f"{when} [{mid}] 🤖 ПИЗДЮК [{kind}{target}]: {text}")
+        if draft and draft.strip() != str(text).strip():
+            out.append(f"      черновик до редактора: {draft}")
+    names = {name for _m, uid, name, _t2, _ts in rows if uid > 0}
+    doss = {k: v for k, v in (await db.chat_dossiers(chat_id)).items() if k in names}
+    if doss:
+        out += ["", "=== ДОСЬЕ (что бот «знает» о людях) ==="]
+        for name, text in doss.items():
+            out += ["", f"--- {name}", text]
+    data = "\n".join(out).encode("utf-8")
+    await message.answer_document(
+        BufferedInputFile(data, filename=f"log-{datetime.now(msk):%Y%m%d-%H%M}.txt"),
+        caption=f"📄 Лог: {len(rows)} сообщений и досье. Внутри переписка чата - никуда не выкладывай. "
+                "/log 300 - больше сообщений.")
+
+
+def _ver() -> str:
+    try:
+        import version
+        return f"{version.current()} ({version.commit()})"
+    except Exception:
+        return "?"
+
+
 @router.callback_query(F.data == "admin:chan_posts")
 async def admin_chan_posts(call: CallbackQuery, bot: Bot, db: Database, config: Config) -> None:
     if not _is_admin(call.from_user.id, config):

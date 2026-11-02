@@ -176,6 +176,7 @@ async def _maybe_defend(message: Message, bot: Bot, db: Database, config) -> boo
         try:
             answer = await ai.defend_father(name, text, await db.get_dossier(message.chat.id, user.id),
                                             await db.style_sample(message.chat.id))
+            _mark("заступился за батю", answer)
             ctx = _as_dicts(await db.recent_messages(message.chat.id, limit=8))
             # author — обидчик: редактор должен оставить ответ ему, а не бате
             answer = await ai.polish(answer, text, ctx, author=name)
@@ -183,6 +184,7 @@ async def _maybe_defend(message: Message, bot: Bot, db: Database, config) -> boo
             logger.warning("defend failed: %s", e)
     if not answer:
         answer = random.choice(FATHER_FALLBACK).format(n=name)
+        _mark("заступился за батю (запасная фраза)")
     await _say_human(bot, message.chat.id, answer, reply_to=message.message_id)
     return True
 
@@ -417,6 +419,15 @@ async def _say_human(bot: Bot, chat_id: int, text: str, reply_to: int | None = N
     await _say(bot, chat_id, text, reply_to=reply_to)
 
 
+# Почему бот говорит то, что говорит (для /log): ветка ответа и черновик до редактора. Ставит путь ответа
+# прямо перед _say_human; _say записывает это в bot_log вместе с id отправленного сообщения.
+_why: contextvars.ContextVar[dict | None] = contextvars.ContextVar("why", default=None)
+
+
+def _mark(kind: str, draft: str = "") -> None:
+    _why.set({"kind": kind, "draft": draft})
+
+
 async def _say(bot: Bot, chat_id: int, text: str, reply_to: int | None = None) -> None:
     text = ai.scrub(text)  # слова за красными линиями не уходят в чат, что бы ни написала модель
     kwargs = {}
@@ -433,6 +444,9 @@ async def _say(bot: Bot, chat_id: int, text: str, reply_to: int | None = None) -
         try:
             await _db_ref[0].add_chat_message(chat_id, getattr(sent, "message_id", 0) or 0, 0,
                                               BOT_SELF, None, text.strip()[:1000])
+            why = _why.get() or {}
+            await _db_ref[0].add_bot_log(chat_id, getattr(sent, "message_id", 0) or 0, why.get("kind") or "другое",
+                                         reply_to, why.get("draft"))
         except Exception as e:
             logger.debug("save own message failed: %s", e)
 
@@ -712,6 +726,7 @@ async def cmd_roast(message: Message, command: CommandObject, bot: Bot, db: Data
         return
     # Команду бот уже удалил (middleware) — отвечаем на сообщение того, кого жарим, если /roast был ответом
     rt = message.reply_to_message
+    _mark("прожарка /roast")
     await _say(bot, chat_id, f"🔥 Прожарка: {target_name}\n\n{text}",
                reply_to=rt.message_id if rt and rt.from_user and rt.from_user.id == target_id else None)
 
@@ -942,6 +957,7 @@ async def _maybe_laugh(message: Message, bot: Bot, db: Database, config) -> bool
     else:
         pool = LAUGH_LINES_FATHER + LAUGH_LINES[:4] if is_father else LAUGH_LINES
         recent = set(ai.recent_bot_lines.get() or ())
+        _mark("смех на шутку бота (готовая фраза)")
         await _say_human(bot, chat_id, random.choice([t for t in pool if t not in recent] or pool),
                          reply_to=message.message_id)
     return True
@@ -970,6 +986,7 @@ async def _maybe_rhyme(message: Message, bot: Bot, config) -> bool:
     elif time.time() - _rhyme_last.get(chat_id, 0) < RHYME_GAP or random.random() > RHYME_FREE:
         return False
     answer = rhymes.rhyme_for(text, chat_id)
+    _mark("рифма (без ИИ)")
     if not answer:
         return False
     _rhyme_last[chat_id] = time.time()
@@ -1058,6 +1075,7 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
         if ai.available():
             try:
                 jab = await ai.comeback(name, text, short=True, dossier=dossier, samples=samples, is_father=is_father)
+                _mark("послали - зеркалка + добивка", f"{answer} {jab}")
                 if jab:  # редактор проверяет ответ целиком, как одно сообщение
                     full = await ai.polish(f"{answer} {jab}", text,
                                            _as_dicts(await db.recent_messages(chat_id, limit=8)), max_words=20,
@@ -1066,6 +1084,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
                         answer = full
             except Exception as e:
                 logger.warning("comeback failed: %s", e)
+        if not _why.get():
+            _mark("послали - зеркалка")
         await _say_human(bot, chat_id, ai.vary_father(answer) if is_father else answer,
                          reply_to=last_msg.message_id)
         if who:
@@ -1082,6 +1102,7 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
                 quote = await _old_quote(db, chat_id, who.id) if who and random.random() < QUOTE_RECALL else ""
                 answer = await ai.banter(name, text, _as_dicts(ctx), dossier=dossier, samples=samples,
                                          is_father=is_father, quote=quote)
+            _mark(("ответка на грубость" if rude else "ответ на обращение") + (" бате" if is_father else ""), answer)
             if answer:  # редактор: связно ли, к месту ли, коротко ли
                 answer = await ai.polish(answer, text, _as_dicts(await db.recent_messages(chat_id, limit=20)),
                                          author=ai.FATHER_NAME if is_father else name)
@@ -1089,6 +1110,7 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
             logger.warning("bot reply failed: %s", e)
     if not answer and rude:
         answer = random.choice(FATHER_MIRRORS) if is_father and not ai.father_rude.get() else random.choice(COMEBACKS)
+        _mark("ответка на грубость (запасная фраза)")
     if answer and is_father:
         answer = ai.vary_father(answer)
     if answer:
@@ -1285,6 +1307,7 @@ async def _remind_promises(bot: Bot, db: Database) -> None:
             answer = ""
         if not answer:
             answer = f"{name}, ну что, «{what}»? Срок вышел. Рассказывай, как слился 🤡"
+        _mark("напоминание об обещании")
         await _say(bot, chat_id, answer, reply_to=msg_id)
 
 
@@ -1442,6 +1465,7 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
                                      count=count, father_channel=_forwarded_from_father_channel(message),
                                      seen=descr, media_kind=kind)
         author = ai.FATHER_NAME if is_father else _name(message)
+        _mark(f"коммент к {label}" + (" (обратились)" if addressed else ""), draft)
         answer = await ai.polish(draft, caption or f"[{label}]",
                                  _as_dicts(await db.recent_messages(chat_id, limit=10)),
                                  author=author, about_photo=True, image=(img, mime), seen=descr)  # редактор видит то же
@@ -1602,11 +1626,17 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int) -> None:
         return  # пока думали, бот уже успел ответить кому-то — молчим
     if result["text"]:
         reply_to = result["reply_to"] if result["reply_to"] in new_ids else None
-        target = next((r for r in rows if r[0] == reply_to), rows[-1])
+        if reply_to is None:  # раньше брали последнее сообщение чата (бывало — свою же реплику или чужую), и
+            # редактор переписывал подкол «под него»: ответ уходил не тому. Не ясно, кому, — молчим.
+            logger.info("auto roast in %s: ИИ указал id %s (не из новых) - молчу: %s",
+                        chat_id, result["reply_to"], result["text"])
+            return
+        target = next(r for r in rows if r[0] == reply_to)
         trigger = target[3]
         is_father = target[1] == _father_id(_cfg_ref[0] if _cfg_ref else None)
         if is_father:  # подкол бате — в его режиме (иногда грубо, чаще по-доброму)
             ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)
+        _mark("сам встрял", result["text"])
         text = await ai.polish(result["text"], trigger, _as_dicts(rows),
                                author=ai.FATHER_NAME if is_father else (target[2] or "" if target[1] > 0 else ""))
         if is_father:

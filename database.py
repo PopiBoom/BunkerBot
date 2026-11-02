@@ -213,6 +213,20 @@ class Database:
                 )
                 """
             )
+            # Почему бот сказал то, что сказал: ветка ответа, на какое сообщение, черновик до редактора (для /log)
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_log (
+                    chat_id    INTEGER NOT NULL,
+                    bot_msg_id INTEGER NOT NULL,
+                    ts         INTEGER NOT NULL,
+                    kind       TEXT,
+                    reply_to   INTEGER,
+                    draft      TEXT,
+                    PRIMARY KEY (chat_id, bot_msg_id)
+                )
+                """
+            )
             # Миграция: у «забытых» помним имя и @ник — чтобы админ мог вернуть их через /remember_me @ник
             cur = await db.execute("PRAGMA table_info(roast_optout)")
             ocols = {r[1] for r in await cur.fetchall()}
@@ -728,6 +742,37 @@ class Database:
                 (keep_last, older_than),
             )
             await db.commit()
+
+    # --- лог ответов бота (/log) ---
+
+    async def add_bot_log(self, chat_id: int, bot_msg_id: int, kind: str, reply_to: int | None,
+                          draft: str | None) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO bot_log (chat_id, bot_msg_id, ts, kind, reply_to, draft) VALUES (?, ?, ?, ?, ?, ?)",
+                (chat_id, bot_msg_id, int(time.time()), kind, reply_to, (draft or "")[:1500]))
+            await db.execute("DELETE FROM bot_log WHERE ts < ?", (int(time.time()) - 30 * 86400,))
+            await db.commit()
+
+    async def bot_log_for(self, chat_id: int, msg_ids: list[int]) -> dict[int, tuple]:
+        """{id сообщения бота: (ветка, на какое сообщение, черновик)}."""
+        if not msg_ids:
+            return {}
+        marks = ",".join("?" for _ in msg_ids)
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(f"SELECT bot_msg_id, kind, reply_to, draft FROM bot_log WHERE chat_id = ? "
+                                   f"AND bot_msg_id IN ({marks})", (chat_id, *msg_ids))
+            return {r[0]: (r[1], r[2], r[3]) for r in await cur.fetchall()}
+
+    async def messages_by_id(self, chat_id: int, msg_ids: list[int]) -> dict[int, tuple[str, str]]:
+        """{id: (имя, текст)} — на что отвечал бот, если этого нет среди последних сообщений."""
+        if not msg_ids:
+            return {}
+        marks = ",".join("?" for _ in msg_ids)
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(f"SELECT msg_id, name, text FROM chat_messages WHERE chat_id = ? AND msg_id IN ({marks})",
+                                   (chat_id, *msg_ids))
+            return {r[0]: (r[1] or "?", r[2]) for r in await cur.fetchall()}
 
     # --- расходы на ИИ ---
 

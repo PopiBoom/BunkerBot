@@ -185,6 +185,7 @@ async def quiet_kick(bot: Bot, db: Database, chat_id: int) -> None:
     if not q:
         return
     await _remember_question(db, chat_id, q)
+    R._mark("вопрос дня в тишину")
     await R._say(bot, chat_id, f"🤔 {q}")
     logger.info("вопрос дня в %s: %s", chat_id, q)
 
