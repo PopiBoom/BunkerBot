@@ -675,9 +675,10 @@ class Database:
             return [(r[0], r[1]) for r in await cur.fetchall()][::-1]
 
     async def reset_dossier_times(self) -> None:
-        """Пересобрать все досье заново (новый формат): «давно не обновлялись» — их подхватит _heavy."""
+        """Пересобрать все досье С НУЛЯ (новый формат): старый текст стираем — иначе его ошибки («кинн трек,
+        посвящённый Славику») переезжали в новое досье; собираются заново по сообщениям (они хранятся 30 дней)."""
         async with aiosqlite.connect(self.path) as db:
-            await db.execute("UPDATE dossiers SET updated = 0")
+            await db.execute("UPDATE dossiers SET updated = 0, text = ''")
             await db.commit()
 
     async def set_dossier(self, chat_id: int, user_id: int, name: str, text: str) -> None:

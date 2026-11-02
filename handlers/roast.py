@@ -356,7 +356,8 @@ async def _ensure_genders(db: Database, chat_id: int) -> None:
 
 
 TYPE_SPEED = 18          # символов в секунду — «печатает» столько, сколько человек
-SPLIT_CHANCE = 0.35     # иногда разбивает ответ на два сообщения: подкол, потом добивка
+SPLIT_CHANCE = 0.15     # иногда разбивает ответ на два сообщения: подкол, потом добивка (обе части — полные)
+SPLIT_MIN = 40          # символов в каждой части — иначе вторым сообщением летел огрызок «пиздец, … нахуй»
 
 
 # Сколько бот уже «печатал», пока думал (ставит _typing_on): столько не ждём второй раз перед отправкой
@@ -409,9 +410,11 @@ async def _say_human(bot: Bot, chat_id: int, text: str, reply_to: int | None = N
             first.append(p)
             acc += len(p) + 1
         one, two = " ".join(first), " ".join(parts[len(first):])
-        if two:
+        if len(one) >= SPLIT_MIN and len(two) >= SPLIT_MIN:
             await _typing(bot, chat_id, one, 1.0, 3.5)
             await _say(bot, chat_id, one, reply_to=reply_to)
+            why = _why.get() or {}
+            _mark(why.get("kind", "") + " (вторая часть)", "")  # черновик в /log — только у первой части
             await _typing(bot, chat_id, two, 1.2, 3.0)
             await _say(bot, chat_id, two)
             return
@@ -1667,7 +1670,7 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int) -> None:
 
 
 DOSSIER_VERSION_KEY = "dossier_version"
-DOSSIER_VERSION = "2"  # 2 — Sonnet, только факты с датами и цитатами (было: Haiku «своими словами»)
+DOSSIER_VERSION = "3"  # 2 — Sonnet, факты с датами и цитатами; 3 — без категорий, мелочи, толкований и пометок
 
 
 async def _heavy(bot: Bot, db: Database) -> None:

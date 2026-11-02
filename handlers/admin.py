@@ -148,7 +148,7 @@ LOG_DEFAULT, LOG_MAX = 100, 500
 @router.message(Command("log"))
 async def cmd_log(message: Message, command: CommandObject, bot: Bot, db: Database, config: Config) -> None:
     """/log [сколько] — файл: последние сообщения чата, у каждого ответа бота — почему он так ответил
-    (ветка, на какое сообщение, черновик до редактора), в конце досье участников. Только админ, в личке."""
+    (ветка, на какое сообщение, черновик ИИ до фильтров), в конце досье участников. Только админ, в личке."""
     if message.from_user is None or not _is_admin(message.from_user.id, config):
         await message.answer(texts.ADMIN_ONLY)
         return
@@ -176,7 +176,7 @@ async def cmd_log(message: Message, command: CommandObject, bot: Bot, db: Databa
     missing = [r for _k, r, _d in why.values() if r and r not in by_id]
     by_id.update(await db.messages_by_id(chat_id, missing))
     out = [f"ЛОГ ЧАТА {chat_id} · последние {len(rows)} сообщений · время МСК · версия {_ver()}",
-           "Строки 🤖 — ответы бота: [ветка; на что ответил] и черновик до редактора, если редактор его менял.", ""]
+           "Строки 🤖 — ответы бота: [ветка; на что ответил] и черновик ИИ, если фильтры его поменяли.", ""]
     for mid, uid, name, text, ts in rows:
         when = datetime.fromtimestamp(ts, msk).strftime("%d.%m %H:%M")
         if uid != 0:
@@ -190,7 +190,7 @@ async def cmd_log(message: Message, command: CommandObject, bot: Bot, db: Databa
             target = f"; ответ на [{reply_to}] {t_name}: «{t_text[:120]}»"
         out.append(f"{when} [{mid}] 🤖 ПИЗДЮК [{kind}{target}]: {text}")
         if draft and draft.strip() != str(text).strip():
-            out.append(f"      черновик до редактора: {draft}")
+            out.append(f"      черновик ИИ: {draft}")
     names = {name for _m, uid, name, _t2, _ts in rows if uid > 0}
     doss = {k: v for k, v in (await db.chat_dossiers(chat_id)).items() if k in names}
     if doss:
