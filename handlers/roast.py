@@ -556,10 +556,22 @@ async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
                 await db.add_chat_message(chat_id, message.message_id, 0, BOT_SELF, None,
                                           f"[мой пост в канале] {text}"[:1000])
             return
+    # Голосовое, кружок или видео в посте (и сообщение бати от имени канала в комментариях) — слушаем, что
+    # сказано: раньше слух был только у обычных сообщений чата, а здесь голосовое было для бота пустым
+    speech, raw = "", None
+    sound = message.voice or message.video or message.video_note
+    if (sound is not None and (sound.file_size or 0) <= VIDEO_MAX and ai.openrouter_available()
+            and not _bunker_active(chat_id) and await _enabled(db)):
+        try:
+            raw = (await bot.download(sound)).read()
+            speech = await _hear(raw)
+        except Exception as e:
+            logger.warning("channel post audio failed: %s", e)
     if text or media:
         who = f"📢 {channel} (репост бати из {repost_from})" if repost_from else f"📢 {channel} (пост бати)"
-        await db.add_chat_message(chat_id, message.message_id, CHANNEL_USER_ID, who,
-                                  None, (f"[{media}] " if media else "") + text[:1000])
+        await db.add_chat_message(chat_id, message.message_id, CHANNEL_USER_ID, who, None,
+                                  " ".join(x for x in (f"[{media}]" if media else "", text[:1000],
+                                                       f"говорит: «{speech}»" if speech else "") if x)[:1000])
     if not await _enabled(db) or not ai.available() or _bunker_active(chat_id):
         return
     if not text and not media:
@@ -572,7 +584,10 @@ async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
             image = ((await bot.download(photo)).read(), "image/jpeg")
         else:  # у видео — кадр из середины (первый часто тёмный), у гифок — превью
             vid = message.video or message.video_note
-            frame = await _video_frame(bot, vid) if vid is not None else None
+            if vid is not None and raw is not None:  # уже скачано ради звука
+                frame = await asyncio.to_thread(frames.middle_frame, raw)
+            else:
+                frame = await _video_frame(bot, vid) if vid is not None else None
             if frame:
                 image = (frame, "image/jpeg")
                 media = f"{media} (ты видишь один кадр из середины)"
@@ -588,7 +603,7 @@ async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
         await _remember_lines(db, chat_id)
         ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)  # пост бати: иногда и нагрубить
         answer = await ai.channel_comment(channel, text, media, image, await db.style_sample(chat_id),
-                                          repost_from=repost_from)
+                                          repost_from=repost_from, speech=speech)
     except Exception as e:
         logger.warning("channel comment failed: %s", e)
         return
