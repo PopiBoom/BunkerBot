@@ -421,18 +421,22 @@ def _dossier_note(dossier: str) -> str:
             f"<dossier>{dossier}</dossier>" if dossier else "")
 
 
-async def mafia_intro(names: list[str], composition: str, style: str = "") -> dict:
-    """Город и вступление к партии: {"city": "...", "text": "..."}. Ролей ведущий не знает."""
+_CITY_NOTE = ("Город настоящий — {city}: можно подколоть местным бытом (жара, пыль и ветер, Волга, город "
+              "тянется на десятки километров, вечный ремонт дорог, маршрутки), но про войну, Сталинград, "
+              "Мамаев курган и мемориалы — нельзя.")
+
+
+async def mafia_intro(names: list[str], composition: str, city: str, style: str = "") -> dict:
+    """Вступление к партии: {"city": city, "text": "..."}. Город задан (Волгоград), ролей ведущий не знает."""
     user = (
         f"Игроки: {json.dumps(names, ensure_ascii=False)}\nСостав ролей: {composition}\n"
-        "Придумай смешное название города, где завелась мафия (2-3 слова, пародия на криминальную столицу "
-        "или унылый райцентр), и вступление ведущего (2 коротких абзаца, до 55 слов): что за город и что "
-        "мафия уже среди них; можно подколоть одного-двух игроков по именам — но ты НЕ знаешь, у кого какая "
-        "роль, и не намекаешь на роли. Верни СТРОГО JSON: {\"city\": \"...\", \"text\": \"...\"}"
+        f"Мафия завелась в городе {city}. " + _CITY_NOTE.format(city=city) + "\n"
+        "Напиши вступление ведущего (2 коротких абзаца, до 55 слов): что за город и что мафия уже среди них; "
+        "можно подколоть одного-двух игроков по именам — но ты НЕ знаешь, у кого какая роль, и не намекаешь "
+        "на роли. Верни СТРОГО JSON: {\"text\": \"...\"}"
     )
     data = _extract_json(await _complete(_mafia_host(style) + " Отвечаешь строго JSON.", user,
                                          max_tokens=2500, model=EDIT_MODEL))
-    city = re.sub(r"[*_#`\"«»]+", "", str(data.get("city", ""))).strip()[:40]
     text = scrub(str(data.get("text", "")).strip())
     if about_looks(text) or _garbled(text):
         text = ""
@@ -451,7 +455,7 @@ async def mafia_morning(city: str, night: int, victim: str | None, role: str | N
                 "и ты не называй и не угадывай. Все живы.")
     else:
         what = "Этой ночью мафия так никого и не убила — не договорилась или проспала. Все живы."
-    user = f"Город: {city}. Утро после ночи {night}.\n{what}\nДо 60 слов."
+    user = f"Город: {city}. {_CITY_NOTE.format(city=city)} Утро после ночи {night}.\n{what}\nДо 60 слов."
     return await _mafia_text(_mafia_host(style), user)
 
 

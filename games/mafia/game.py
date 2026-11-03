@@ -57,6 +57,7 @@ SHERIFF_TIME = 30         # сек на проверку Следователя
 MAFIA_TIME = 45           # сек мафии на выбор жертвы (раньше, если вся семья выбрала)
 VOTE_TIME = 60            # сек на дневное голосование (закрывается раньше, как только проголосовали все)
 VERDICT_PAUSE = 6         # сек после приговора (было «по длине текста», до 25 — владельцу долго)
+STORY_PAUSE = 6           # сек после вступления и утренней сводки (было «по длине текста», до 25 — долго)
 LAST_WORD_MAX = 500       # символов в последнем слове
 LAST_WORD_SECONDS = 60    # голосовое или кружок — не длиннее
 SPEECH_TIME = 30          # сек на оправдания при ничьей
@@ -954,9 +955,9 @@ async def _run_game(bot: Bot, game: Game) -> None:
     game.dealt = True
     status = await _send(bot, game.chat_id, "Раздаю роли…")
     await _check_rights(bot, game)
-    intro = await _ai(ai.mafia_intro([p.name for p in players], comp, _style(game)), "intro") \
+    game.city = C.CITY  # город всегда Волгоград (просьба владельца), ИИ его больше не придумывает
+    intro = await _ai(ai.mafia_intro([p.name for p in players], comp, game.city, _style(game)), "intro") \
         if ai.available() else None
-    game.city = (intro or {}).get("city") or random.choice(C.CITIES)
     intro_text = (intro or {}).get("text") or random.choice(C.INTRO).format(city=game.city)
 
     no_dm = [p for p in players if not p.is_bot and not await _send_role(bot, game, p)]
@@ -975,7 +976,7 @@ async def _run_game(bot: Bot, game: Game) -> None:
     except Exception as e:
         logger.warning("mafia cover failed: %s", e)
         await _send(bot, game.chat_id, f"{caption}\n\n{_host(game, intro_text)}", reply_markup=kb)
-    await _pause(game, _read(intro_text))
+    await _pause(game, STORY_PAUSE)
     if no_dm and _is_active(game):
         rows = [[b] for b in (_open_bot(game),) if b] + [[_btn("Моя роль", "mf:role")]]
         await _send(bot, game.chat_id,
@@ -1386,7 +1387,7 @@ async def _morning(bot: Bot, game: Game) -> None:
     story_html = _host(game, story)
     await _send_phase(bot, game, f"morning_{'kill' if victim else 'safe'}_{game.no}", story_html,
                       f"☀️ <b>УТРО {game.no}</b>\n{HR}\n\n{story_html}")
-    await _pause(game, _read(story))
+    await _pause(game, STORY_PAUSE)
     if not victim or not _is_active(game):
         return
     await _send_card(bot, game, victim, "killed",
