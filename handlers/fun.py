@@ -445,3 +445,42 @@ async def cmd_vmem(message: Message, command: CommandObject, bot: Bot, db: Datab
     except Exception as e:
         logger.warning("vmem failed: %s", e)
         await temp_reply(message, "Не вышло смонтировать видео - попробуй другое.")
+
+
+# ---------- голосовой чат: /voice — Пиздюк заходит в войс группы и слушает, /voice_stop — выходит ----------
+
+
+@router.message(Command("voice"))
+async def cmd_voice(message: Message, bot: Bot, db: Database) -> None:
+    """Пиздюк в голосовой чат (через отдельный аккаунт — см. voicechat.py)."""
+    import voicechat
+
+    chat_id = message.chat.id
+    if R._bunker_active(chat_id):
+        await temp_reply(message, "Идёт игра - в войс после партии.")
+        return
+    if not R._db_ref:
+        R._db_ref.append(db)
+    if not ai.openrouter_available():
+        await temp_reply(message, "Для войса нужен ключ OpenRouter (слух и голос) - /setkey боту в личку.")
+        return
+    status = await temp_reply(message, "🎙 Захожу в войс…")
+    why = await voicechat.join(bot, db, chat_id)
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    if why:
+        await temp_reply(message, why)
+        return
+    # не временное: все в чате должны видеть, что бот в войсе и слушает
+    await bot.send_message(chat_id, "🎙 Пиздюк в войсе и всех слышит. Зовите «Пиздюк, …» - отвечу голосом, "
+                                    "иногда встряну сам. Выгнать - /voice_stop.")
+
+
+@router.message(Command("voice_stop"))
+async def cmd_voice_stop(message: Message) -> None:
+    import voicechat
+
+    if not await voicechat.leave(message.chat.id, "🎙 Пиздюк вышел из войса."):
+        await temp_reply(message, "Я и так не в войсе.")

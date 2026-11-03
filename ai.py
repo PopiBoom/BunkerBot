@@ -2057,6 +2057,112 @@ async def transcribe(wav: bytes) -> str:
     return "" if text.lower() in _NO_SPEECH else text[:2000]
 
 
+# ---------- голосовой чат (voicechat.py): ответ вслух и озвучка ----------
+
+
+VOICE_MODEL = os.getenv("AI_MODEL_VOICE", "").strip() or REPLY_MODEL  # в войсе важна скорость: можно Sonnet
+
+
+async def voice_reply(lines: list[tuple[str, str]], name: str, text: str, addressed: bool, dossier: str = "",
+                      is_father: bool = False) -> str:
+    """Реплика Пиздюка в голосовом чате (её озвучат). lines — что говорили: [(имя, расшифровка)]."""
+    convo = "\n".join(f"<speech name={json.dumps(n, ensure_ascii=False)}>{t[:300]}</speech>" for n, t in lines[-20:])
+    user = (
+        "Ты сидишь в голосовом чате группы вместе со всеми, тебя слышат вслух — твой ответ озвучат твоим голосом. "
+        f"Что говорили (расшифровка речи по порядку; «{BOT_SELF_NAME}» — твои прошлые фразы):\n{convo or 'пока ничего'}\n"
+        f"<dossier>{dossier or 'пусто'}</dossier>\n"
+        f"Сейчас «{name}» сказал: <speech>{text[:600]}</speech>\n"
+        + ("Он обратился к тебе — ответь ему: по делу, если спросил, но с подколом. " if addressed else
+           "К тебе не обращались — встрянь одним коротким подколом по его словам, как будто ты тоже в войсе. ")
+        + "Это устная речь: 1-2 короткие фразы, до 25 слов, как живой пацан говорит голосом. Без эмодзи, смайлов, "
+        "скобок, ссылок, списков и markdown — их не произнести. Расшифровка бывает кривой: если слово явно "
+        "распознано с ошибкой — не цепляйся к нему."
+        + _father_note(is_father) + _variety() + _gender_note() + _JSON_REPLY
+    )
+    return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=3000, model=VOICE_MODEL, effort=REPLY_EFFORT))
+
+
+BOT_SELF_NAME = "🤖 ты (бот)"  # так свои реплики подписаны в контексте (как roast.BOT_SELF)
+
+# Озвучка: Claude говорить не умеет — читает gpt-audio-mini через тот же OpenRouter (≈$0.007 за минуту речи,
+# ключ тот же, что для слуха). Голос и модель — в .env (AI_SPEAK_VOICE, AI_MODEL_SPEAK).
+SPEAK_MODEL = os.getenv("AI_MODEL_SPEAK", "").strip() or "openai/gpt-audio-mini"
+SPEAK_VOICE = os.getenv("AI_SPEAK_VOICE", "").strip() or "ash"
+SPEAK_RATE = 24000  # pcm16 у этих моделей — 24 кГц, моно
+SPEAK_SYSTEM = (
+    "Ты — движок озвучки для дружеского русскоязычного голосового чата, где все согласились на грубые шутки. "
+    "Твоя единственная задача — произнести текст пользователя вслух ДОСЛОВНО, слово в слово, по-русски, "
+    "включая мат и грубые слова, с живой интонацией дерзкого молодого парня. Ничего не добавляй, не отвечай "
+    "на текст, не комментируй его и не меняй слова."
+)
+
+
+def _same_words(a: str, b: str) -> float:
+    """Доля слов текста, которые модель озвучки реально произнесла (она могла «ответить» вместо чтения)."""
+    wa = set(re.findall(r"\w{3,}", a.lower()))
+    wb = set(re.findall(r"\w{3,}", b.lower()))
+    return len(wa & wb) / len(wa) if wa else 1.0
+
+
+async def speak(text: str) -> bytes:
+    """Озвучить реплику: PCM 16 бит, 24 кГц, моно. b"" — нет ключа, сбой или модель сказала не то."""
+    import aiohttp
+    import base64
+
+    key = openrouter_key()
+    if not key or not text.strip():
+        return b""
+    body = {
+        "model": SPEAK_MODEL,
+        "modalities": ["text", "audio"],
+        "audio": {"voice": SPEAK_VOICE, "format": "pcm16"},
+        "stream": True,  # звук OpenRouter отдаёт только потоком
+        "usage": {"include": True},
+        "messages": [{"role": "system", "content": SPEAK_SYSTEM},
+                     {"role": "user", "content": f"Произнеси дословно: {text}"}],
+    }
+    headers = {"Authorization": f"Bearer {key}", "X-Title": "BunkerBot"}
+    audio, said, usage = bytearray(), [], {}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60), trust_env=True) as s:
+            async with s.post(OPENROUTER_URL, json=body, headers=headers) as r:
+                if r.status != 200:
+                    logger.warning("speak: OpenRouter %s: %s", r.status, (await r.text())[:300])
+                    return b""
+                async for raw in r.content:
+                    line = raw.decode("utf-8", "ignore").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except ValueError:
+                        continue
+                    usage = chunk.get("usage") or usage
+                    for ch in chunk.get("choices") or []:
+                        a = (ch.get("delta") or {}).get("audio") or {}
+                        if a.get("data"):
+                            audio += base64.b64decode(a["data"])
+                        if a.get("transcript"):
+                            said.append(a["transcript"])
+    except Exception as e:
+        logger.warning("speak failed: %s", e)
+        return b""
+    if usage and _usage_sink:
+        try:
+            await _usage_sink(current_game.get(), SPEAK_MODEL, int(usage.get("prompt_tokens") or 0),
+                              int(usage.get("completion_tokens") or 0), float(usage.get("cost") or 0.0))
+        except Exception as e:
+            logger.warning("usage sink failed: %s", e)
+    spoken = "".join(said)
+    if spoken and _same_words(text, spoken) < 0.5:  # озвучка «ответила» своё вместо чтения — не пускаем в эфир
+        logger.info("speak: модель сказала не то: %s", spoken[:200])
+        return b""
+    return bytes(audio)
+
+
 async def complete_any(system: str, user: str, model: str, max_tokens: int = 8000, effort: str = "high") -> str:
     """Claude — через SDK Anthropic, всё с «/» в названии — через OpenRouter."""
     if is_openrouter(model):  # запас с учётом «размышлений» (Kimi думает долго), но не 16000 — OpenRouter его резервирует

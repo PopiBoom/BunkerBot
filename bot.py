@@ -189,6 +189,12 @@ async def main() -> None:
     finally:
         for task in background:
             task.cancel()
+        try:  # сидели в войсе — выйти из звонков и отключить аккаунт войса
+            import voicechat
+
+            await voicechat.shutdown()
+        except Exception as e:
+            logger.info("voice shutdown: %s", e)
 
 
 if __name__ == "__main__":

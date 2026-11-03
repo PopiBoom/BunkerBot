@@ -119,6 +119,12 @@ def _flag_needed() -> bool:
                                g.chat_id, MAX_GAME_AGE // 3600)
     for key in set(_first_seen) - seen:
         _first_seen.pop(key, None)
+    try:  # Пиздюк в войсе — перезапуск выкинул бы его из звонка (сам войс дольше 3 ч не держится)
+        import voicechat
+
+        need = need or voicechat.live()
+    except Exception:
+        pass
     return need
 
 

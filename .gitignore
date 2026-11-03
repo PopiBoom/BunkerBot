@@ -4,6 +4,8 @@
 *.db-journal
 *.sqlite3
 .game_running
+*.session
+*.session-journal
 
 # Python
 __pycache__/
