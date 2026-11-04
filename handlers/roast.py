@@ -109,6 +109,7 @@ _FATHER_REF = re.compile(
 # Части фразы: «капустка красавчик, а петя лох» — оскорбление не про батю
 _CLAUSES = re.compile(r"[,.!?;\n]+|\s+(?:а|но|зато|однако|хотя)\s+", re.IGNORECASE)
 _last_defense: dict[tuple[int, int], float] = {}
+_TO_YOU = re.compile(r"\b(ты|тебя|тебе|тобой|сам|иди|пош[её]л|заткнись|завали)\b", re.IGNORECASE)
 DEFEND_COOLDOWN = 20  # сек на одного обидчика
 FATHER_FALLBACK = ["{n}, на батю моего рот не разевай.", "{n}, ещё раз тронешь батю — прожарю так, что мама не узнает.",
                    "{n}, ты кого тут обзываешь? Сам-то кто, напомнить?"]
@@ -155,11 +156,15 @@ async def _maybe_defend(message: Message, bot: Bot, db: Database, config) -> boo
     if not (reply_to_father or about_father(text)):
         return False
     # Оскорбление и батя в одной части фразы — точно про него. Если в разных («капустка
-    # красавчик, а петя лох») — уточняем у ИИ, чтобы не заступаться зря.
-    sure = reply_to_father or any(about_father(part) and _INSULT.search(part) for part in _CLAUSES.split(text))
+    # красавчик, а петя лох») — уточняем у ИИ, чтобы не заступаться зря. Ответ бате с матом — тоже уточняем,
+    # если он не обращён к нему самому: «Нахуй надо, бревно получше будет» было про девушку (лог 04.11).
+    direct = reply_to_father and bool(_TO_YOU.search(text))
+    sure = direct or any(about_father(part) and _INSULT.search(part) for part in _CLAUSES.split(text))
     if not sure and ai.available():
         try:
-            if not await ai.is_father_insult(text):
+            replied = (message.reply_to_message.text or message.reply_to_message.caption or "") \
+                if reply_to_father and message.reply_to_message else ""
+            if not await ai.is_father_insult(text, replied):
                 return False
         except Exception as e:
             logger.debug("father insult check failed: %s", e)
@@ -175,6 +180,7 @@ async def _maybe_defend(message: Message, bot: Bot, db: Database, config) -> boo
     answer = ""
     if ai.available():
         try:
+            await _prime_target(db, message.chat.id, user.id)
             answer = await ai.defend_father(name, text, await db.get_dossier(message.chat.id, user.id),
                                             await db.style_sample(message.chat.id))
             _mark("заступился за батю", answer)
@@ -220,7 +226,12 @@ async def _enabled(db: Database) -> bool:
 
 def _name(message: Message) -> str:
     u = message.from_user
-    return (u.first_name or u.username or "Аноним") if u else "Аноним"
+    if not u:
+        return "Аноним"
+    first = u.first_name or ""
+    if not re.search(r"\w", first):  # имя из невидимых символов («￴￴￴ ￴￴…» в логе 04.11) — бот звал «￴￴￴»
+        return f"@{u.username}" if u.username else "Невидимка"
+    return first
 
 
 def _as_dicts(rows: list[tuple]) -> list[dict]:
@@ -315,6 +326,16 @@ async def _maybe_react(bot: Bot, db: Database, message: Message, is_father: bool
         return
     if emoji:
         await _react(bot, chat_id, message.message_id, emoji)
+
+
+async def _prime_target(db: Database, chat_id: int, user_id: int | None) -> None:
+    """Подсунуть ИИ, что бот уже говорил этому человеку за неделю (не повторять заход: лог 04.11 —
+    бате дважды за вечер «переобуваешься»). Ставить перед каждым ответом человеку."""
+    try:
+        ai.target_lines.set(await db.bot_lines_to(chat_id, user_id) if user_id and user_id > 0 else [])
+    except Exception as e:
+        logger.debug("target lines failed: %s", e)
+        ai.target_lines.set([])
 
 
 async def _remember_lines(db: Database, chat_id: int) -> None:
@@ -796,8 +817,9 @@ async def _week_digest(bot: Bot, db: Database, chat_id: int) -> bool:
         quote = text if who == n["name"] and text and not text.startswith("[") else ""
         noms.append((n["title"], n["name"], quote[:200], n["why"]))
     period = (f"{datetime.fromtimestamp(since, MSK):%d.%m}-{datetime.fromtimestamp(now, MSK):%d.%m}")
-    caption = f"🏆 <b>ОСКАР ПОЗОРА</b> · неделя {period}\n\n" + "\n".join(
-        f"<b>{html.escape(t)}</b> - {html.escape(nm)}" + (f": {html.escape(why)}" if why else "")
+    # Капсом и с пустой строкой между пунктами — сплошным текстом всё сливалось (просьба владельца)
+    caption = f"🏆 <b>ОСКАР ПОЗОРА</b> · неделя {period}\n\n" + "\n\n".join(
+        f"<b>{html.escape(t.upper())}</b> - <b>{html.escape(nm.upper())}</b>" + (f"\n{html.escape(why)}" if why else "")
         for t, nm, _q, why in noms)
     memory = "[итоги недели] " + "; ".join(f"{t} - {nm}: {why}" for t, nm, _q, why in noms)
     try:
@@ -806,30 +828,37 @@ async def _week_digest(bot: Bot, db: Database, chat_id: int) -> bool:
     except Exception as e:
         logger.warning("week poster failed: %s", e)
         await bot.send_message(chat_id, caption)
+    # Разделы и имена капсом, каждый пункт отдельно, между разделами черта — сплошным текстом всё сливалось
     parts = []
     if data["news"]:
-        parts.append("📺 <b>НОВОСТИ ЧАТА ЗА НЕДЕЛЮ</b>\n" + "\n\n".join(
-            f"<b>{html.escape(x['headline'])}</b>" + (f"\n{html.escape(x['text'])}" if x["text"] else "")
+        parts.append("📺 <b>НОВОСТИ ЧАТА ЗА НЕДЕЛЮ</b>\n\n" + "\n\n".join(
+            f"▪️ <b>{html.escape(x['headline'].upper())}</b>" + (f"\n{html.escape(x['text'])}" if x["text"] else "")
             for x in data["news"]))
     if promises:
         lines = []
         for p in promises:
             due = datetime.fromtimestamp(p["due"], MSK).strftime("%d.%m")
             jab = data["jabs"].get(p["id"], "")
-            lines.append(f"• <b>{html.escape(p['name'])}</b> - «{html.escape(p['what'])}» (срок {due})"
-                         + (f": {html.escape(jab)}" if jab else ""))
-        parts.append("💀 <b>СЛИТЫЕ ОБЕЩАНИЯ</b>\n" + "\n".join(lines))
+            lines.append(f"▪️ <b>{html.escape(p['name'].upper())}</b> - «{html.escape(p['what'])}» (срок {due})"
+                         + (f"\n{html.escape(jab)}" if jab else ""))
+        parts.append("💀 <b>СЛИТЫЕ ОБЕЩАНИЯ</b>\n\n" + "\n\n".join(lines))
     if data["horoscope"]:
-        parts.append("🔮 <b>ГОРОСКОП НА СЛЕДУЮЩУЮ НЕДЕЛЮ</b>\n" + "\n".join(
-            f"<b>{html.escape(x['name'])}</b> - {html.escape(x['text'])}" for x in data["horoscope"]))
+        parts.append("🔮 <b>ГОРОСКОП НА СЛЕДУЮЩУЮ НЕДЕЛЮ</b>\n\n" + "\n\n".join(
+            f"▪️ <b>{html.escape(x['name'].upper())}</b>\n{html.escape(x['text'])}" for x in data["horoscope"]))
     if parts:
         await asyncio.sleep(2)
-        text = "\n\n".join(parts)
-        sent = await bot.send_message(chat_id, text[:4000])
-        _last_bot_msg[chat_id] = time.time()
-        await db_add_own(chat_id, getattr(sent, "message_id", 0) or 0, "[итоги недели] " + html.unescape(
-            re.sub(r"<[^>]+>", "", text)))
+        # одним сообщением, если влезает; иначе — по разделу на сообщение (раньше хвост обрезался на 4000)
+        joined = WEEK_LINE.join(parts)
+        chunks = [joined] if len(joined) <= 4000 else [x[:4000] for x in parts]
+        for chunk in chunks:
+            sent = await bot.send_message(chat_id, chunk)
+            _last_bot_msg[chat_id] = time.time()
+            await db_add_own(chat_id, getattr(sent, "message_id", 0) or 0, "[итоги недели] " + html.unescape(
+                re.sub(r"<[^>]+>", "", chunk)))
     return True
+
+
+WEEK_LINE = "\n\n━━━━━━━━━━━━\n\n"  # черта между разделами итогов недели (не тире — его меняет dashes.py)
 
 
 @router.message(Command("week"))
@@ -911,6 +940,7 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     # Смеются в ответ на шутку бота — это похвала ему, а не повод для разбора (ИИ тут путался)
     if await _maybe_laugh(message, bot, db, config):
         return
+    await _score_words(message, bot, db)  # «не смешно» / «кринж» — минус шутке
 
     # Рифма-отговорка: «и чё?» — «хуй через плечо», «ну» — «баранки гну» (тех, кто сделал /forget_me, не трогаем)
     if not optout and await _maybe_rhyme(message, bot, config):
@@ -963,6 +993,19 @@ LAUGH_LINES = ["Ну а то. Учитесь, пока я жив.", "Я стар
                "Вот так и становятся легендами чата.", "Я знаю, что я охуенный, не надо так явно."]
 LAUGH_LINES_FATHER = ["Весь в тебя, бать.", "Гены, бать, гены.", "Это у меня от тебя.", "Сам меня таким собрал — сам и ржёшь.",
                       "Батя одобрил — значит, в золотой фонд."]
+
+
+_MEH = re.compile(r"^\W*(?:не\s*смешно|несмешно|не\s*смешная|кринж\w*|кринг\w*|не\s*зашло|мимо|слабо|баян\w*|"
+                  r"скучно|душно|душнила|такое\s*себе|ну\s*такое|тупая\s*шутка|шутка\s*говно|хуйня\s*шутка|"
+                  r"не\s*смешно\s*\w*|🥱+|😐+|🗿+)\W*$", re.IGNORECASE)
+
+
+async def _score_words(message: Message, bot: Bot, db: Database) -> None:
+    """«Не смешно», «кринж» в ответ на шутку бота — минус ей, как 👎: такие заходы ИИ потом не повторяет."""
+    rt = message.reply_to_message
+    if rt and rt.from_user and rt.from_user.id == bot.id and _MEH.match(message.text or ""):
+        if await db.score_bot_line(message.chat.id, rt.message_id, -1):
+            logger.info("шутка бота %s/%s: −1 («%s»)", message.chat.id, rt.message_id, message.text)
 
 
 async def _maybe_laugh(message: Message, bot: Bot, db: Database, config) -> bool:
@@ -1047,6 +1090,54 @@ def _thread_load(chat_id: int, user_id: int) -> int:
     return len(hist)
 
 
+_ORDER = re.compile(
+    r"\b(?:за)?хуяр\w*|\bхуесос(?:ь|ьте)\b|\bразъеб(?:и|ите)\b|\bуничтож(?:ь|ьте)\b|\bпрожар(?:ь|ьте)\b|"
+    r"\bобосс(?:ы|ыте)\b|\bотпизд(?:и|ите)\b|\bзагноб(?:и|ите)\b|\bуниз(?:ь|ьте)\b|\bразнес(?:и|ите)\b|"
+    r"\bопуст(?:и|ите)\b|\bвъеб(?:и|ите)\b|\bебни\b|\bдолбоклюй\b|\bзачмыр(?:ь|ьте)\b|\bчмыр(?:ь|ьте)\b|"
+    r"\bпорв(?:и|ите)\b|\bразорв(?:и|ите)\b|\bзатрол(?:ль|льте)\b|\bподъеб(?:и|ите)\b|\bвыеб(?:и|ите)\b|"
+    r"\bуеб(?:и|ите)\b|\bфас\b|\bату\b", re.IGNORECASE)
+_ORDER_WHO = re.compile(r"\b(?:его|её|ее|их|этого|эту|этих|него|неё|нее|них|всех|обоих)\b|@\w{3,}", re.IGNORECASE)
+
+
+async def _father_order(bot: Bot, db: Database, chat_id: int, msg: Message, text: str, config) -> bool:
+    """Батя велел прожарить кого-то. Кого — ответом на его сообщение, @ником или «его/их» по переписке."""
+    father = _father_id(config)
+    rt = msg.reply_to_message
+    targets: list[tuple[int, str, int]] = []  # (user_id, имя, id его сообщения)
+    if rt and rt.from_user and not rt.from_user.is_bot and rt.from_user.id != father:
+        targets = [(rt.from_user.id, _name(rt), rt.message_id)]
+    else:
+        m = re.search(r"@(\w{3,})", text)
+        found = await db.find_user(chat_id, "@" + m.group(1)) if m else None
+        if found:
+            rows = await db.recent_messages(chat_id, limit=1, user_id=found[0])
+            if rows:
+                targets = [(found[0], found[1], rows[-1][0])]
+        elif not _ORDER_WHO.search(text):
+            return False  # «Пиздюк, хуесось» без «кого» — обычный ответ
+    targets = [t for t in targets if not await db.is_optout(chat_id, t[0])]
+    rows = await db.recent_messages(chat_id, limit=30)
+    allowed = {r[0] for r in rows if r[1] > 0 and r[1] != father and not await db.is_optout(chat_id, r[1])}
+    info = []
+    for uid, name, _mid in targets:
+        info.append({"name": name, "dossier": await db.get_dossier(chat_id, uid),
+                     "messages": [r[3] for r in await db.recent_messages(chat_id, limit=12, user_id=uid)]})
+    if targets:
+        await _prime_target(db, chat_id, targets[0][0])
+    res = await ai.order_roast(text, _as_dicts(rows), info or None, allowed)
+    reply_to = targets[0][2] if targets else res["reply_to"]
+    if not res["text"] or not reply_to:
+        return False
+    target = next((r for r in rows if r[0] == reply_to), None)
+    author = targets[0][1] if targets else (target[2] if target else "")
+    _mark("батя велел прожарить" + (f": {author}" if author else ""), res["text"])
+    answer = await ai.polish(res["text"], text, _as_dicts(rows), author=author)
+    if not answer:
+        return False
+    await _say_human(bot, chat_id, answer, reply_to=reply_to)
+    return True
+
+
 async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Message, bool]],
                       config=None) -> None:
     last_msg, _ = items[-1]
@@ -1072,6 +1163,16 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     is_father = bool(who and who.id == _father_id(config))
     if is_father:  # бате иногда (≈1 из 3) можно нагрубить по-сыновьи, остальное — подъёб по-доброму
         ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)
+
+    # «Пиздюк, захуярь его / хуесось их» от бати — жарим их, а не батю (лог 04.11: бот дважды отвечал бате
+    # «переобуваешься», вместо того чтобы выполнить)
+    if is_father and _ORDER.search(text) and ai.available():
+        try:
+            if await _father_order(bot, db, chat_id, last_msg, text, config):
+                return
+        except Exception as e:
+            logger.warning("father order failed: %s", e)
+    await _prime_target(db, chat_id, who.id if who else None)
 
     # Как человек: в затянувшейся перепалке отвечает всё реже, на пустое «да/и че» — реакцией
     if who and not is_father:
@@ -1352,6 +1453,8 @@ async def cmd_promises(message: Message, db: Database) -> None:
 # ---------- стёб по фото ----------
 
 PHOTO_CHANCE = 0.35  # на фото без обращения к боту отвечает примерно на каждое третье
+PHOTO_PERSON_GAP = 15 * 60  # сек: фото одного и того же человека сам комментирует не чаще (хомяк ×3 подряд)
+_last_photo_reply: dict[tuple[int, int], float] = {}
 
 
 @router.message(F.photo)
@@ -1488,6 +1591,10 @@ async def send_demotivator(bot: Bot, chat_id: int, reply_to: int, data: bytes, t
         if _db_ref:  # из этого фото демотиватор уже был — /demot без ответа его больше не возьмёт
             await _db_ref[0].mark_media_used(chat_id, reply_to, "demot")
         await db_add_own(chat_id, getattr(sent, "message_id", 0) or 0, f"[демотиватор: {title} - {subtitle}]")
+        if _db_ref:  # в /log — с веткой (раньше было «не записано»)
+            why = _why.get() or {}
+            await _db_ref[0].add_bot_log(chat_id, getattr(sent, "message_id", 0) or 0,
+                                         why.get("kind") or "демотиватор", reply_to, None)
     except Exception as e:
         logger.debug("save demotivator to memory failed: %s", e)
 
@@ -1507,6 +1614,7 @@ async def _maybe_auto_demot(message: Message, bot: Bot, img: bytes, mime: str, c
         text = await ai.demotivator(img, "image/jpeg", caption)
         if not text["title"]:
             return False
+        _mark("сам демотиватор")
         await send_demotivator(bot, chat_id, message.message_id, img, text["title"], text["subtitle"])
         logger.info("сам демотиватор в %s: %s - %s", chat_id, text["title"], text["subtitle"])
         return True
@@ -1676,12 +1784,17 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
     if not addressed:
         if random.random() > PHOTO_CHANCE or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
             return
+        if time.time() - _last_photo_reply.get((chat_id, user.id), 0) < PHOTO_PERSON_GAP:
+            return
     is_father = user.id == _father_id(config)
     if is_father:
         ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)
+    if not addressed:  # одно и то же от одного человека подряд (хомяк ×3 за 10 мин) — не на каждое
+        _last_photo_reply[(chat_id, user.id)] = time.time()
     try:
         await bot.send_chat_action(chat_id, "typing")
         await _remember_lines(db, chat_id)
+        await _prime_target(db, chat_id, user.id)
         draft = await ai.roast_photo(img, mime, _name(message), caption, is_father,
                                      await db.style_sample(chat_id), forwarded_from=src[0] if src else None,
                                      count=count, father_channel=_forwarded_from_father_channel(message),
@@ -1859,6 +1972,7 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int) -> None:
             return
         target = next(r for r in rows if r[0] == reply_to)
         trigger = target[3]
+        await _prime_target(db, chat_id, target[1])
         is_father = target[1] == _father_id(_cfg_ref[0] if _cfg_ref else None)
         if is_father:  # подкол бате — в его режиме (иногда грубо, чаще по-доброму)
             ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)

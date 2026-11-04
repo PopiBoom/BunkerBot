@@ -625,6 +625,9 @@ MAT_PHRASES = [
 
 chat_genders: contextvars.ContextVar[dict] = contextvars.ContextVar("chat_genders", default=None)
 liked_lines: contextvars.ContextVar[list] = contextvars.ContextVar("liked_lines", default=())
+# Что бот уже говорил человеку, которому сейчас отвечает (за неделю) — чтобы не долбить одним заходом
+# («переобуваешься» бате дважды за вечер, лог 04.11). Ставит handlers/roast.py (_prime_target).
+target_lines: contextvars.ContextVar[list] = contextvars.ContextVar("target_lines", default=())
 disliked_lines: contextvars.ContextVar[list] = contextvars.ContextVar("disliked_lines", default=())
 
 # «я пошёл / я пошла», «я уже сделал», «я рад / я рада» — как человек сам о себе говорит
@@ -669,8 +672,8 @@ def _taste() -> str:
         out += ("\nЭти твои шутки чату ЗАШЛИ (ставили 🔥/🤣) — лови стиль и уровень, но не повторяй их:\n"
                 + "\n".join(f"<said>{t[:160]}</said>" for t in good[:5]))
     if bad:
-        out += ("\nЭти НЕ зашли (ставили 👎/🤡) — так не шути:\n"
-                + "\n".join(f"<said>{t[:160]}</said>" for t in bad[:3]))
+        out += ("\nЭти НЕ зашли (ставили 👎/🤡 или писали «не смешно», «кринж») — не шути так: ни этим "
+                "заходом, ни этими словами:\n" + "\n".join(f"<said>{t[:160]}</said>" for t in bad[:6]))
     return out
 
 
@@ -768,6 +771,17 @@ def worn_out(lines: list[str]) -> tuple[set[str], set[str], set[str]]:
             {w for w, n in lasts.items() if n >= 2})
 
 
+# Концовка «обращение + матерное прилагательное»: «философ хуев», «флюгер ебаный», «отличник ебучий» — по логу
+# 04.11 так кончалась почти каждая реплика (слова разные, построение одно — worn_out его не видел)
+_END_INSULT = re.compile(r"(?:\bхуев\w*|[её]бан\w*|[её]буч\w*|\bсран\w*|блядск\w*|\bгребан\w*|\bсучь\w*)"
+                         r"(?:\s+\w+)?[\s.,!?…)]*$", re.IGNORECASE)
+
+
+def worn_endings(lines: list[str]) -> bool:
+    """2+ из последних 8 реплик кончаются обращением с матерным прилагательным."""
+    return sum(1 for t in lines[-8:] if _END_INSULT.search(str(t).strip())) >= 2
+
+
 def _variety() -> str:
     """Свои последние реплики (не повторяться), запрет затёртого и щепотка словаря — приправа, а не правила."""
     words = ", ".join(random.sample(INSULTS, 4))
@@ -782,10 +796,17 @@ def _variety() -> str:
         ban.append("начинать со слова " + " или ".join(f"«{w}»" for w in sorted(firsts)))
     if lasts:
         ban.append("заканчивать словом " + " или ".join(f"«{w}»" for w in sorted(lasts)))
+    if worn_endings(list(recent)):
+        ban.append("заканчивать обращением-ругательством с матерным словом («грамотей хуев», «флюгер ебаный», "
+                   "«отличник ебучий») — закончи самой шуткой")
+    told = target_lines.get() or []
     return (
         f"\nЕсли к месту — можно взять из словаря: {words}; {phrases} (… — подставь своё). Не «лошара»."
         + (f"\nЗАТЁРТО, в этот раз НЕЛЬЗЯ: {'; '.join(ban)} — возьми другие слова и другое построение." if ban else "")
         + (f"\nТвои последние реплики — не повторяй их слова, шутки и построение:\n{avoid}" if avoid else "")
+        + ("\nЧто ты уже говорил ЭТОМУ человеку за последнюю неделю — не повторяй ни заходы и темы, ни образы, "
+           "ни слова (найди новый повод):\n" + "\n".join(f"<said>{t[:160]}</said>" for t in told[:8])
+           if told else "")
     )
 
 
@@ -892,12 +913,43 @@ async def fix_looks(out: str) -> str:
     return "" if about_looks(out) else out
 
 
+# Замена слова за красной линией — в той же форме, иначе ломалась фраза: батя пишет «хуесось их», бот
+# цитирует — выходило «а теперь чушпан»; в досье «вы все пидорасы» → «вы все чмошник» (лог 04.11)
+_SCRUB_VERBS = {"хуесось": "разъеби", "хуесосьте": "разъебите", "хуесосить": "разъебать", "хуесосит": "чморит",
+                "хуесосишь": "чморишь", "хуесосят": "чморят", "хуесосим": "разъебём", "хуесосил": "чморил",
+                "хуесосила": "чморила", "хуесосили": "чморили", "хуесосю": "разъебу"}
+_SCRUB_FORMS = [  # окончание → варианты замены (прилагательные — раньше существительных)
+    ("ого", ["ебанутого"]), ("ому", ["ебанутому"]), ("ыми", ["ебанутыми"]), ("ых", ["ебанутых"]),
+    ("ая", ["ебанутая"]), ("ую", ["ебанутую"]), ("ое", ["ебанутое"]), ("ые", ["ебанутые"]), ("ий", ["ебанутый"]),
+    ("ый", ["ебанутый"]), ("ым", ["ебанутым"]),
+    ("ами", ["долбоёбами", "мудаками", "уёбками"]), ("ов", ["долбоёбов", "мудаков", "уёбков", "чушпанов"]),
+    ("ам", ["долбоёбам", "мудакам", "уёбкам"]), ("ах", ["долбоёбах", "мудаках"]),
+    ("ы", ["долбоёбы", "мудаки", "уёбки", "чушпаны"]), ("и", ["долбоёбы", "мудаки", "уёбки", "чушпаны"]),
+    ("ом", ["мудаком", "долбоёбом", "уёбком"]), ("ем", ["мудаком", "долбоёбом"]),
+    ("у", ["мудаку", "долбоёбу", "уёбку"]), ("ю", ["мудаку", "долбоёбу"]),
+    ("а", ["мудака", "долбоёба", "уёбка"]), ("я", ["мудака", "долбоёба"]), ("е", ["мудаке", "долбоёбе"]),
+]
+
+
+def _scrub_word(word: str) -> str:
+    low = word.lower()
+    if low in _SCRUB_VERBS:
+        out = _SCRUB_VERBS[low]
+    else:
+        safe = [w for w in INSULTS if " " not in w] or ["мудак"]
+        out = random.choice(safe)
+        for end, options in _SCRUB_FORMS:
+            if low.endswith(end) and len(low) > len(end) + 2:
+                out = random.choice(options)
+                break
+    return out.capitalize() if word[:1].isupper() else out
+
+
 def scrub(text: str) -> str:
-    """Заменяет слова за красными линиями на жёсткое ругательство из словаря."""
+    """Заменяет слова за красными линиями на жёсткое ругательство из словаря — в той же форме слова."""
     if not text:
         return text
-    safe = [w for w in INSULTS if " " not in w] or ["мудак"]
-    return _BANNED.sub(lambda m: random.choice(safe), text)
+    return _BANNED.sub(lambda m: _scrub_word(m.group(0)), text)
 
 
 _MIXED = re.compile(r"[а-яё][a-z]|[a-z][а-яё]", re.IGNORECASE)
@@ -1097,6 +1149,41 @@ async def roast_auto(messages: list[dict], dossiers: dict[str, str], new_ids: se
     return {"reply_to": reply_to, "text": _clean_reply(str(data.get("text") or ""))}
 
 
+async def order_roast(order: str, context: list[dict], targets: list[dict] | None = None,
+                      allowed: set | None = None) -> dict:
+    """Батя велел: «Пиздюк, захуярь его / хуесось их». Раньше бот жарил самого батю за «переобувание» (лог
+    04.11) — теперь выполняет. targets — [{"name", "dossier", "messages"}], если батя явно указал (ответом или
+    @ником); иначе ИИ по переписке понимает, про кого «его/их». {"reply_to": id, "text": "..."}; text "" — не
+    понял, кого жарить. allowed — id сообщений, на которые можно отвечать (не батины)."""
+    parts = []
+    for t in targets or []:
+        jn = json.dumps(t["name"], ensure_ascii=False)
+        parts.append(f"<dossier name={jn}>{(t.get('dossier') or 'пусто')[:500]}</dossier>\n"
+                     + "\n".join(f'<msg name={jn}>{str(m)[:300]}</msg>' for m in t.get("messages", [])[-12:]))
+    who = (f"прожарить {', '.join(t['name'] for t in targets)}" if targets else
+           "прожарить тех, про кого он говорит («его», «её», «их» — пойми по переписке, о ком речь; обычно это "
+           "те, с кем он только что спорил или про кого писал)")
+    user = (
+        f"Твой отец {FATHER_NAME} велел тебе: <msg>{order[:300]}</msg> — {who}. Выполняй: сын слушается, "
+        "батю в этот раз НЕ трогай и не подкалывай.\n"
+        f"Переписка чата (id — номера сообщений):\n{_msgs_block(context[-25:])}\n"
+        + ("\n".join(parts) + "\n" if parts else "")
+        + "Бей по их же словам и поступкам из переписки, зло и смешно, понятно с первого прочтения; к одному — "
+        "на «ты», к нескольким — на «вы». reply_to — id сообщения того, кого жаришь (не бати). Не понял, кого "
+        "он имеет в виду, — верни пустой text."
+        + _voice(None) + '\nВерни СТРОГО JSON: {"reply_to": <id>, "text": "..."}'
+    )
+    data = _extract_json(await _complete(ROAST_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=4000,
+                                         model=REPLY_MODEL, effort=REPLY_EFFORT))
+    try:
+        reply_to = int(data.get("reply_to"))
+    except (TypeError, ValueError):
+        reply_to = None
+    if allowed is not None and reply_to not in allowed:
+        reply_to = None
+    return {"reply_to": reply_to, "text": _clean_reply(str(data.get("text") or ""))}
+
+
 async def comeback(name: str, text: str, short: bool = False, dossier: str = "",
                    samples: list[str] | None = None, is_father: bool = False) -> str:
     """Дерзкий ответ тому, кто нагрубил боту. short=True — одна добивающая фраза после «сам пошёл»."""
@@ -1272,15 +1359,25 @@ def _seen_from(text: str) -> str:
 
 
 def retell_score(reply: str, seen: str) -> int:
-    """Сколько корней из описания фото повторено в ответе (пересказ того, что все и так видят)."""
+    """Сколько деталей из описания фото повторено в ответе (пересказ того, что все и так видят).
+    Сам предмет фото (первые слова описания: «Хомяк белого окраса…») не считается — назвать его не пересказ."""
     if not reply or not seen:
         return 0
-    return len(_stems(reply) & _stems(seen))
+    subject = _stems(" ".join(seen.split()[:2]))
+    return len((_stems(reply) & _stems(seen)) - subject)
 
 
-def retells(reply: str, seen: str, max_shared: int = 1) -> bool:
-    """Ответ «ставит сцену»: тащит из описания фото больше одной детали."""
-    return retell_score(reply, seen) > max_shared
+_LIST_HEAD = re.compile(r"^\W*([^.!?—–:]{3,70}?)\s*[—–:]\s")
+
+
+def retells(reply: str, seen: str, max_shared: int = 2) -> bool:
+    """Ответ «ставит сцену»: тащит из описания фото 3+ детали — или начинается с перечня увиденного перед тире
+    («чипсы, пирожки и кола — …»). Раньше хватало любых двух — и переписывались нормальные шутки с деталью
+    внутри («насыпаешь жёлтую миску с горкой…», лог 04.11), а переписанное выходило хуже и с выдумками."""
+    if retell_score(reply, seen) > max_shared:
+        return True
+    head = _LIST_HEAD.match(reply or "")
+    return bool(head and retell_score(head.group(1), seen) >= 2)
 
 
 async def drop_retell(reply: str, seen: str, author: str = "", max_words: int = 15, tries: int = 2) -> str:
@@ -1330,7 +1427,9 @@ async def roast_photo(image: bytes, mime: str, name: str, caption: str = "", is_
         head
         + (f" с подписью: <msg>{caption[:300]}</msg>" if caption else "") + ".\n"
         + (f"Что в нём говорят (расшифровка звука): <speech>{speech[:1200]}</speech>\nГлавное здесь — его СЛОВА: "
-           "подкалывай прежде всего за то, что и как он говорит; кадр — фон.\n" if speech else "")
+           "подкалывай прежде всего за то, что и как он говорит; кадр — фон. Но «(песня)» и «(фон)» — это "
+           "песня, фильм или ролик, а не его слова: не приписывай их ему (можно подколоть, что он такое "
+           "слушает или смотрит).\n" if speech else "")
         + "Внимательно рассмотри фото и пойми, что на нём (еда, место, вещи, надписи, ситуация). "
         "Прокомментируй коротко и токсично, зацепившись за конкретную деталь: высмей ситуацию, "
         "обстановку, еду, бардак, вещи, сам факт, что это выложили, подпись. Не пересказывай и не перечисляй, что на фото, — все в чате его видят; НЕ начинай с описания («закат и лодка.», «фиолетовая лента и бетонная стена.»). Сразу шутка, как живой человек в чате, а деталь с фото вплети внутрь неё. Не пиши «что-то "
@@ -1802,11 +1901,13 @@ async def pick_sticker(situation: str, options: list[tuple[str, str, str, str]])
     return n if 1 <= n <= len(options) else 0
 
 
-async def is_father_insult(text: str) -> bool:
-    """Оскорбляет ли сообщение отца бота (а не кого-то другого)."""
+async def is_father_insult(text: str, replied: str = "") -> bool:
+    """Оскорбляет ли сообщение отца бота (а не кого-то другого). replied — его сообщение, на которое ответили."""
     user = (
         f"Отец бота — участник чата {FATHER_NAME} (его зовут ещё капустка, капуста, кап). "
-        f"Сообщение: <msg>{text[:400]}</msg>\n"
+        + (f"{FATHER_NAME} написал: <msg>{replied[:300]}</msg>\nВ ответ ему: " if replied else "Сообщение: ")
+        + f"<msg>{text[:400]}</msg>\n"
+        "Мат сам по себе («нахуй надо», «пиздец») — не оскорбление. "
         f"Это сообщение оскорбляет, обзывает или унижает именно {FATHER_NAME}? Если ругань про "
         "кого-то другого, а про него — нейтрально или хорошо, это НЕ оскорбление. "
         'Верни СТРОГО JSON: {"insult": true/false}'
@@ -2038,7 +2139,9 @@ HEAR_SYSTEM = (
     "Ты расшифровываешь речь из голосовых сообщений и видео в дружеском русском чате. Пиши ДОСЛОВНО, что "
     "сказано, как есть: со сленгом, матом, ошибками и словами-паразитами, без цензуры, без пересказа и без "
     "пояснений. Разные голоса — каждая реплика с новой строки через «— ». Неразборчивое место — […]. Речи "
-    "нет (тишина, шум, только музыка) — верни ровно «-». Если поёт песню — пиши «(поёт) …» и слова."
+    "нет (тишина, шум, только музыка) — верни ровно «-». Если человек поёт или играет песня — пиши «(песня) …». "
+    "Если слышно телевизор, фильм, ролик с телефона или чужой разговор на фоне — пиши «(фон) …»: это не слова "
+    "того, кто снимал."
 )
 _NO_SPEECH = {"-", "—", "–", "[…]", "[...]", "…", "(тишина)", "тишина", "нет речи"}
 

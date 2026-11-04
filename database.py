@@ -370,6 +370,18 @@ class Database:
             await db.commit()
             return True
 
+    async def bot_lines_to(self, chat_id: int, user_id: int, days: int = 7, limit: int = 8) -> list[str]:
+        """Что бот говорил этому человеку (ответами на его сообщения) за последние дни, новые первыми."""
+        since = int(time.time()) - days * 86400
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT m.text FROM bot_log b "
+                "JOIN chat_messages t ON t.chat_id = b.chat_id AND t.msg_id = b.reply_to "
+                "JOIN chat_messages m ON m.chat_id = b.chat_id AND m.msg_id = b.bot_msg_id AND m.user_id = 0 "
+                "WHERE b.chat_id = ? AND t.user_id = ? AND b.ts >= ? AND b.bot_msg_id > 0 "
+                "ORDER BY b.ts DESC LIMIT ?", (chat_id, user_id, since, limit))
+            return [r[0] for r in await cur.fetchall()]
+
     async def scored_lines(self, chat_id: int, good: bool, limit: int = 5) -> list[str]:
         """Шутки бота, которые чату зашли (good) или не зашли — за последние 60 дней."""
         since = int(time.time()) - 60 * 86400

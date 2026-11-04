@@ -281,6 +281,7 @@ async def cmd_demot(message: Message, command: CommandObject, bot: Bot, db: Data
     if not R._db_ref:
         R._db_ref.append(db)
     try:
+        R._mark("демотиватор /demot")
         await R.send_demotivator(bot, chat_id, target, data, text["title"], text["subtitle"])
     except Exception as e:
         logger.warning("demot failed: %s", e)
