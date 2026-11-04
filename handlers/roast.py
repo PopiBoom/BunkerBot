@@ -772,12 +772,14 @@ async def cmd_roast(message: Message, command: CommandObject, bot: Bot, db: Data
                reply_to=rt.message_id if rt and rt.from_user and rt.from_user.id == target_id else None)
 
 
-async def _send_card(bot: Bot, chat_id: int, png: bytes, caption: str, memory: str) -> None:
-    """Картинка в чат (подпись — HTML, уже экранированная) + запись в память бота, что он это сказал."""
+async def _send_card(bot: Bot, chat_id: int, png: bytes, caption: str, memory: str, kind: str = "картинка") -> None:
+    """Картинка в чат (подпись — HTML, уже экранированная) + запись в память бота, что он это сказал, и в /log."""
     sent = await bot.send_photo(chat_id, BufferedInputFile(png, filename="card.png"), caption=caption[:1024])
     _last_bot_msg[chat_id] = time.time()
     try:
         await db_add_own(chat_id, getattr(sent, "message_id", 0) or 0, memory)
+        if _db_ref:
+            await _db_ref[0].add_bot_log(chat_id, getattr(sent, "message_id", 0) or 0, kind, None, None)
     except Exception as e:
         logger.debug("save own card failed: %s", e)
 
@@ -824,7 +826,7 @@ async def _week_digest(bot: Bot, db: Database, chat_id: int) -> bool:
     memory = "[итоги недели] " + "; ".join(f"{t} - {nm}: {why}" for t, nm, _q, why in noms)
     try:
         png = await asyncio.to_thread(cards.render_week_poster, period, [(t, nm, q) for t, nm, q, _w in noms])
-        await _send_card(bot, chat_id, png, caption, memory)
+        await _send_card(bot, chat_id, png, caption, memory, "итоги недели (Оскар позора)")
     except Exception as e:
         logger.warning("week poster failed: %s", e)
         await bot.send_message(chat_id, caption)
@@ -855,6 +857,7 @@ async def _week_digest(bot: Bot, db: Database, chat_id: int) -> bool:
             _last_bot_msg[chat_id] = time.time()
             await db_add_own(chat_id, getattr(sent, "message_id", 0) or 0, "[итоги недели] " + html.unescape(
                 re.sub(r"<[^>]+>", "", chunk)))
+            await db.add_bot_log(chat_id, getattr(sent, "message_id", 0) or 0, "итоги недели", None, None)
     return True
 
 
@@ -1096,44 +1099,87 @@ _ORDER = re.compile(
     r"\bопуст(?:и|ите)\b|\bвъеб(?:и|ите)\b|\bебни\b|\bдолбоклюй\b|\bзачмыр(?:ь|ьте)\b|\bчмыр(?:ь|ьте)\b|"
     r"\bпорв(?:и|ите)\b|\bразорв(?:и|ите)\b|\bзатрол(?:ль|льте)\b|\bподъеб(?:и|ите)\b|\bвыеб(?:и|ите)\b|"
     r"\bуеб(?:и|ите)\b|\bфас\b|\bату\b", re.IGNORECASE)
-_ORDER_WHO = re.compile(r"\b(?:его|её|ее|их|этого|эту|этих|него|неё|нее|них|всех|обоих)\b|@\w{3,}", re.IGNORECASE)
+# «Пиздюк, ответь ей / скажи ему / напиши @нику» — не прожарка, а «ответь этому человеку» (лог 04.11: бот на
+# «ответь ей» подколол батю, а должен был ответить ей — ответом на ЕЁ сообщение)
+_ANSWER = re.compile(r"\b(?:ответь|отвечай|ответьте|скажи|скажите|напиши|напишите|поздоровайся|поприветствуй|"
+                     r"объясни|поясни|расскажи|спроси|поддержи|похвали)\b", re.IGNORECASE)
+_ORDER_WHO = re.compile(r"\b(?:его|её|ее|их|этого|эту|этих|него|неё|нее|них|всех|обоих|ей|ему|им|ней|нему|ним|"
+                        r"этой|этому|этим)\b|@\w{3,}", re.IGNORECASE)
+
+
+def _mentions(msg: Message) -> tuple[list[tuple[int, str]], list[str]]:
+    """Кого отметили в сообщении: ([(user_id, как отмечен)] — отметки без ника, @ники)."""
+    ids, nicks = [], []
+    text = msg.text or msg.caption or ""
+    for e in msg.entities or msg.caption_entities or []:
+        if e.type == "text_mention" and e.user and not e.user.is_bot:
+            ids.append((e.user.id, text[e.offset:e.offset + e.length] or e.user.first_name or ""))
+        elif e.type == "mention":
+            nicks.append(text[e.offset:e.offset + e.length].lstrip("@"))
+    nicks += [n for n in re.findall(r"@(\w{3,})", text) if n not in nicks]
+    return ids, nicks
 
 
 async def _father_order(bot: Bot, db: Database, chat_id: int, msg: Message, text: str, config) -> bool:
-    """Батя велел прожарить кого-то. Кого — ответом на его сообщение, @ником или «его/их» по переписке."""
+    """Батя велел прожарить кого-то или ответить кому-то. Кого — ответом на его сообщение, отметкой (@ник,
+    в этом или в его сообщении минутой раньше) или «его/её/им» по переписке. Отвечаем на сообщение ЭТОГО
+    человека; отмечен, но ещё ничего не писал — отмечаем его в ответе."""
     father = _father_id(config)
+    mode = "roast" if _ORDER.search(text) else "answer"
+    me = await bot.me()
     rt = msg.reply_to_message
-    targets: list[tuple[int, str, int]] = []  # (user_id, имя, id его сообщения)
+    targets: list[tuple[int, str, int | None]] = []  # (user_id, имя, id его сообщения)
+    tag = ""  # отмечен @ником, но в чате не писал — обратимся к нему в тексте
     if rt and rt.from_user and not rt.from_user.is_bot and rt.from_user.id != father:
         targets = [(rt.from_user.id, _name(rt), rt.message_id)]
     else:
-        m = re.search(r"@(\w{3,})", text)
-        found = await db.find_user(chat_id, "@" + m.group(1)) if m else None
-        if found:
-            rows = await db.recent_messages(chat_id, limit=1, user_id=found[0])
-            if rows:
-                targets = [(found[0], found[1], rows[-1][0])]
-        elif not _ORDER_WHO.search(text):
-            return False  # «Пиздюк, хуесось» без «кого» — обычный ответ
+        ids, nicks = _mentions(msg)
+        pronoun = bool(_ORDER_WHO.search(re.sub(r"@\w+", "", text)))  # «ей/ему/их», а не «мне»
+        if not ids and not nicks and pronoun:  # «@ник» отдельным сообщением, потом «Пиздюк, ответь ей»
+            for r in reversed(await db.recent_messages(chat_id, limit=4, user_id=father,
+                                                       since=int(time.time()) - 180)):
+                nicks = re.findall(r"@(\w{3,})", str(r[3]))
+                if nicks:
+                    break
+        nicks = [n for n in nicks if n.lower() != (me.username or "").lower()]
+        for uid, shown in ids:
+            rows = await db.recent_messages(chat_id, limit=1, user_id=uid)
+            targets.append((uid, rows[-1][2] if rows else shown, rows[-1][0] if rows else None))
+        for nick in nicks:
+            found = await db.find_user(chat_id, "@" + nick)
+            if found:
+                rows = await db.recent_messages(chat_id, limit=1, user_id=found[0])
+                targets.append((found[0], found[1], rows[-1][0] if rows else None))
+            elif not targets:
+                tag = "@" + nick
+        if not targets and not tag and not pronoun:
+            return False  # «Пиздюк, хуесось» / «Пиздюк, ответь мне» без «кого» — обычный ответ
     targets = [t for t in targets if not await db.is_optout(chat_id, t[0])]
     rows = await db.recent_messages(chat_id, limit=30)
     allowed = {r[0] for r in rows if r[1] > 0 and r[1] != father and not await db.is_optout(chat_id, r[1])}
     info = []
     for uid, name, _mid in targets:
-        info.append({"name": name, "dossier": await db.get_dossier(chat_id, uid),
+        info.append({"name": name or "тот, кого отметил батя", "dossier": await db.get_dossier(chat_id, uid),
                      "messages": [r[3] for r in await db.recent_messages(chat_id, limit=12, user_id=uid)]})
+    if tag:
+        info.append({"name": tag, "dossier": "", "messages": []})
     if targets:
         await _prime_target(db, chat_id, targets[0][0])
-    res = await ai.order_roast(text, _as_dicts(rows), info or None, allowed)
-    reply_to = targets[0][2] if targets else res["reply_to"]
-    if not res["text"] or not reply_to:
+    res = await ai.order_roast(text, _as_dicts(rows), info or None, allowed, mode=mode)
+    reply_to = targets[0][2] if targets else (None if tag else res["reply_to"])
+    if not res["text"] or not (reply_to or tag or targets):
         return False
     target = next((r for r in rows if r[0] == reply_to), None)
-    author = targets[0][1] if targets else (target[2] if target else "")
-    _mark("батя велел прожарить" + (f": {author}" if author else ""), res["text"])
+    author = targets[0][1] if targets else (target[2] if target else tag)
+    _mark(("батя велел прожарить" if mode == "roast" else "батя велел ответить") + (f": {author}" if author else ""),
+          res["text"])
     answer = await ai.polish(res["text"], text, _as_dicts(rows), author=author)
     if not answer:
         return False
+    if not reply_to:  # человек ещё ничего не писал — не отвечаем бате, а обращаемся к тому, кому ответ
+        nick = tag or next((f"@{n}" for n in _mentions(msg)[1]), "") or (targets[0][1] if targets else "")
+        if nick and nick.lower() not in answer.lower():
+            answer = f"{nick}, {answer}"
     await _say_human(bot, chat_id, answer, reply_to=reply_to)
     return True
 
@@ -1166,7 +1212,7 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
 
     # «Пиздюк, захуярь его / хуесось их» от бати — жарим их, а не батю (лог 04.11: бот дважды отвечал бате
     # «переобуваешься», вместо того чтобы выполнить)
-    if is_father and _ORDER.search(text) and ai.available():
+    if is_father and (_ORDER.search(text) or _ANSWER.search(text)) and ai.available():
         try:
             if await _father_order(bot, db, chat_id, last_msg, text, config):
                 return
@@ -1866,7 +1912,7 @@ async def _clown_of_day(bot: Bot, db: Database, chat_id: int) -> bool:
     try:
         png = await asyncio.to_thread(cards.render_clown_day, label, quote[:300], total, result["nickname"],
                                       datetime.now(MSK).strftime("%d.%m.%Y"))
-        await _send_card(bot, chat_id, png, caption, f"[клоун дня] {label}: {result['reason']}")
+        await _send_card(bot, chat_id, png, caption, f"[клоун дня] {label}: {result['reason']}", "клоун дня")
     except Exception as e:
         logger.warning("clown card failed: %s", e)
         await _say(bot, chat_id, f"🤡 КЛОУН ДНЯ - {label}\n\n{result['reason']}\n\n"
