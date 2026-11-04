@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import contextvars
 import html
+import json
 import logging
 import os
 import random
@@ -328,14 +329,41 @@ async def _maybe_react(bot: Bot, db: Database, message: Message, is_father: bool
         await _react(bot, chat_id, message.message_id, emoji)
 
 
+GRUDGE_HOURS = 24  # сколько бот помнит наезд на себя и жёстче с этим человеком
+
+
 async def _prime_target(db: Database, chat_id: int, user_id: int | None) -> None:
-    """Подсунуть ИИ, что бот уже говорил этому человеку за неделю (не повторять заход: лог 04.11 —
-    бате дважды за вечер «переобуваешься»). Ставить перед каждым ответом человеку."""
+    """Подсунуть ИИ про человека, которому сейчас отвечаем: что бот ему уже говорил за неделю (не повторять
+    заход: лог 04.11 — бате дважды за вечер «переобуваешься»), его наезд на бота за сутки (злопамятность),
+    какой это раунд перепалки и его старые слова за неделю (ловушка лицемерия). Ставить перед ответом человеку."""
+    ai.target_lines.set([])
+    ai.target_extra.set({})
+    if not user_id or user_id <= 0:
+        return
     try:
-        ai.target_lines.set(await db.bot_lines_to(chat_id, user_id) if user_id and user_id > 0 else [])
+        ai.target_lines.set(await db.bot_lines_to(chat_id, user_id))
+        extra: dict = {"round": _thread_load(chat_id, user_id) + 1}
+        raw = await db.get_setting(f"grudge:{chat_id}:{user_id}", "")
+        if raw:
+            g = json.loads(raw)
+            if time.time() - float(g.get("ts", 0)) < GRUDGE_HOURS * 3600:
+                extra["grudge"] = str(g.get("text", ""))
+        rows = await db.recent_messages(chat_id, limit=80, user_id=user_id, since=int(time.time()) - 7 * 86400)
+        old = [r for r in rows[:-15] if not str(r[3]).startswith("[") and len(str(r[3]).split()) >= 4]
+        if old:
+            step = max(1, len(old) // 12)
+            extra["history"] = [f"{datetime.fromtimestamp(r[4], MSK):%d.%m}: {r[3]}" for r in old[::step][-12:]]
+        ai.target_extra.set(extra)
     except Exception as e:
-        logger.debug("target lines failed: %s", e)
-        ai.target_lines.set([])
+        logger.debug("prime target failed: %s", e)
+
+
+async def _remember_grudge(db: Database, chat_id: int, user_id: int, text: str) -> None:
+    try:
+        await db.set_setting(f"grudge:{chat_id}:{user_id}", json.dumps({"ts": time.time(), "text": text[:200]},
+                                                                      ensure_ascii=False))
+    except Exception as e:
+        logger.debug("grudge save failed: %s", e)
 
 
 async def _remember_lines(db: Database, chat_id: int) -> None:
@@ -351,7 +379,11 @@ async def _remember_lines(db: Database, chat_id: int) -> None:
             genders[name] = g
     ai.chat_genders.set(genders)
     ai.liked_lines.set(await db.scored_lines(chat_id, True))
-    ai.disliked_lines.set(await db.scored_lines(chat_id, False))
+    ai.disliked_lines.set(await db.scored_lines(chat_id, False, limit=6))
+    try:  # внутренние мемы чата — собираются раз в сутки (_refresh_memes)
+        ai.chat_memes_var.set(json.loads(await db.get_setting(f"chat_memes:{chat_id}", "") or "{}").get("items") or [])
+    except (ValueError, AttributeError):
+        ai.chat_memes_var.set([])
 
 
 _gender_ready: set[int] = set()
@@ -1062,6 +1094,10 @@ async def _maybe_rhyme(message: Message, bot: Bot, config) -> bool:
 
 
 _thread: dict[tuple[int, int], list[float]] = {}  # когда бот отвечал этому человеку
+SPAR_MAX = 6          # раундов перепалки, в которых бот отвечает всегда (дальше — через раз)
+FINISH_AFTER = (5 * 60, 15 * 60)  # сек: замолчал после перепалки — в этом окне бот может добить «слился»
+FINISH_CHANCE = 0.4
+_spar: dict[tuple[int, int], dict] = {}  # перепалка с человеком: раунды, последняя ответка бота
 THREAD_WINDOW = 180                                # перепалка — ответы за последние 3 минуты
 _EMPTY = re.compile(r"^\W*(да|нет|ага|угу|и\s*ч[её]|ч[её]|ну\s*и\s*\w+|знаю|ок|окей|пофиг|похуй|ладно|"
                     r"мм+|хм+|ха(ха)*|ахах\w*|лол|кек|\+|\)+|не\s*буду|буду|пойду|делай|сам\s*такой|"
@@ -1220,11 +1256,16 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
             logger.warning("father order failed: %s", e)
     await _prime_target(db, chat_id, who.id if who else None)
 
-    # Как человек: в затянувшейся перепалке отвечает всё реже, на пустое «да/и че» — реакцией
+    # Перепалка: огрызается ему — бот отвечает каждый раз (до SPAR_MAX раундов), по нарастающей, последнее слово
+    # за ботом (просьба владельца). На пустое «да/и че» и в чужой болтовне — как человек, всё реже.
     if who and not is_father:
         n = _thread_load(chat_id, who.id)
         empty = bool(_EMPTY.match(last_msg.text or ""))
-        chance = 1.0 if n < 2 else {2: 0.5, 3: 0.3}.get(n, 0.15)
+        to_bot = bool(rt and rt.from_user and rt.from_user.id == bot.id)
+        if to_bot and not empty:
+            chance = 1.0 if n < SPAR_MAX else 0.5
+        else:
+            chance = 1.0 if n < 2 else {2: 0.5, 3: 0.3}.get(n, 0.15)
         if empty and n >= 1:
             chance = min(chance, 0.3)
         if random.random() > chance:
@@ -1233,6 +1274,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
                              "🖕" if rude else random.choice(COOL_REACTIONS), force=True)
             return
     dossier = await db.get_dossier(chat_id, who.id) if who else ""
+    if rude and who and not is_father:  # наехал на бота — сутки бот с ним жёстче и может припомнить
+        await _remember_grudge(db, chat_id, who.id, last_msg.text or text)
 
     if rude and _SEND_OFF.search(text):
         # Посылают — отвечаем зеркально, в лоб, а ИИ добавляет короткий подкол
@@ -1285,6 +1328,10 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
         await _say_human(bot, chat_id, answer, reply_to=last_msg.message_id)
         if who:
             _thread.setdefault((chat_id, who.id), []).append(time.time())
+            if not is_father:  # перепалка: замолчит после 2+ раундов — бот может добить «слился»
+                sp = _spar.setdefault((chat_id, who.id), {"rounds": 0})
+                sp.update(rounds=sp["rounds"] + 1, ts=time.time(), name=name, their=last_msg.text or "",
+                          reply_to=last_msg.message_id, bot=answer, done=False)
         if random.random() < STICKER_AFTER:
             await asyncio.sleep(random.uniform(1.0, 2.5))
             await _send_sticker(bot, db, chat_id, f"{text}\nОтвет бота: {answer}")
@@ -2037,6 +2084,61 @@ DOSSIER_VERSION_KEY = "dossier_version"
 DOSSIER_VERSION = "3"  # 2 — Sonnet, факты с датами и цитатами; 3 — без категорий, мелочи, толкований и пометок
 
 
+async def _finish_spars(bot: Bot, db: Database) -> None:
+    """Кто слился из перепалки (2+ раунда, потом 5-15 мин тишины) — иногда добиваем «слился»."""
+    now = time.time()
+    for (chat_id, uid), sp in list(_spar.items()):
+        age = now - sp.get("ts", 0)
+        if age > FINISH_AFTER[1] * 2:
+            _spar.pop((chat_id, uid), None)
+            continue
+        if sp.get("done") or sp.get("rounds", 0) < 2 or not (FINISH_AFTER[0] <= age <= FINISH_AFTER[1]):
+            continue
+        sp["done"] = True
+        if (random.random() >= FINISH_CHANCE or _bunker_active(chat_id) or chat_id in _pending
+                or now - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING):
+            continue
+        rows = await db.recent_messages(chat_id, limit=1, user_id=uid, since=int(sp["ts"]) + 1)
+        if rows:  # писал после ответки — значит, не слился
+            continue
+        try:
+            await _remember_lines(db, chat_id)
+            await _prime_target(db, chat_id, uid)
+            text = await ai.finisher(sp.get("name", ""), sp.get("bot", ""), sp.get("their", ""))
+            _mark("добил: слился из перепалки", text)
+            text = await ai.polish(text, sp.get("their", ""), author=sp.get("name", ""))
+            if text:
+                await _say_human(bot, chat_id, text, reply_to=sp.get("reply_to"))
+        except Exception as e:
+            logger.warning("finisher failed: %s", e)
+
+
+MEMES_EVERY = 24 * 3600
+
+
+async def _refresh_memes(db: Database) -> None:
+    """Раз в сутки — внутренние мемы чата за неделю (бабуня-страшуня, Фантик…): бот вставляет их к месту."""
+    for chat_id in await db.active_chats(int(time.time()) - 86400):
+        key = f"chat_memes:{chat_id}"
+        try:
+            cur = json.loads(await db.get_setting(key, "") or "{}")
+        except ValueError:
+            cur = {}
+        if time.time() - float(cur.get("ts", 0)) < MEMES_EVERY or _bunker_active(chat_id):
+            continue
+        rows = await db.recent_messages(chat_id, limit=600, since=int(time.time()) - 7 * 86400)
+        rows = [r for r in rows if r[1] > 0 and len(str(r[3])) > 3]
+        if len(rows) < 30:
+            continue
+        try:
+            items = await ai.chat_memes(_as_dicts(rows))
+        except Exception as e:
+            logger.warning("chat memes failed in %s: %s", chat_id, e)
+            continue
+        await db.set_setting(key, json.dumps({"ts": time.time(), "items": items}, ensure_ascii=False))
+        logger.info("мемы чата %s: %s", chat_id, [m["meme"] for m in items])
+
+
 async def _heavy(bot: Bot, db: Database) -> None:
     """Раз в 10 минут: чистка старого, досье, итоги недели."""
     await db.purge_old_messages(int(time.time()) - KEEP_DAYS * 86400)
@@ -2054,6 +2156,11 @@ async def _heavy(bot: Bot, db: Database) -> None:
                 await db.set_dossier(chat_id, user_id, name or "Аноним", text)
         except Exception as e:
             logger.warning("dossier update failed: %s", e)
+
+    try:
+        await _refresh_memes(db)
+    except Exception as e:
+        logger.warning("memes refresh failed: %s", e)
 
     now_msk = datetime.now(MSK)
     if now_msk.hour >= CLOWN_HOUR:  # клоун дня — раз в сутки, после 21:00 МСК
@@ -2104,6 +2211,10 @@ async def background(bot: Bot, db: Database) -> None:
                     await _remind_promises(bot, db)
                 except Exception as e:
                     logger.warning("promise reminders failed: %s", e)
+                try:  # слился из перепалки — иногда добиваем (отдельной задачей: контекст не утекает)
+                    await asyncio.create_task(_finish_spars(bot, db))
+                except Exception as e:
+                    logger.warning("finish spars failed: %s", e)
                 # Посты бота в канал (пока тестовый режим из /admin)
                 try:
                     from handlers import channel_posts
