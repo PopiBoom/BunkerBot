@@ -33,10 +33,11 @@ EDIT_MODEL = os.getenv("AI_MODEL_EDIT", "claude-sonnet-5-5").strip() or "claude-
 # Кто пишет ответы людям в чате. Было: черновик Sonnet + второй Sonnet-«редактор» — он выравнивал всё под
 # один шаблон и искажал смысл (жалоба владельца). Теперь один проход Opus, а после — только программные
 # фильтры (polish). Обдумывание low: на тех же сообщениях ≈ как medium по качеству, ≈$0.016 и ~6 сек за ответ
-# (medium ≈$0.019 и ~7 сек; было Sonnet+редактор ≈$0.013). AI_REPLY_EFFORT=medium в .env — включить поглубже.
+# (medium ≈$0.019 и ~7 сек; было Sonnet+редактор ≈$0.013). AI_REPLY_EFFORT=low в .env — быстрее и дешевле.
 # Haiku остаётся на служебном: описать фото/стикер, реакция, обещание.
 REPLY_MODEL = os.getenv("AI_MODEL_REPLY", "").strip() or MODEL
-REPLY_EFFORT = os.getenv("AI_REPLY_EFFORT", "").strip() or "low"
+# medium: в слепом сравнении владельца на его логе (04.11) — 3:2 против low (≈ +$0.004 и +2 сек на ответ)
+REPLY_EFFORT = os.getenv("AI_REPLY_EFFORT", "").strip() or "medium"
 
 # Цены, $ за 1M токенов (вход, выход). Для учёта расходов — примерно, без налогов.
 PRICES = {
@@ -2164,6 +2165,7 @@ async def transcribe(wav: bytes) -> str:
 
 
 VOICE_MODEL = os.getenv("AI_MODEL_VOICE", "").strip() or REPLY_MODEL  # в войсе важна скорость: можно Sonnet
+VOICE_EFFORT = os.getenv("AI_VOICE_EFFORT", "").strip() or "low"  # в войсе каждая секунда на счету
 
 
 async def voice_reply(lines: list[tuple[str, str]], name: str, text: str, addressed: bool, dossier: str = "",
@@ -2182,7 +2184,7 @@ async def voice_reply(lines: list[tuple[str, str]], name: str, text: str, addres
         "распознано с ошибкой — не цепляйся к нему."
         + _father_note(is_father) + _variety() + _gender_note() + _JSON_REPLY
     )
-    return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=3000, model=VOICE_MODEL, effort=REPLY_EFFORT))
+    return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=3000, model=VOICE_MODEL, effort=VOICE_EFFORT))
 
 
 BOT_SELF_NAME = "🤖 ты (бот)"  # так свои реплики подписаны в контексте (как roast.BOT_SELF)
