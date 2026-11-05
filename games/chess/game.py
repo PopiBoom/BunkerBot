@@ -27,7 +27,10 @@ from aiogram.filters import Command
 from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InlineQuery,
                            InlineQueryResultArticle, InputTextMessageContent, Message)
 
+from config import Config
 from database import Database
+
+from . import icons as icon_set
 
 logger = logging.getLogger("chess")
 router = Router(name="chess")
@@ -39,7 +42,8 @@ VS15 = "︎"           # текстовый вид символа: иначе �
 # белой фигурой, а контурный ♔ — тёмной (по шрифтовым названиям было наоборот — владелец: «цвета перепутал»).
 PIECES = {"K": "♚", "Q": "♛", "R": "♜", "B": "♝", "N": "♞", "P": "♟",
           "k": "♔", "q": "♕", "r": "♖", "b": "♗", "n": "♘", "p": "♙"}
-LIGHT, DARK = "⠀", "·"   # пустые клетки: светлая — пусто, тёмная — точка (как у шашек)
+EMPTY = "⠀"   # пустая клетка (точки на тёмных клетках рябили и мешали видеть фигуры — убраны по просьбе владельца)
+ICON_TEXT = "⠀"  # подпись кнопки со значком фигуры (пустую Telegram не принимает)
 MOVE_DOT = "•"
 # Ширина кнопок = ширина сообщения, а она — по самой длинной строке текста. Строка из «пустых» знаков
 # растягивает сообщение на весь экран: клетки выходят почти квадратными (было узко — просьба владельца).
@@ -56,12 +60,14 @@ START_COUNT = {"P": 8, "N": 2, "B": 2, "R": 2, "Q": 1}
 # подсвечивается правкой, только пока правок за минуту меньше SELECT_BUDGET, иначе — подсказкой у кнопки.
 EDIT_GAP = 1.0
 SELECT_BUDGET = 12
+ICONS_ON = "chess_icons_on"   # «1» — у владельца Premium (видно по его /chess): фигуры значками
 
 _locks: dict[str, asyncio.Lock] = {}
 _dirty: dict[str, int] = {}                 # номер последнего изменения партии
 _painters: dict[str, asyncio.Task] = {}
 _edits: dict[str, deque] = {}               # время правок за последнюю минуту
 _flood_until: dict[str, float] = {}
+_no_icons: set[str] = set()                 # партии, где Telegram значки не принял — играют символами
 
 
 def _chess():
@@ -143,7 +149,8 @@ def _captured(board) -> tuple[str, str]:
     return out[0], out[1]
 
 
-def render(st: dict) -> tuple[str, InlineKeyboardMarkup]:
+def render(st: dict, icons: dict[str, str] | None = None) -> tuple[str, InlineKeyboardMarkup]:
+    """Текст и доска; icons — id значков фигур (icons.py), без них — символы ♜."""
     chess = _chess()
     b = _board(st)
     wid, wname = st["w"]
@@ -179,7 +186,9 @@ def render(st: dict) -> tuple[str, InlineKeyboardMarkup]:
         for file in range(8):
             sq = chess.square(file, rank)
             piece = b.piece_at(sq)
-            style = None
+            style = icon = None
+            if piece and icons and sq not in targets:
+                icon = icons.get(piece.symbol())
             if sq == sel:
                 text, style = _sym(piece), SEL
             elif sq in captures:
@@ -190,9 +199,10 @@ def render(st: dict) -> tuple[str, InlineKeyboardMarkup]:
                 text = _sym(piece)
                 style = HIT if sq == checked else None
             else:
-                text = "◦" if sq in last_sq else (DARK if (file + rank) % 2 == 0 else LIGHT)
-            row.append(InlineKeyboardButton(text=text, style=style,
-                                            callback_data="c:x" if st.get("over") else f"c:{sq}"))
+                text = "◦" if sq in last_sq else EMPTY
+            extra = {k: v for k, v in (("style", style), ("icon_custom_emoji_id", icon)) if v}  # пустые не слать
+            row.append(InlineKeyboardButton(text=ICON_TEXT if icon else text,
+                                            callback_data="c:x" if st.get("over") else f"c:{sq}", **extra))
         rows.append(row)
     if st.get("over"):
         rows.append([InlineKeyboardButton(text="🔁 Реванш", callback_data="cre")])
@@ -208,11 +218,11 @@ def _plain(kb: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
                                                   for b in row] for row in kb.inline_keyboard])
 
 
-def _view(st: dict) -> tuple[str, InlineKeyboardMarkup]:
+def _view(st: dict, icons: dict[str, str] | None = None) -> tuple[str, InlineKeyboardMarkup]:
     if st.get("lobby"):  # реванш: снова «Играть»
         uid, name = st["lobby"]
         return lobby_text(name), lobby_kb(uid, name)
-    return render(st)
+    return render(st, icons)
 
 
 def _recent_edits(gid: str) -> int:
@@ -226,21 +236,41 @@ def _flood_left(gid: str) -> int:
     return max(0, round(_flood_until.get(gid, 0) - time.time()))
 
 
-async def _edit(bot: Bot, target: tuple, text: str, kb: InlineKeyboardMarkup) -> None:
+async def _edit_once(bot: Bot, target: tuple, text: str, kb: InlineKeyboardMarkup):
     inline_id, chat_id, msg_id = target
-    for markup in (kb, _plain(kb)):
+    if inline_id:
+        return await bot.edit_message_text(text=text, inline_message_id=inline_id, reply_markup=kb, parse_mode="HTML")
+    return await bot.edit_message_text(text=text, chat_id=chat_id, message_id=msg_id, reply_markup=kb,
+                                       parse_mode="HTML")
+
+
+def _has_icons(kb) -> bool:
+    return any(getattr(b, "icon_custom_emoji_id", None) for row in (kb.inline_keyboard if kb else []) for b in row)
+
+
+async def _edit(bot: Bot, gid: str, target: tuple, st: dict, icons: dict[str, str] | None) -> None:
+    """Правка доски: со значками фигур → без них (символами) → без цвета кнопок. TelegramRetryAfter — наверх."""
+    tries = []
+    if icons and gid not in _no_icons:
+        tries.append(("icons", _view(st, icons)))
+    text, kb = _view(st)
+    tries += [("text", (text, kb)), ("plain", (text, _plain(kb)))]
+    for kind, (text, kb) in tries:
         try:
-            if inline_id:
-                await bot.edit_message_text(text=text, inline_message_id=inline_id, reply_markup=markup,
-                                            parse_mode="HTML")
-            else:
-                await bot.edit_message_text(text=text, chat_id=chat_id, message_id=msg_id, reply_markup=markup,
-                                            parse_mode="HTML")
-            return
+            res = await _edit_once(bot, target, text, kb)
         except TelegramBadRequest as e:
             if "not modified" in str(e):
                 return
-            logger.warning("chess edit failed: %s", e)
+            logger.warning("chess edit failed (%s): %s", kind, e)
+            if kind == "icons":
+                _no_icons.add(gid)
+            continue
+        # Telegram может молча выкинуть значки (нет Premium у владельца) — тогда на кнопках пусто: перерисовать
+        if kind == "icons" and not isinstance(res, bool) and not _has_icons(getattr(res, "reply_markup", None)):
+            logger.warning("chess %s: Telegram убрал значки фигур из кнопок — играем символами", gid)
+            _no_icons.add(gid)
+            continue
+        return
 
 
 async def _painter(bot: Bot, db: Database, gid: str, target: tuple) -> None:
@@ -254,8 +284,9 @@ async def _painter(bot: Bot, db: Database, gid: str, target: tuple) -> None:
             st = await _load(db, gid)
             if not st:
                 return
+            icons = await icon_set.load(db) if st.get("icons") else None
             try:
-                await _edit(bot, target, *_view(st))
+                await _edit(bot, gid, target, st, icons)
             except TelegramRetryAfter as e:
                 _flood_until[gid] = time.time() + e.retry_after + 0.5
                 logger.info("chess %s: лимит правок Telegram, жду %s с", gid, e.retry_after)
@@ -307,10 +338,16 @@ async def inline_games(query: InlineQuery) -> None:
 
 
 @router.message(Command("chess"))
-async def cmd_chess(message: Message, bot: Bot) -> None:
-    """/chess — то же в этом чате (в остальных — через «@бот»)."""
+async def cmd_chess(message: Message, bot: Bot, db: Database, config: Config) -> None:
+    """/chess — то же в этом чате (в остальных — через «@бот»). Здесь фигуры — значками, если у владельца Premium."""
     name = _name(message.from_user)
     await bot.send_message(message.chat.id, lobby_text(name), reply_markup=lobby_kb(message.from_user.id, name))
+    owner = config.admin_ids[0] if config.admin_ids else 0
+    if message.from_user and message.from_user.id == owner:  # Premium видно только по сообщению самого владельца
+        premium = bool(message.from_user.is_premium)
+        await db.set_setting(ICONS_ON, "1" if premium else "0")
+        if premium:
+            await icon_set.ensure(bot, db, owner)
 
 
 @router.callback_query(F.data.startswith("cj:"))
@@ -332,7 +369,10 @@ async def cb_join(call: CallbackQuery, bot: Bot, db: Database) -> None:
             return
         players = [[cid, cname], [call.from_user.id, _name(call.from_user)]]
         random.shuffle(players)
-        st = {"w": players[0], "b": players[1], "moves": [], "sel": None}
+        st = {"w": players[0], "b": players[1], "moves": [], "sel": None,
+              # значки — только в сообщениях бота (/chess), не в «@бот»: так велит Telegram (см. icons.py)
+              "icons": bool(call.message and not call.inline_message_id
+                            and await db.get_setting(ICONS_ON, "0") == "1" and await icon_set.load(db))}
         await _save(db, gid, st)
     await call.answer("Поехали! " + ("Ты белыми, твой ход." if st["w"][0] == call.from_user.id else "Ты чёрными."))
     _refresh(bot, db, call)
