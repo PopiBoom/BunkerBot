@@ -5,6 +5,7 @@
 нажмёт — соперник (не создатель), цвета случайные. Доска — 64 кнопки, белые снизу: нажал свою фигуру —
 бот отметил, куда можно (зелёные • — ход, красные — взятие), нажал клетку — ход. Правила — python-chess: шах, мат, пат,
 рокировка, взятие на проходе, превращение (в ферзя), ничья по повторению / 50 ходам / нехватке фигур.
+Доску перерисовывает `_painter` (лимит правок Telegram — см. EDIT_GAP).
 Сдаться — двойным нажатием 🏳, ничья — 🤝 одного и согласие второго. После партии — «🔁 Реванш».
 
 Партия хранится в базе (настройка chess:<id>: список ходов, игроки, выбранная фигура) — перезапуски бота при
@@ -18,9 +19,10 @@ import json
 import logging
 import random
 import time
+from collections import deque
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InlineQuery,
                            InlineQueryResultArticle, InputTextMessageContent, Message)
@@ -47,7 +49,19 @@ WIDE = "⠀" * 30  # 40 на айфоне — в притык к краю; в г
 SEL, GO, HIT = "primary", "success", "danger"
 START_COUNT = {"P": 8, "N": 2, "B": 2, "R": 2, "Q": 1}
 
+# Telegram ограничивает частоту правок одного сообщения: при каждом нажатии (выбор фигуры + ход) правка шла
+# сразу, лимит кончался, правки отбивались «Too Many Requests» — доска стояла до минуты («ходы через минуту»).
+# Теперь: доску перерисовывает одна задача на партию — не чаще EDIT_GAP, всегда ПОСЛЕДНЕЕ состояние (лишние
+# промежуточные правки пропадают), при лимите ждёт, сколько сказал Telegram, и рисует снова. Выбор фигуры
+# подсвечивается правкой, только пока правок за минуту меньше SELECT_BUDGET, иначе — подсказкой у кнопки.
+EDIT_GAP = 1.0
+SELECT_BUDGET = 12
+
 _locks: dict[str, asyncio.Lock] = {}
+_dirty: dict[str, int] = {}                 # номер последнего изменения партии
+_painters: dict[str, asyncio.Task] = {}
+_edits: dict[str, deque] = {}               # время правок за последнюю минуту
+_flood_until: dict[str, float] = {}
 
 
 def _chess():
@@ -194,21 +208,88 @@ def _plain(kb: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
                                                   for b in row] for row in kb.inline_keyboard])
 
 
-async def _show(bot: Bot, call: CallbackQuery, text: str, kb: InlineKeyboardMarkup) -> None:
+def _view(st: dict) -> tuple[str, InlineKeyboardMarkup]:
+    if st.get("lobby"):  # реванш: снова «Играть»
+        uid, name = st["lobby"]
+        return lobby_text(name), lobby_kb(uid, name)
+    return render(st)
+
+
+def _recent_edits(gid: str) -> int:
+    q = _edits.setdefault(gid, deque())
+    while q and time.time() - q[0] > 60:
+        q.popleft()
+    return len(q)
+
+
+def _flood_left(gid: str) -> int:
+    return max(0, round(_flood_until.get(gid, 0) - time.time()))
+
+
+async def _edit(bot: Bot, target: tuple, text: str, kb: InlineKeyboardMarkup) -> None:
+    inline_id, chat_id, msg_id = target
     for markup in (kb, _plain(kb)):
         try:
-            if call.inline_message_id:
-                await bot.edit_message_text(text=text, inline_message_id=call.inline_message_id,
-                                            reply_markup=markup, parse_mode="HTML")
-            elif call.message:
-                await bot.edit_message_text(text=text, chat_id=call.message.chat.id,
-                                            message_id=call.message.message_id, reply_markup=markup,
+            if inline_id:
+                await bot.edit_message_text(text=text, inline_message_id=inline_id, reply_markup=markup,
+                                            parse_mode="HTML")
+            else:
+                await bot.edit_message_text(text=text, chat_id=chat_id, message_id=msg_id, reply_markup=markup,
                                             parse_mode="HTML")
             return
         except TelegramBadRequest as e:
             if "not modified" in str(e):
                 return
             logger.warning("chess edit failed: %s", e)
+
+
+async def _painter(bot: Bot, db: Database, gid: str, target: tuple) -> None:
+    try:
+        while True:
+            wait = max(_flood_until.get(gid, 0) - time.time(),
+                       (_edits[gid][-1] + EDIT_GAP - time.time()) if _edits.get(gid) else 0)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            ver = _dirty.get(gid, 0)
+            st = await _load(db, gid)
+            if not st:
+                return
+            try:
+                await _edit(bot, target, *_view(st))
+            except TelegramRetryAfter as e:
+                _flood_until[gid] = time.time() + e.retry_after + 0.5
+                logger.info("chess %s: лимит правок Telegram, жду %s с", gid, e.retry_after)
+                continue
+            _recent_edits(gid)
+            _edits[gid].append(time.time())
+            if _dirty.get(gid, 0) == ver:  # пока рисовали, ничего не поменялось
+                return
+    except Exception:  # noqa: BLE001 — доска не обновилась, партия в базе цела; следующее нажатие перерисует
+        logger.exception("chess painter %s", gid)
+    finally:
+        _painters.pop(gid, None)
+
+
+def _refresh(bot: Bot, db: Database, call: CallbackQuery) -> None:
+    """Партия изменилась — перерисовать доску (не сразу, если правок было много: см. EDIT_GAP)."""
+    gid = _gid(call)
+    if not gid:
+        return
+    _dirty[gid] = _dirty.get(gid, 0) + 1
+    if gid in _painters:
+        return  # задача уже рисует — возьмёт последнее состояние
+    if len(_dirty) > 500:
+        for d in (_dirty, _edits, _flood_until):
+            d.clear()
+        _dirty[gid] = 1
+    target = (call.inline_message_id, call.message.chat.id if call.message else None,
+              call.message.message_id if call.message else None)
+    _painters[gid] = asyncio.create_task(_painter(bot, db, gid, target))
+
+
+def _slow_note(gid: str) -> str:
+    left = _flood_left(gid)
+    return f" Telegram притормозил доску - обновится через {left} сек." if left else ""
 
 
 # ---------- создать партию ----------
@@ -254,7 +335,7 @@ async def cb_join(call: CallbackQuery, bot: Bot, db: Database) -> None:
         st = {"w": players[0], "b": players[1], "moves": [], "sel": None}
         await _save(db, gid, st)
     await call.answer("Поехали! " + ("Ты белыми, твой ход." if st["w"][0] == call.from_user.id else "Ты чёрными."))
-    await _show(bot, call, *render(st))
+    _refresh(bot, db, call)
     logger.info("шахматы %s: %s (белые) против %s", gid, st["w"][1], st["b"][1])
 
 
@@ -320,6 +401,12 @@ async def cb_square(call: CallbackQuery, bot: Bot, db: Database) -> None:
             else:
                 await call.answer("Нажми свою фигуру, которой можно сходить.")
                 return
+            # подсветку ходов рисуем, только пока лимит правок не близко — иначе подсказка у кнопки
+            if _flood_left(gid) or _recent_edits(gid) >= SELECT_BUDGET:
+                await _save(db, gid, st)
+                await call.answer(f"Выбран {_sym(piece)} {chess.square_name(sq)} - жми, куда ходить."
+                                  if st["sel"] is not None else "Отменил выбор.")
+                return
         else:
             moves = [m for m in b.legal_moves if m.from_square == sel and m.to_square == sq]
             if not moves:
@@ -344,8 +431,8 @@ async def cb_square(call: CallbackQuery, bot: Bot, db: Database) -> None:
                 note = st["over"]
                 logger.info("шахматы %s: %s", gid, st["over"])
         await _save(db, gid, st)
-    await call.answer(note)
-    await _show(bot, call, *render(st))
+    await call.answer(note or _slow_note(gid).strip())
+    _refresh(bot, db, call)
 
 
 @router.callback_query(F.data == "cr")
@@ -367,7 +454,7 @@ async def cb_resign(call: CallbackQuery, bot: Bot, db: Database) -> None:
         st["over"] = f"{me[1]} сдался. Победил {other[1]}"
         await _save(db, gid, st)
     await call.answer("Сдался.")
-    await _show(bot, call, *render(st))
+    _refresh(bot, db, call)
 
 
 @router.callback_query(F.data == "cd")
@@ -390,7 +477,7 @@ async def cb_draw(call: CallbackQuery, bot: Bot, db: Database) -> None:
             note = "Предложил ничью - если соперник нажмёт 🤝, партия кончится вничью."
         await _save(db, gid, st)
     await call.answer(note)
-    await _show(bot, call, *render(st))
+    _refresh(bot, db, call)
 
 
 @router.callback_query(F.data == "cre")
@@ -405,7 +492,7 @@ async def cb_rematch(call: CallbackQuery, bot: Bot, db: Database) -> None:
         if call.from_user.id not in (st["w"][0], st["b"][0]):
             await call.answer("Реванш - для игроков этой партии. Начни свою: @бот → «Шахматы».", show_alert=True)
             return
-        await _save(db, gid, {"over": "лобби"})  # не идущая партия — «Играть» сработает
-    name = _name(call.from_user)
+        # не идущая партия — «Играть» сработает
+        await _save(db, gid, {"over": "лобби", "lobby": [call.from_user.id, _name(call.from_user)]})
     await call.answer("Ждём соперника.")
-    await _show(bot, call, lobby_text(name), lobby_kb(call.from_user.id, name))
+    _refresh(bot, db, call)
