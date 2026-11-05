@@ -60,9 +60,14 @@ async def own_posts(db: Database) -> set[int]:
         return set()
 
 
-async def _remember_post(db: Database, msg_id: int, text: str) -> None:
+async def mark_own(db: Database, msg_id: int) -> None:
+    """Пост бота в канале — стёб-бот его в комментариях не обсуждает (и /chess_post тоже)."""
     ids = sorted(await own_posts(db) | {msg_id})[-100:]
     await db.set_setting(OWN_KEY, json.dumps(ids))
+
+
+async def _remember_post(db: Database, msg_id: int, text: str) -> None:
+    await mark_own(db, msg_id)
     try:
         texts = json.loads(await db.get_setting(POSTS_KEY, "[]"))
     except ValueError:

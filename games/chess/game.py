@@ -25,7 +25,7 @@ from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InlineQuery,
-                           InlineQueryResultArticle, InputTextMessageContent, Message)
+                           InlineQueryResultArticle, InputTextMessageContent, Message, ReplyParameters)
 
 from config import Config
 from database import Database
@@ -68,6 +68,10 @@ _painters: dict[str, asyncio.Task] = {}
 _edits: dict[str, deque] = {}               # время правок за последнюю минуту
 _flood_until: dict[str, float] = {}
 _no_icons: set[str] = set()                 # партии, где Telegram значки не принял — играют символами
+# /chess_post: пост в канал, партия — в комментариях (это уже группа: там значки можно, в самом канале — нет)
+COMMENT_WAIT = 20   # сек ждём, пока пост канала появится в группе комментариев
+_forwards: dict[tuple[int, int], int] = {}            # (канал, пост) → id копии поста в группе
+_forward_waits: dict[tuple[int, int], asyncio.Future] = {}
 
 
 def _chess():
@@ -337,17 +341,95 @@ async def inline_games(query: InlineQuery) -> None:
     await query.answer([res], cache_time=1, is_personal=True)
 
 
+async def _owner_icons(message: Message, bot: Bot, db: Database, config: Config) -> None:
+    """Команду написал владелец бота — запомнить, есть ли у него Premium (видно только по его сообщению), и
+    при Premium приготовить набор значков фигур."""
+    owner = config.admin_ids[0] if config.admin_ids else 0
+    if message.from_user and message.from_user.id == owner:
+        premium = bool(message.from_user.is_premium)
+        await db.set_setting(ICONS_ON, "1" if premium else "0")
+        if premium:
+            await icon_set.ensure(bot, db, owner)
+
+
 @router.message(Command("chess"))
 async def cmd_chess(message: Message, bot: Bot, db: Database, config: Config) -> None:
     """/chess — то же в этом чате (в остальных — через «@бот»). Здесь фигуры — значками, если у владельца Premium."""
     name = _name(message.from_user)
     await bot.send_message(message.chat.id, lobby_text(name), reply_markup=lobby_kb(message.from_user.id, name))
-    owner = config.admin_ids[0] if config.admin_ids else 0
-    if message.from_user and message.from_user.id == owner:  # Premium видно только по сообщению самого владельца
-        premium = bool(message.from_user.is_premium)
-        await db.set_setting(ICONS_ON, "1" if premium else "0")
-        if premium:
-            await icon_set.ensure(bot, db, owner)
+    await _owner_icons(message, bot, db, config)
+
+
+def note_forward(message: Message) -> None:
+    """Middleware в bot.py: пост канала пришёл в группу комментариев — запомнить, где он (для /chess_post)."""
+    fo = message.forward_origin
+    chat = getattr(fo, "chat", None)
+    post = getattr(fo, "message_id", None)
+    if not (message.is_automatic_forward and chat and post):
+        return
+    key = (chat.id, post)
+    if len(_forwards) > 200:
+        _forwards.clear()
+    _forwards[key] = message.message_id
+    fut = _forward_waits.pop(key, None)
+    if fut and not fut.done():
+        fut.set_result(message.message_id)
+
+
+async def _comment_root(channel: int, post: int) -> int | None:
+    key = (channel, post)
+    if key in _forwards:  # пришёл раньше, чем мы начали ждать
+        return _forwards[key]
+    fut = _forward_waits[key] = asyncio.get_running_loop().create_future()
+    try:
+        return await asyncio.wait_for(fut, COMMENT_WAIT)
+    except asyncio.TimeoutError:
+        return _forwards.get(key)
+    finally:
+        _forward_waits.pop(key, None)
+
+
+@router.message(Command("chess_post"))
+async def cmd_chess_post(message: Message, bot: Bot, db: Database, config: Config) -> None:
+    """/chess_post — пост «играем в шахматы» в канал бати, сама партия — в комментариях под ним.
+    В канале значки в кнопках Telegram не разрешает (только в личке и группах), а комментарии — это группа."""
+    from ephemeral import temp_reply
+    from handlers.channel_posts import channel_id, mark_own
+
+    channel = await channel_id(bot, db)
+    try:
+        info = await bot.get_chat(channel) if channel else None
+    except TelegramBadRequest:
+        info = None
+    group = getattr(info, "linked_chat_id", None)
+    if not group:
+        await temp_reply(message, "Не нашёл канал с комментариями: бот должен быть админом канала, "
+                                  "а у канала - группа для комментариев.")
+        return
+    name = _name(message.from_user)
+    await _owner_icons(message, bot, db, config)
+    try:
+        post = await bot.send_message(channel, f"♟ <b>Шахматы</b>\n\n{html.escape(name)} ищет соперника. "
+                                               "Партия - в комментариях: жми там «Играть» 👇", parse_mode="HTML")
+    except TelegramBadRequest as e:
+        await temp_reply(message, f"Не смог написать в канал: {html.escape(str(e))}")
+        return
+    await mark_own(db, post.message_id)  # стёб-бот не комментирует свой же пост
+    root = await _comment_root(channel, post.message_id)
+    if not root:
+        await temp_reply(message, "Пост в канале есть, но в комментариях он не появился - партию не открыть. "
+                                  "Проверь, что бот есть в группе комментариев.")
+        return
+    lobby = await bot.send_message(group, lobby_text(name), reply_markup=lobby_kb(message.from_user.id, name),
+                                   reply_parameters=ReplyParameters(message_id=root, allow_sending_without_reply=True))
+    if getattr(info, "username", None):  # кнопка под постом — сразу в комментарии
+        try:
+            await bot.edit_message_reply_markup(chat_id=channel, message_id=post.message_id, reply_markup=(
+                InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                    text="♟ К партии", url=f"https://t.me/{info.username}/{post.message_id}?comment={lobby.message_id}")]])))
+        except TelegramBadRequest as e:
+            logger.info("chess: кнопка под постом не встала: %s", e)
+    logger.info("шахматы: пост %s в канале %s, партия в комментариях", post.message_id, channel)
 
 
 @router.callback_query(F.data.startswith("cj:"))
