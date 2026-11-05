@@ -43,7 +43,10 @@ VS15 = "︎"           # текстовый вид символа: иначе �
 PIECES = {"K": "♚", "Q": "♛", "R": "♜", "B": "♝", "N": "♞", "P": "♟",
           "k": "♔", "q": "♕", "r": "♖", "b": "♗", "n": "♘", "p": "♙"}
 EMPTY = "⠀"   # пустая клетка (точки на тёмных клетках рябили и мешали видеть фигуры — убраны по просьбе владельца)
-ICON_TEXT = "⠀"  # подпись кнопки со значком фигуры (пустую Telegram не принимает)
+# Подпись кнопки со значком фигуры: Telegram ставит значок и подпись рядом и центрует вместе — с «⠀» значок уезжал
+# влево («не ровно по центру» — владелец). Сначала пробуем подпись нулевой ширины; не примет — «⠀».
+ICON_TEXTS = ("\u200b", "⠀")
+_icon_text = [ICON_TEXTS[0]]   # какая подпись сработала (пробуем с неё)
 MOVE_DOT = "•"
 # Ширина кнопок = ширина сообщения, а она — по самой длинной строке текста. Строка из «пустых» знаков
 # растягивает сообщение на весь экран: клетки выходят почти квадратными (было узко — просьба владельца).
@@ -153,7 +156,8 @@ def _captured(board) -> tuple[str, str]:
     return out[0], out[1]
 
 
-def render(st: dict, icons: dict[str, str] | None = None) -> tuple[str, InlineKeyboardMarkup]:
+def render(st: dict, icons: dict[str, str] | None = None,
+           icon_text: str = ICON_TEXTS[-1]) -> tuple[str, InlineKeyboardMarkup]:
     """Текст и доска; icons — id значков фигур (icons.py), без них — символы ♜."""
     chess = _chess()
     b = _board(st)
@@ -205,7 +209,7 @@ def render(st: dict, icons: dict[str, str] | None = None) -> tuple[str, InlineKe
             else:
                 text = "◦" if sq in last_sq else EMPTY
             extra = {k: v for k, v in (("style", style), ("icon_custom_emoji_id", icon)) if v}  # пустые не слать
-            row.append(InlineKeyboardButton(text=ICON_TEXT if icon else text,
+            row.append(InlineKeyboardButton(text=icon_text if icon else text,
                                             callback_data="c:x" if st.get("over") else f"c:{sq}", **extra))
         rows.append(row)
     if st.get("over"):
@@ -222,11 +226,12 @@ def _plain(kb: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
                                                   for b in row] for row in kb.inline_keyboard])
 
 
-def _view(st: dict, icons: dict[str, str] | None = None) -> tuple[str, InlineKeyboardMarkup]:
+def _view(st: dict, icons: dict[str, str] | None = None,
+          icon_text: str = ICON_TEXTS[-1]) -> tuple[str, InlineKeyboardMarkup]:
     if st.get("lobby"):  # реванш: снова «Играть»
         uid, name = st["lobby"]
         return lobby_text(name), lobby_kb(uid, name)
-    return render(st, icons)
+    return render(st, icons, icon_text)
 
 
 def _recent_edits(gid: str) -> int:
@@ -256,17 +261,20 @@ async def _edit(bot: Bot, gid: str, target: tuple, st: dict, icons: dict[str, st
     """Правка доски: со значками фигур → без них (символами) → без цвета кнопок. TelegramRetryAfter — наверх."""
     tries = []
     if icons and gid not in _no_icons:
-        tries.append(("icons", _view(st, icons)))
+        texts = [_icon_text[0]] + [t for t in ICON_TEXTS if t != _icon_text[0]]
+        tries += [("icons", t, _view(st, icons, t)) for t in texts]
     text, kb = _view(st)
-    tries += [("text", (text, kb)), ("plain", (text, _plain(kb)))]
-    for kind, (text, kb) in tries:
+    tries += [("text", "", (text, kb)), ("plain", "", (text, _plain(kb)))]
+    for n, (kind, label, (text, kb)) in enumerate(tries):
+        if kind == "icons" and gid in _no_icons:  # Telegram молча выкинул значки — другие подписи не помогут
+            continue
         try:
             res = await _edit_once(bot, target, text, kb)
         except TelegramBadRequest as e:
             if "not modified" in str(e):
                 return
-            logger.warning("chess edit failed (%s): %s", kind, e)
-            if kind == "icons":
+            logger.warning("chess edit failed (%s %r): %s", kind, label, e)
+            if kind == "icons" and tries[n + 1][0] != "icons":  # ни одна подпись не прошла
                 _no_icons.add(gid)
             continue
         # Telegram может молча выкинуть значки (нет Premium у владельца) — тогда на кнопках пусто: перерисовать
@@ -274,6 +282,8 @@ async def _edit(bot: Bot, gid: str, target: tuple, st: dict, icons: dict[str, st
             logger.warning("chess %s: Telegram убрал значки фигур из кнопок — играем символами", gid)
             _no_icons.add(gid)
             continue
+        if kind == "icons":
+            _icon_text[0] = label
         return
 
 
@@ -420,15 +430,10 @@ async def cmd_chess_post(message: Message, bot: Bot, db: Database, config: Confi
         await temp_reply(message, "Пост в канале есть, но в комментариях он не появился - партию не открыть. "
                                   "Проверь, что бот есть в группе комментариев.")
         return
-    lobby = await bot.send_message(group, lobby_text(name), reply_markup=lobby_kb(message.from_user.id, name),
-                                   reply_parameters=ReplyParameters(message_id=root, allow_sending_without_reply=True))
-    if getattr(info, "username", None):  # кнопка под постом — сразу в комментарии
-        try:
-            await bot.edit_message_reply_markup(chat_id=channel, message_id=post.message_id, reply_markup=(
-                InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-                    text="♟ К партии", url=f"https://t.me/{info.username}/{post.message_id}?comment={lobby.message_id}")]])))
-        except TelegramBadRequest as e:
-            logger.info("chess: кнопка под постом не встала: %s", e)
+    # без кнопок под самим постом: у поста с кнопками Telegram прячет строку комментариев (владелец: «кнопка без
+    # комментариев» — была «♟ К партии»)
+    await bot.send_message(group, lobby_text(name), reply_markup=lobby_kb(message.from_user.id, name),
+                           reply_parameters=ReplyParameters(message_id=root, allow_sending_without_reply=True))
     logger.info("шахматы: пост %s в канале %s, партия в комментариях", post.message_id, channel)
 
 

@@ -8,7 +8,7 @@
 принял — играют обычными символами.
 
 Набор бот создаёт сам один раз (владелец — первый ADMIN_ID): «chess1_by_<ник бота>», id значков — в настройке
-chess_icons. Поменял картинки — подними SET (иначе останется старый набор).
+chess_icons. Поменял картинки — подними SET и допиши старое имя в OLD_SETS (иначе останется старый набор).
 """
 from __future__ import annotations
 
@@ -25,9 +25,10 @@ from database import Database
 
 logger = logging.getLogger("chess")
 
-SET = "chess1"
+SET = "chess2"                    # chess1 — фигуры стояли по низу, пешки казались ниже центра
+OLD_SETS = ("chess1",)            # старые наборы — удаляем, когда создали новый
 ORDER = "KQRBNPkqrbnp"            # белые, потом чёрные
-SETTING = "chess_icons"
+SETTING = "chess_icons:" + SET
 GLYPH = {"K": "♚", "Q": "♛", "R": "♜", "B": "♝", "N": "♞", "P": "♟"}  # залитые — силуэт фигуры
 FONT = Path(__file__).resolve().parents[2] / "assets" / "fonts" / "DejaVuSans.ttf"
 SIZE = 100
@@ -44,11 +45,10 @@ def draw(symbol: str) -> bytes:
     stroke = int(big * 0.035)
     im = Image.new("RGBA", (big, big), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
-    # общий масштаб для всех фигур: пешка ниже короля, как на доске; по высоте — по королю
-    king = d.textbbox((0, 0), GLYPH["K"], font=font, stroke_width=stroke)
+    # общий масштаб для всех фигур (пешка меньше короля), каждая — ровно по центру клетки
     box = d.textbbox((0, 0), glyph, font=font, stroke_width=stroke)
     x = (big - (box[2] - box[0])) / 2 - box[0]
-    y = big - (big - (king[3] - king[1])) / 2 - king[3]  # все стоят на одной линии снизу
+    y = (big - (box[3] - box[1])) / 2 - box[1]
     d.text((x, y), glyph, font=font, fill=(255, 255, 255, 255) if white else (28, 28, 28, 255),
            stroke_width=stroke, stroke_fill=(25, 25, 25, 255) if white else (235, 235, 235, 255))
     out = io.BytesIO()
@@ -89,5 +89,10 @@ async def ensure(bot: Bot, db: Database, owner_id: int) -> dict[str, str] | None
         return None
     icons = dict(zip(ORDER, ids, strict=True))
     await db.set_setting(SETTING, json.dumps(icons))
+    for old in OLD_SETS:
+        try:
+            await bot.delete_sticker_set(f"{old}_by_{me.username}")
+        except Exception:  # noqa: BLE001 — уже нет или не вышло: уборка, шахматам не мешает
+            pass
     logger.info("chess: значки фигур готовы (%s)", name)
     return icons
