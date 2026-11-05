@@ -2081,7 +2081,8 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int) -> None:
 
 
 DOSSIER_VERSION_KEY = "dossier_version"
-DOSSIER_VERSION = "3"  # 2 — Sonnet, факты с датами и цитатами; 3 — без категорий, мелочи, толкований и пометок
+DOSSIER_VERSION = "4"  # 2 — Sonnet, факты с датами и цитатами; 3 — без категорий, мелочи, толкований и пометок;
+# 4 — про бота максимум один пункт (у бати было полдосье про бота — подколы по кругу)
 
 
 async def _finish_spars(bot: Bot, db: Database) -> None:
