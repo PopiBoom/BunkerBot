@@ -3,7 +3,7 @@
 Как играть: в любом чате (канал, группа, личка) набрать «@ник_бота» и выбрать «♟ Шахматы» (инлайн-режим —
 его один раз включают в @BotFather: /setinline), или /chess в группе. В сообщении кнопка «Играть»: кто
 нажмёт — соперник (не создатель), цвета случайные. Доска — 64 кнопки, белые снизу: нажал свою фигуру —
-бот отметил, куда можно (• — ход, × — взятие), нажал клетку — ход. Правила — python-chess: шах, мат, пат,
+бот отметил, куда можно (зелёные • — ход, красные — взятие), нажал клетку — ход. Правила — python-chess: шах, мат, пат,
 рокировка, взятие на проходе, превращение (в ферзя), ничья по повторению / 50 ходам / нехватке фигур.
 Сдаться — двойным нажатием 🏳, ничья — 🤝 одного и согласие второго. После партии — «🔁 Реванш».
 
@@ -36,7 +36,13 @@ VS15 = "︎"           # текстовый вид символа: иначе �
 PIECES = {"K": "♔", "Q": "♕", "R": "♖", "B": "♗", "N": "♘", "P": "♙",
           "k": "♚", "q": "♛", "r": "♜", "b": "♝", "n": "♞", "p": "♟"}
 LIGHT, DARK = "⠀", "·"   # пустые клетки: светлая — пусто, тёмная — точка (как у шашек)
-MOVE_DOT, CAPTURE = "•", "×"
+MOVE_DOT = "•"
+# Ширина кнопок = ширина сообщения, а она — по самой длинной строке текста. Строка из «пустых» знаков
+# растягивает сообщение на весь экран: клетки выходят почти квадратными (было узко — просьба владельца).
+WIDE = "⠀" * 40
+# Цвет кнопок (Bot API style): выбранная фигура — синяя, куда можно — зелёные, взятие и король под шахом —
+# красные. Старые приложения цвет не показывают — для них остаются «•» на ходах.
+SEL, GO, HIT = "primary", "success", "danger"
 START_COUNT = {"P": 8, "N": 2, "B": 2, "R": 2, "Q": 1}
 
 _locks: dict[str, asyncio.Lock] = {}
@@ -126,7 +132,7 @@ def render(st: dict) -> tuple[str, InlineKeyboardMarkup]:
     b = _board(st)
     wid, wname = st["w"]
     bname = st["b"][1]
-    lines = ["♟ <b>Шахматы</b>", "", f"⚪ {html.escape(wname)}  ·  ⚫ {html.escape(bname)}"]
+    lines = ["♟ <b>Шахматы</b>", WIDE, f"⚪ {html.escape(wname)}  ·  ⚫ {html.escape(bname)}"]
     if st.get("over"):
         lines += ["", f"<b>{html.escape(st['over'])}</b>"]
     else:
@@ -150,23 +156,27 @@ def render(st: dict) -> tuple[str, InlineKeyboardMarkup]:
             if m.from_square == sel:
                 (captures if b.is_capture(m) else targets).add(m.to_square)
     last_sq = set(st.get("last_sq") or [])
+    checked = b.king(b.turn) if b.is_check() else None
     rows = []
     for rank in range(7, -1, -1):
         row = []
         for file in range(8):
             sq = chess.square(file, rank)
             piece = b.piece_at(sq)
+            style = None
             if sq == sel:
-                text = f"[{_sym(piece)}]"
+                text, style = _sym(piece), SEL
             elif sq in captures:
-                text = CAPTURE + (_sym(piece) if piece else "")  # взятие на проходе — клетка пустая
+                text, style = (_sym(piece) if piece else MOVE_DOT), HIT  # на проходе — клетка пустая
             elif sq in targets:
-                text = MOVE_DOT
+                text, style = MOVE_DOT, GO
             elif piece:
                 text = _sym(piece)
+                style = HIT if sq == checked else None
             else:
                 text = "◦" if sq in last_sq else (DARK if (file + rank) % 2 == 0 else LIGHT)
-            row.append(InlineKeyboardButton(text=text, callback_data="c:x" if st.get("over") else f"c:{sq}"))
+            row.append(InlineKeyboardButton(text=text, style=style,
+                                            callback_data="c:x" if st.get("over") else f"c:{sq}"))
         rows.append(row)
     if st.get("over"):
         rows.append([InlineKeyboardButton(text="🔁 Реванш", callback_data="cre")])
@@ -176,16 +186,26 @@ def render(st: dict) -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _plain(kb: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
+    """Та же доска без цвета кнопок — на случай, если Telegram цвет не принял."""
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=b.text, callback_data=b.callback_data)
+                                                  for b in row] for row in kb.inline_keyboard])
+
+
 async def _show(bot: Bot, call: CallbackQuery, text: str, kb: InlineKeyboardMarkup) -> None:
-    try:
-        if call.inline_message_id:
-            await bot.edit_message_text(text=text, inline_message_id=call.inline_message_id, reply_markup=kb,
-                                        parse_mode="HTML")
-        elif call.message:
-            await bot.edit_message_text(text=text, chat_id=call.message.chat.id, message_id=call.message.message_id,
-                                        reply_markup=kb, parse_mode="HTML")
-    except TelegramBadRequest as e:
-        if "not modified" not in str(e):
+    for markup in (kb, _plain(kb)):
+        try:
+            if call.inline_message_id:
+                await bot.edit_message_text(text=text, inline_message_id=call.inline_message_id,
+                                            reply_markup=markup, parse_mode="HTML")
+            elif call.message:
+                await bot.edit_message_text(text=text, chat_id=call.message.chat.id,
+                                            message_id=call.message.message_id, reply_markup=markup,
+                                            parse_mode="HTML")
+            return
+        except TelegramBadRequest as e:
+            if "not modified" in str(e):
+                return
             logger.warning("chess edit failed: %s", e)
 
 
