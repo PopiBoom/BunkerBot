@@ -863,6 +863,8 @@ async def on_group_message(message: Message, bot: Bot, db: Database, config=None
     user = message.from_user
     if user is None or user.is_bot or not message.text:
         return
+    if message.via_bot and message.via_bot.id == bot.id:  # партия шахмат «через @бота» — не реплика человека
+        return
     chat_id = message.chat.id
     if not _db_ref:
         _db_ref.append(db)
