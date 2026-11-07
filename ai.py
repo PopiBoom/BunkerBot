@@ -2385,7 +2385,9 @@ async def speak(text: str, system: str | None = None, voice: str | None = None, 
     if spoken and _same_words(text, spoken) < 0.5:  # озвучка «ответила» своё вместо чтения — не пускаем в эфир
         logger.info("speak: модель сказала не то: %s", spoken[:200])
         return b""
-    return bytes(audio)
+    if audio[:3] == b"ID3" or audio[:4] in (b"RIFF", b"OggS"):
+        logger.info("speak: %s вернул сжатый звук (%s) — декодирую", model or SPEAK_MODEL, bytes(audio[:4]))
+    return to_pcm24(bytes(audio))  # иногда это MP3/WAV, а не PCM: войс и эфир иначе хрипели помехами
 
 
 # ---------- голос для эфиров: ElevenLabs (живой) или OpenRouter (запасной) ----------
@@ -2408,6 +2410,49 @@ def eleven_key() -> str:
     return os.getenv("ELEVENLABS_API_KEY", "").strip() or _eleven_key
 
 
+def to_pcm24(data: bytes) -> bytes:
+    """Ответ озвучки → PCM 16 бит, 24 кГц, моно. Сервисы порой отдают MP3/WAV/OGG вместо «сырого» звука, и бот
+    принимал сжатый файл за PCM — в эфире были одни помехи (владелец: «20 сек и одни помехи»). Сжатое узнаём по
+    сигнатуре и декодируем PyAV; не декодировалось — это и был PCM."""
+    if not data:
+        return b""
+    head = data[:4]
+    maybe = head[:3] == b"ID3" or head in (b"RIFF", b"OggS", b"fLaC") or (data[0] == 0xFF and data[1] & 0xE0 == 0xE0)
+    if not maybe:
+        return data
+    try:
+        import io as _io
+
+        import av
+
+        out = bytearray()
+        with av.open(_io.BytesIO(data)) as c:
+            rs = av.AudioResampler(format="s16", layout="mono", rate=SPEAK_RATE)
+            for frame in c.decode(audio=0):
+                for g in rs.resample(frame):
+                    out += g.to_ndarray().astype("<i2").tobytes()
+            for g in rs.resample(None):
+                out += g.to_ndarray().astype("<i2").tobytes()
+        return bytes(out) if out else data
+    except Exception:
+        return data
+
+
+def is_noise(pcm: bytes, rate: int = SPEAK_RATE) -> bool:
+    """Шум вместо речи: у речи спектр «горбатый» (плоскость ≈ 0.3), у мусора — плоский (≈ 0.8)."""
+    import numpy as np
+
+    x = np.frombuffer(pcm[: len(pcm) // 2 * 2], dtype="<i2").astype(np.float32)
+    fr = int(0.05 * rate)
+    vals = []
+    for i in range(0, len(x) - fr, fr):
+        seg = x[i:i + fr]
+        if np.mean(seg ** 2) > 1e4:
+            spec = np.abs(np.fft.rfft(seg)) + 1e-9
+            vals.append(float(np.exp(np.mean(np.log(spec))) / np.mean(spec)))
+    return bool(vals) and float(np.median(vals)) > 0.6
+
+
 async def eleven_speak(text: str, horror: bool = False, voice: str | None = None, key: str | None = None) -> bytes:
     """ElevenLabs: PCM 16 бит, 24 кГц, моно. b"" — нет ключа или сбой."""
     import aiohttp
@@ -2425,7 +2470,9 @@ async def eleven_speak(text: str, horror: bool = False, voice: str | None = None
                 if r.status != 200:
                     logger.warning("eleven: %s: %s", r.status, (await r.text())[:300])
                     return b""
-                return await r.read()
+                data = await r.read()
+                logger.info("eleven: %s, %d байт, начало %s", r.headers.get("content-type"), len(data), data[:4])
+                return to_pcm24(data)
     except Exception as e:
         logger.warning("eleven failed: %s", e)
         return b""
@@ -2454,15 +2501,24 @@ HORROR_SPEAK = (
 
 
 async def narrate(text: str, horror: bool = False) -> bytes:
-    """Голос эфира: ElevenLabs → gpt-audio → gpt-audio-mini. PCM 16 бит, 24 кГц."""
-    if eleven_key():
-        pcm = await eleven_speak(text, horror=horror)
-        if pcm:
-            return pcm
+    """Голос эфира: ElevenLabs → gpt-audio → gpt-audio-mini. PCM 16 бит, 24 кГц. Шум вместо речи — следующий."""
     system = HORROR_SPEAK if horror else NIGHT_SPEAK
     voice = os.getenv("AI_NIGHT_VOICE", "").strip() or None
-    pcm = await speak(text, system=system, voice=voice, timeout=120, model=NIGHT_SPEAK_MODEL)
-    return pcm or await speak(text, system=system, voice=voice, timeout=120)
+    tries = []
+    if eleven_key():
+        tries.append(("ElevenLabs", lambda: eleven_speak(text, horror=horror)))
+    tries += [(NIGHT_SPEAK_MODEL, lambda: speak(text, system=system, voice=voice, timeout=120, model=NIGHT_SPEAK_MODEL)),
+              (SPEAK_MODEL, lambda: speak(text, system=system, voice=voice, timeout=120))]
+    for name, call in tries:
+        pcm = to_pcm24(await call())
+        if not pcm:
+            continue
+        if is_noise(pcm):
+            logger.warning("narrate: %s вернул шум вместо речи (%d байт, начало %s) — пробую следующий",
+                           name, len(pcm), pcm[:4])
+            continue
+        return pcm
+    return b""
 
 
 HORROR_SYSTEM = (
