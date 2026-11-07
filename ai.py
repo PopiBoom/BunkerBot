@@ -2408,11 +2408,11 @@ def eleven_key() -> str:
     return os.getenv("ELEVENLABS_API_KEY", "").strip() or _eleven_key
 
 
-async def eleven_speak(text: str, horror: bool = False, voice: str | None = None) -> bytes:
+async def eleven_speak(text: str, horror: bool = False, voice: str | None = None, key: str | None = None) -> bytes:
     """ElevenLabs: PCM 16 бит, 24 кГц, моно. b"" — нет ключа или сбой."""
     import aiohttp
 
-    key = eleven_key()
+    key = key or eleven_key()
     if not key or not text.strip():
         return b""
     body = {"text": text, "model_id": ELEVEN_MODEL,

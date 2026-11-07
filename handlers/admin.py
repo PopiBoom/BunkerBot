@@ -149,15 +149,16 @@ async def _set_eleven(message: Message, key: str, db: Database) -> None:
         await message.answer("🔑 Ключ ElevenLabs удалён - эфиры снова запасным голосом.")
         return
     quota = await ai.eleven_quota(key)
-    if quota is None:
-        await message.answer("❌ ElevenLabs не принял ключ - проверь, что он скопирован целиком.")
-        return
+    if quota is None:  # ключ с урезанными правами не видит подписку — проверим коротким словом озвучки
+        if not await ai.eleven_speak("Проверка.", key=key):
+            await message.answer("❌ ElevenLabs не принял ключ - проверь, что он скопирован целиком и что у ключа "
+                                 "есть доступ к Text to Speech.")
+            return
     await db.set_setting("eleven_key", key)
     ai.set_eleven_key(key)
-    used, limit = quota
-    await message.answer(f"✅ Ключ ElevenLabs сохранён на сервере, сообщение с ним удалил.\n"
-                         f"Символов в этом месяце: {used:,} из {limit:,}. Страшная история - примерно 3 000 символов."
-                         .replace(",", " "))
+    tail = ("Символов в этом месяце: {:,} из {:,}. ".format(*quota).replace(",", " ") if quota else "")
+    await message.answer(f"✅ Ключ ElevenLabs сохранён на сервере, сообщение с ним удалил.\n{tail}"
+                         "Страшная история - примерно 3 000 символов. Проверь: /horror")
 
 
 async def _openrouter_balance(key: str) -> float | None:
