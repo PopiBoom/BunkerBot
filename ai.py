@@ -2539,6 +2539,8 @@ async def eleven_speak(text: str, horror: bool = False, voice: str | None = None
                     return b""
                 data = await r.read()
                 ctype = r.headers.get("content-type") or ""
+                if ("audio" in ctype or "octet" in ctype) and data:
+                    _eleven_geo_until = 0.0  # звук пришёл — регион пускает: дальше озвучиваем ElevenLabs сразу
                 if "audio" not in ctype and "octet" not in ctype:  # вместо звука — страница (блок по стране, прокси…)
                     page = data[:4000].decode("utf-8", "replace")
                     m = re.search(r"<title[^>]*>(.*?)</title>", page, re.IGNORECASE | re.DOTALL)
