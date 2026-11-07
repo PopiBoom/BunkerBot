@@ -2446,8 +2446,9 @@ def to_pcm24(data: bytes) -> bytes:
     if not data:
         return b""
     head = data[:4]
-    maybe = head[:3] == b"ID3" or head in (b"RIFF", b"OggS", b"fLaC") or (data[0] == 0xFF and data[1] & 0xE0 == 0xE0)
-    if not maybe:
+    strong = head[:3] == b"ID3" or head in (b"RIFF", b"OggS", b"fLaC")
+    weak = len(data) > 1 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0  # MP3-кадр — или PCM, начавшийся с «-1»
+    if not (strong or weak):
         return data
     try:
         import io as _io
@@ -2462,7 +2463,13 @@ def to_pcm24(data: bytes) -> bytes:
                     out += g.to_ndarray().astype("<i2").tobytes()
             for g in rs.resample(None):
                 out += g.to_ndarray().astype("<i2").tobytes()
-        return bytes(out) if out else data
+        if not out:
+            return data
+        # «ff ff» в начале бывает и у обычного PCM (тихий сэмпл -1): MP3 после распаковки всегда длиннее себя,
+        # а PCM, «распакованный» как MP3, — обрывок. Не стало длиннее — это был PCM.
+        if weak and not strong and len(out) <= len(data):
+            return data
+        return bytes(out)
     except Exception:
         return data
 
@@ -2500,8 +2507,9 @@ async def eleven_speak(text: str, horror: bool = False, voice: str | None = None
                     logger.warning("eleven: %s: %s", r.status, (await r.text())[:300])
                     return b""
                 data = await r.read()
-                logger.info("eleven: %s, %d байт, начало %s", r.headers.get("content-type"), len(data), data[:4])
-                return to_pcm24(data)
+                ctype = r.headers.get("content-type") or ""
+                logger.info("eleven: %s, %d байт (≈%.1f с), начало %s", ctype, len(data), len(data) / 48000, data[:4])
+                return data if "pcm" in ctype else to_pcm24(data)  # сказали «pcm» — по первым байтам не гадаем
     except Exception as e:
         logger.warning("eleven failed: %s", e)
         return b""
