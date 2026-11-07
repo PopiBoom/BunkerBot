@@ -123,7 +123,7 @@ async def _record(model: str, usage) -> None:
 
 async def _complete(system: str, user: str, max_tokens: int = 4000, fast: bool = False,
                     model: str | None = None, image: tuple[bytes, str] | None = None,
-                    effort: str = "low") -> str:
+                    effort: str = "low", tools: list | None = None) -> str:
     """Один запрос к Claude, возвращает текст ответа.
 
     fast=True — дешёвая модель для коротких реплик. max_tokens берём с запасом:
@@ -147,17 +147,28 @@ async def _complete(system: str, user: str, max_tokens: int = 4000, fast: bool =
                                          "data": base64.standard_b64encode(data).decode()}},
             {"type": "text", "text": user},
         ]}]
-    if model in _FALLBACK_MODELS:
-        # При отказе API само переотправит запрос подходящей модели.
-        resp = await client.beta.messages.create(
-            betas=["server-side-fallback-2026-07-01"], fallbacks="default", **kwargs
-        )
-    else:
-        resp = await client.messages.create(**kwargs)
-    await _record(getattr(resp, "model", None) or model, resp.usage)
+    if tools:  # серверные инструменты (поиск в интернете) — их крутит сам API
+        kwargs["tools"] = tools
+    for _ in range(4):
+        if model in _FALLBACK_MODELS:
+            # При отказе API само переотправит запрос подходящей модели.
+            resp = await client.beta.messages.create(
+                betas=["server-side-fallback-2026-07-01"], fallbacks="default", **kwargs
+            )
+        else:
+            resp = await client.messages.create(**kwargs)
+        await _record(getattr(resp, "model", None) or model, resp.usage)
+        if resp.stop_reason != "pause_turn":
+            break
+        # долгий поиск: сервер встал на паузу — отправляем его же ответ обратно, он продолжит сам
+        kwargs["messages"] = kwargs["messages"] + [{"role": "assistant", "content": resp.content}]
     if resp.stop_reason == "refusal":
         raise AIUnavailable("модель отказалась отвечать")
     return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+
+# Поиск в интернете (серверный инструмент Claude): страшным историям — настоящие детали мест и городские легенды
+WEB_SEARCH = {"type": "web_search_20260209", "name": "web_search", "max_uses": 3}
 
 
 # ---------- генерация партии ----------
@@ -2543,7 +2554,10 @@ async def eleven_speak(text: str, horror: bool = False, voice: str | None = None
 # Яндекс SpeechKit (API v1): живые русские голоса, пускает сервер, где ElevenLabs закрыт по региону (07.11, выбор
 # владельца). Ключ — API-ключ сервисного аккаунта с ролью ai.speechkit-tts.user (/setkey yandex …), folderId не нужен.
 YANDEX_TTS_URL = "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize"
-YANDEX_VOICES = {"ermil": "Ермил", "filipp": "Филипп", "zahar": "Захар", "madirus": "Мадирус"}  # мужские
+YANDEX_VOICES = {"ermil": "Ермил", "filipp": "Филипп", "zahar": "Захар", "madirus": "Мадирус",
+                 "jane_evil": "Джейн, зловещая", "omazh_evil": "Омаж, зловещая"}
+# «задорный, но жуткий» голос (владелец 07.11): у Яндекса эмоция «evil» есть у женских jane и omazh
+YANDEX_PARAMS = {"jane_evil": ("jane", "evil"), "omazh_evil": ("omazh", "evil")}
 _yandex = {"key": "", "voice": ""}
 
 
@@ -2570,8 +2584,11 @@ async def yandex_ogg(text: str, horror: bool = False, voice: str | None = None, 
     key = key or yandex_key()
     if not key or not text.strip():
         return b""
-    form = {"text": text[:4900], "lang": "ru-RU", "voice": voice or yandex_voice(), "format": "oggopus",
+    name, emotion = YANDEX_PARAMS.get(voice or yandex_voice(), (voice or yandex_voice(), None))
+    form = {"text": text[:4900], "lang": "ru-RU", "voice": name, "format": "oggopus",
             "speed": "0.95" if horror else "1.0"}
+    if emotion:
+        form["emotion"] = emotion
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60), trust_env=True) as s:
             async with s.post(YANDEX_TTS_URL, data=form, headers={"Authorization": f"Api-Key {key}"}) as r:
@@ -2607,10 +2624,11 @@ async def eleven_quota(key: str) -> tuple[int, int] | None:
 
 
 HORROR_SPEAK = (
-    "Ты — движок озвучки ночного радио. Произнеси текст пользователя ДОСЛОВНО, по-русски, как ведущий ночного эфира, "
-    "который читает вслух письмо слушателя: тихо, низким голосом, сдержанно, в обычном темпе живой речи — не "
-    "растягивай слова и не делай долгих пауз; в самых жутких местах — тише, почти шёпотом. Без театральных "
-    "завываний. Ничего не добавляй и не отвечай на текст."
+    "Ты — движок озвучки ночного радио. Произнеси текст пользователя ДОСЛОВНО, по-русски. Голос — рассказчик "
+    "страшилок, которому самому нравится пугать: живой, задорный, с ухмылкой и игрой в голосе, вкрадчивый, местами "
+    "почти весёлый — и от этого жутко. Меняй интонацию: вопросы — с издёвкой, на многоточиях замирай, в самых "
+    "страшных местах переходи на шёпот, последнюю фразу — медленно и тихо, будто стоишь у слушателя за спиной. "
+    "Темп обычный, без растягивания и долгих пауз. Без театральных завываний. Ничего не добавляй и не отвечай на текст."
 )
 
 
@@ -2652,13 +2670,18 @@ HORROR_SYSTEM = (
     "Волгограда, — короткие и по-настоящему страшные истории. Вымысел, но написанный так, что веришь: живой человек "
     "пишет ночью, сбивчиво, от первого лица, с конкретными местами Волгограда, временем и мелочами.\n"
     "Можно: вымышленный маньяк, убийства, пропавшие люди, найденные тела, преследование, кто-то в квартире, страх, что "
-    "следующий — ты. Насилие — через последствия и намёки (нашли куртку, пятно на полу, «его больше никто не видел»), "
-    "без смакования: никаких описаний ран, пыток и расчленения.\n"
+    "следующий — ты; жуткие существа и нечисть — свои, не из фильмов: то, что живёт в балке, в подвале, в воде, в "
+    "последнем вагоне, носит чужие голоса и лица. Насилие — через последствия и намёки (нашли куртку, пятно на полу, "
+    "«его больше никто не видел»), без смакования: никаких описаний ран, пыток и расчленения.\n"
     "Как пугать. Страшно с первой фразы: что-то уже не так. Каждый абзац хуже предыдущего, а последний бьёт по самому "
     "близкому: дом, телефон, кровать, голос родного человека, твоё собственное фото. Страх — от неправильного в "
     "обычном и от того, что он РЯДОМ и знает о тебе то, чего знать не может. Одна мерзкая конкретная деталь, которую не "
     "забыть. Ничего не объясняй до конца. Последняя фраза письма — короткая, как удар, и после неё не должно стать "
-    "легче: «оно ещё здесь», «он уже внутри», «он знает и ваш адрес».\n"
+    "легче: «оно ещё здесь», «он уже внутри», «он знает и ваш адрес». Самое страшное — втянуть слушателя: в конце "
+    "автор просит о чём-то, что слушатель сделает у себя прямо сейчас (не оглядывайтесь; проверьте, закрыта ли у вас "
+    "дверь; если ночью позвонят в домофон и назовут ваше имя — не отвечайте).\n"
+    "Письмо прочтут вслух живым голосом, поэтому пиши под интонацию: короткие фразы, вопросы, обрывы на полуслове, "
+    "многоточия там, где голос должен замереть, прямая речь того, кто пугает.\n"
     "Места — настоящие, но обычные: районы (Тракторный, Спартановка, Красноармейский, Кировский, Дзержинский, "
     "Бекетовка, Ельшанка, «Семь ветров»), балки Мечётки и Царицы, гаражи, частный сектор, общаги, подземные станции "
     "скоростного трамвая, ночные маршрутки, набережная, острова на Волге, шлюзы, элеватор, промзоны, пустыри.\n"
@@ -2707,7 +2730,20 @@ HORROR_MANIAC = [
     "на камере домофона каждую ночь в три часа один и тот же человек молча стоит у двери и смотрит в объектив",
     "сосед по площадке вежливо здоровается, а потом выясняется, что в этой квартире никто не живёт с лета",
 ]
-HORROR_MANIAC_SHARE = 0.6
+HORROR_CREATURES = [
+    "в балке Мечётки по ночам кто-то ходит на четвереньках и зовёт людей голосами их родных",
+    "в подземных станциях скоростного трамвая в последнем вагоне едет кто-то, и с каждой станцией он на сиденье ближе",
+    "старый колодец в частном секторе на Бекетовке отвечает, если сказать в него своё имя, — и запоминает его",
+    "на острове на Волге следы, похожие на человеческие, но слишком длинные, ночью подходят к самым палаткам",
+    "высокая худая фигура на крыше девятиэтажки на Спартановке каждую ночь стоит на этаж ниже — у окон",
+    "в подвале общаги живёт то, что забирает тех, о ком все забыли, — и соседи перестают помнить, что тут кто-то жил",
+    "из Волги ночью выходят те, кто утонул, садятся на скамейки набережной и смотрят на окна домов",
+    "в царицынских подземельях копатели нашли комнату, где углём нарисованы их собственные лица — с закрытыми глазами",
+    "в гаражном кооперативе в одном боксе по ночам горит свет, и оттуда кто-то скребётся и просит открыть",
+    "у человека в зеркале лифта улыбка появляется на секунду раньше, чем у тебя, и однажды он не выходит следом",
+]
+HORROR_MANIAC_SHARE = 0.4      # приём про маньяка
+HORROR_CREATURE_SHARE = 0.35   # про существо; остальное — мистика из HORROR_ENGINES
 
 
 async def horror_story(avoid: list[str]) -> dict:
@@ -2716,12 +2752,18 @@ async def horror_story(avoid: list[str]) -> dict:
     эфире сбой (radio вставит помехи)."""
     import random as _random
 
-    pool = HORROR_MANIAC if _random.random() < HORROR_MANIAC_SHARE else HORROR_ENGINES
+    roll = _random.random()
+    pool = (HORROR_MANIAC if roll < HORROR_MANIAC_SHARE else
+            HORROR_CREATURES if roll < HORROR_MANIAC_SHARE + HORROR_CREATURE_SHARE else HORROR_ENGINES)
     engine = _random.choice([e for e in pool if not any(e[:40] in a for a in avoid)] or pool)
     user = (
         f"Главный приём этой истории: {engine}. Перенеси его в Волгоград (конкретный район, улица, тип дома).\n"
         + (f"Уже были (не повторяй): {'; '.join(avoid)}.\n" if avoid else "")
-        + "Сначала продумай: premise — одна фраза, что не так; escalation — три ступени, каждая страшнее; payoff — "
+        + "Сначала поищи в интернете (1-3 запроса) волгоградские городские легенды, страшилки и жуткие места, о "
+        "которых рассказывают местные, — под этот приём. Возьми из найденного 1-2 настоящие детали места (как "
+        "называется, как выглядит, что о нём говорят), чтобы история звучала как правда. Настоящие преступления, "
+        "настоящих маньяков, жертв и их имена НЕ бери; ссылки и источники в письме не упоминай.\n"
+        "Потом продумай: premise — одна фраза, что не так; escalation — три ступени, каждая страшнее; payoff — "
         "последний удар.\n"
         "Потом напиши: subject — тема письма, как пишут в почте (2-5 слов, без кавычек и точки, например «не "
         "открывайте ему» или «это было в нашем доме»); letter — само письмо, 5-6 коротких абзацев, ВСЕГО 170-210 "
@@ -2733,9 +2775,24 @@ async def horror_story(avoid: list[str]) -> dict:
         '"letter": ["Здравствуйте. ...", "..."], "outro": "", "glitches": [3], "title": ""}'
     )
     asked_shorter = banned = False
+    web = True
     for attempt in range(3):  # не больше одной просьбы «короче» и одной переделки из-за запретной темы
-        out = await _complete(HORROR_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=12000, effort="high")
-        data = _extract_json(out)
+        try:  # с поиском в интернете; не вышло (поиск выключен в организации и т.п.) — пишем без него
+            out = await _complete(HORROR_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=16000, effort="high",
+                                  tools=[WEB_SEARCH] if web else None)
+        except AIUnavailable:
+            raise
+        except Exception as e:
+            if not web:
+                raise
+            logger.warning("horror: поиск в интернете не вышел (%s) — пишу без него", e)
+            web = False
+            out = await _complete(HORROR_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=16000, effort="high")
+        try:
+            data = _extract_json(out)
+        except ValueError:
+            logger.warning("horror: ответ без JSON: %s", out[:200])
+            data = {}
         paras = [scrub(str(p).strip()) for p in data.get("letter") or [] if str(p).strip()]
         outro = scrub(str(data.get("outro", "")).strip())
         whole = " ".join(paras) + " " + outro + " " + str(data.get("title", ""))
@@ -2760,7 +2817,9 @@ async def horror_story(avoid: list[str]) -> dict:
             return {"title": scrub(str(data.get("title", "")).strip())[:60], "subject": subject,
                     "premise": f"{engine[:40]} | {data.get('premise', '')}", "outro": outro,
                     "paragraphs": [p for p in paras if not _garbled(p)][:7], "glitches": glitches[:1]}
-        if banned or not paras:
+        if not paras:  # пустой или битый ответ — ещё раз, если попытки остались
+            continue
+        if banned:
             break
         banned = True
         logger.info("horror: в истории запретная тема — переписываю (попытка %d)", attempt + 1)

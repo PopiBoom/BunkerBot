@@ -200,7 +200,7 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop) -> di
     progress(текст) — что сейчас делаем (правит сообщение «Пишу…», чтобы было видно, что бот жив)."""
     import radio
 
-    await progress("✍️ Пишу письмо в эфир…" if horror else "✍️ Пишу текст эфира…")
+    await progress("🔎 Ищу городские легенды и пишу письмо…" if horror else "✍️ Пишу текст эфира…")
     now = datetime.now(MSK)
     cond = _conditions(await _weather(), now)
     clock = f"{_clock(now).capitalize()}."
