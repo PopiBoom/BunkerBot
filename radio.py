@@ -14,19 +14,41 @@ import numpy as np
 SR = 48000
 
 
-def _band(x: np.ndarray, lo: float, hi: float, sr: int = SR) -> np.ndarray:
-    """Полосовой фильтр через БПФ с мягкими краями (без звона)."""
-    n = len(x)
-    if n == 0:
-        return x
-    f = np.fft.rfftfreq(n, 1 / sr)
-    spec = np.fft.rfft(x)
+def _gain(f: np.ndarray, lo: float, hi: float) -> np.ndarray:
     gain = np.ones_like(f)
     if lo > 0:
         gain *= 1 / (1 + (lo / np.maximum(f, 1e-3)) ** 4)
     if hi > 0:
         gain *= 1 / (1 + (f / hi) ** 4)
-    return np.fft.irfft(spec * gain, n)
+    return gain
+
+
+DIRECT_MAX = 1 << 20   # до ≈ 22 с — фильтр целиком через БПФ (точно и быстро); длиннее — блоками
+FIR_TAPS = 8191        # ядро для блочного фильтра (≈ 0.17 с — хватает и для 30 Гц снизу)
+OLA_FFT = 1 << 17      # размер БПФ блока
+
+
+def _band(x: np.ndarray, lo: float, hi: float, sr: int = SR) -> np.ndarray:
+    """Полосовой фильтр с мягкими краями (без звона). Длинный сигнал — блочной свёрткой (overlap-add): раньше БПФ
+    целиком по 8-минутной страшной истории съедал ~5 ГБ, и сервер убивал бота посреди сборки (07.11)."""
+    n = len(x)
+    if n == 0:
+        return x
+    if n <= DIRECT_MAX:
+        f = np.fft.rfftfreq(n, 1 / sr)
+        return np.fft.irfft(np.fft.rfft(x) * _gain(f, lo, hi), n).astype(np.float32)
+    k = FIR_TAPS
+    half = k // 2
+    h = np.fft.irfft(_gain(np.fft.rfftfreq(OLA_FFT, 1 / sr), lo, hi), OLA_FFT)  # нулевая фаза
+    h = np.roll(h, half)[:k] * np.hanning(k)
+    spec_h = np.fft.rfft(h, OLA_FFT)
+    step = OLA_FFT - k + 1
+    out = np.zeros(n + k - 1, dtype=np.float32)
+    for i in range(0, n, step):
+        seg = x[i:i + step]
+        y = np.fft.irfft(np.fft.rfft(seg, OLA_FFT) * spec_h, OLA_FFT)[:len(seg) + k - 1]
+        out[i:i + len(y)] += y
+    return out[half:half + n]
 
 
 def _resample(pcm: bytes, rate: int) -> np.ndarray:
@@ -107,22 +129,25 @@ def _ident() -> np.ndarray:
     return np.concatenate(out) * 0.5
 
 
-def _drone(n: int, rng: np.random.Generator) -> np.ndarray:
-    """Для страшной истории: низкий гул (две близкие ноты — биения) и редкие глухие удары где-то далеко."""
-    t = np.arange(n) / SR
-    base = rng.uniform(46, 55)
+def _drone(n: int, rng: np.random.Generator, t0: float = 0.0, base: float = 50.0, phase: float = 0.0) -> np.ndarray:
+    """Для страшной истории: низкий гул (две близкие ноты — биения) и редкие глухие удары где-то далеко.
+    t0 — с какой секунды эфира этот кусок: гул считается по абсолютному времени, и куски фона стыкуются без скачков."""
+    t = (np.arange(n, dtype=np.float64) / SR + t0)
     hum = np.sin(2 * np.pi * base * t) + 0.7 * np.sin(2 * np.pi * (base * 1.007) * t) + \
         0.25 * np.sin(2 * np.pi * base * 2.01 * t)
-    hum *= 0.6 + 0.4 * np.sin(2 * np.pi * 0.05 * t + rng.uniform(0, 6))
-    knocks = np.zeros(n)
-    for pos in rng.integers(int(4 * SR), max(int(4 * SR) + 1, n), size=max(1, int(n / SR / 14))):
-        for k in range(rng.integers(1, 4)):  # стук: 1-3 удара
-            p = pos + k * int(0.42 * SR)
-            ln = min(int(0.25 * SR), n - p)
-            if ln > 0:
-                knocks[p:p + ln] += np.sin(2 * np.pi * 70 * np.arange(ln) / SR) * np.exp(-np.arange(ln) / 1800)
-    out = 0.6 * hum / (np.abs(hum).max() or 1) + 0.9 * knocks
-    return out / (np.abs(out).max() or 1)
+    hum *= 0.6 + 0.4 * np.sin(2 * np.pi * 0.05 * t + phase)
+    del t
+    knocks = np.zeros(n, dtype=np.float32)
+    first = max(0, int((4 - t0) * SR))  # первые 4 с эфира — без стука
+    if first < n:
+        for pos in rng.integers(first, n, size=max(1, int(n / SR / 14))):
+            for k in range(rng.integers(1, 4)):  # стук: 1-3 удара
+                p = pos + k * int(0.42 * SR)
+                ln = min(int(0.25 * SR), n - p)
+                if ln > 0:
+                    knocks[p:p + ln] += np.sin(2 * np.pi * 70 * np.arange(ln) / SR) * np.exp(-np.arange(ln) / 1800)
+    out = (0.6 * hum / 1.95 + 0.9 * knocks) / 1.5   # 1.95 — пик гула, 1.5 — пик гула со стуком
+    return out.astype(np.float32)
 
 
 def _glitch(rng: np.random.Generator) -> np.ndarray:
@@ -137,10 +162,43 @@ def _glitch(rng: np.random.Generator) -> np.ndarray:
     return (out / (np.abs(out).max() or 1) * 0.9).astype(np.float32)
 
 
+BED_SEG = 30 * SR   # фон эфира собираем кусками по 30 с…
+BED_XF = SR // 2    # …с перекрытием 0.5 с (плавные стыки) — память не растёт с длиной эфира
+
+
+def _bed_into(mix: np.ndarray, start: int, rng: np.random.Generator, rain: bool, horror: bool) -> None:
+    """Фон под голосом (эфир, ветер или дождь, для страшной истории — гул и стук) прямо в mix[start:]."""
+    total = len(mix) - start
+    base, phase = rng.uniform(46, 55), rng.uniform(0, 6)
+    fin, fout = int(0.8 * SR), int(0.3 * SR)
+    pos = 0
+    while pos < total:
+        n = min(BED_SEG + BED_XF, total - pos)
+        last = pos + n >= total
+        seg = _db(-33) * _static(n, rng)
+        seg += _db(-25 if rain else -24) * _band(_rain(n, rng) if rain else _wind(n, rng), 200, 4200)
+        if horror:  # гул и стук — не сквозь приёмник, «в комнате» у слушателя
+            seg += _db(-24) * _band(_drone(n, rng, (start + pos) / SR, base, phase), 30, 900)
+        seg = seg.astype(np.float32)
+        if pos == 0:
+            seg[:min(fin, n)] *= np.linspace(0, 1, min(fin, n), dtype=np.float32)
+        else:
+            seg[:BED_XF] *= np.linspace(0, 1, BED_XF, dtype=np.float32)
+        if last:
+            seg[-min(fout, n):] *= np.linspace(1, 0, min(fout, n), dtype=np.float32)
+        else:
+            seg[-BED_XF:] *= np.linspace(1, 0, BED_XF, dtype=np.float32)
+        mix[start + pos:start + pos + n] += seg
+        if last:
+            break
+        pos += n - BED_XF
+
+
 def broadcast(voice_chunks: list[bytes], rate: int = 24000, rain: bool = False, seed: int = 0,
               horror: bool = False, glitches: set[int] | None = None) -> np.ndarray:
     """Весь эфир (float32, 48 кГц, моно, пик ≈ -1 дБ). horror — гул, далёкий стук и паузы длиннее; glitches —
-    после каких кусков голоса вместо паузы сбой эфира."""
+    после каких кусков голоса вместо паузы сбой эфира. Всё во float32, фон — кусками: 8 минут эфира — сотни МБ
+    памяти, а не 5 ГБ (раньше на длинной страшной истории сервер убивал бота)."""
     rng = np.random.default_rng(seed)
     pause = np.zeros(int((1.3 if horror else 0.85) * SR), dtype=np.float32)
     glitches = glitches or set()
@@ -150,19 +208,23 @@ def broadcast(voice_chunks: list[bytes], rate: int = 24000, rain: bool = False, 
         if len(v):
             v = v / (np.abs(v).max() or 1)
             parts += ([_glitch(rng) if i - 1 in glitches else pause] if i else []) + [v]
-    voice = np.concatenate(parts) if parts else np.zeros(SR, dtype=np.float32)
+    voice = np.concatenate(parts).astype(np.float32) if parts else np.zeros(SR, dtype=np.float32)
+    del parts
     # «приёмник»: полоса, насыщение, лёгкое плавание громкости
     voice = _band(voice, 280, 3600)
-    voice = np.tanh(voice * 2.2) / np.tanh(2.2)
-    t = np.arange(len(voice)) / SR
-    voice *= 0.94 + 0.06 * np.sin(2 * np.pi * 0.35 * t + rng.uniform(0, 6))
+    np.tanh(voice * 2.2, out=voice)
+    voice /= np.tanh(2.2)
+    ph = rng.uniform(0, 6)
+    for i in range(0, len(voice), 1 << 20):  # кусками — без массивов времени на весь эфир
+        t = np.arange(i, min(i + (1 << 20), len(voice)), dtype=np.float64) / SR
+        voice[i:i + len(t)] *= (0.94 + 0.06 * np.sin(2 * np.pi * 0.35 * t + ph)).astype(np.float32)
 
-    intro_tune = _tuning(1.8, rng)
+    intro_tune = _tuning(1.8, rng).astype(np.float32)
     ident = _ident()
     lead = int(0.4 * SR)                     # тишина эфира между позывным и голосом
     tail = int(1.6 * SR)
     n = len(intro_tune) + len(ident) + lead + len(voice) + tail
-    mix = np.zeros(n, dtype=np.float64)
+    mix = np.zeros(n, dtype=np.float32)
     pos = 0
     mix[pos:pos + len(intro_tune)] += intro_tune
     pos += len(intro_tune) - int(0.5 * SR)   # позывной вступает, пока свист ещё тает
@@ -170,25 +232,22 @@ def broadcast(voice_chunks: list[bytes], rate: int = 24000, rain: bool = False, 
     pos += len(ident) + lead
     vstart = pos
     mix[pos:pos + len(voice)] += voice
+    vlen = len(voice)
+    del voice
     # под голосом — эфир и погода (тоже сквозь приёмник), от позывного до конца
-    bed_n = n - (len(intro_tune) - int(0.5 * SR))
-    bed = _db(-33) * _static(bed_n, rng)
-    bed += _db(-25 if rain else -24) * _band(_rain(bed_n, rng) if rain else _wind(bed_n, rng), 200, 4200)
-    if horror:  # гул и стук — не сквозь приёмник, «в комнате» у слушателя
-        bed += _db(-24) * _band(_drone(bed_n, rng), 30, 900)
-    bed = _fade(bed, 0.8, 0.3)
-    mix[n - bed_n:] += bed
+    _bed_into(mix, len(intro_tune) - int(0.5 * SR), rng, rain, horror)
     # конец: всплеск эфира и щелчок выключения
-    end = vstart + len(voice) + int(0.9 * SR)
+    end = vstart + vlen + int(0.9 * SR)
     burst_n = n - end
     if burst_n > 0:
         burst = _band(rng.standard_normal(burst_n), 500, 6500)
         burst = burst / (np.abs(burst).max() or 1) * np.linspace(0.05, 0.45, burst_n)
-        mix[end:] += burst
+        mix[end:] += burst.astype(np.float32)
         mix[-200:] = 0
     mix = _band(mix, 35 if horror else 120, 7500)
-    mix /= np.abs(mix).max() or 1
-    return (mix * _db(-1)).astype(np.float32)
+    mix /= max(float(mix.max()), float(-mix.min())) or 1
+    mix *= _db(-1)
+    return mix
 
 
 def to_ogg(x: np.ndarray, bitrate: int = 48000) -> bytes:
@@ -200,11 +259,10 @@ def to_ogg(x: np.ndarray, bitrate: int = 48000) -> bytes:
     st = out.add_stream("libopus", rate=SR)
     st.layout = "mono"
     st.bit_rate = bitrate
-    pcm = (np.clip(x, -1, 1) * 32767).astype("<i2")
-    step = 960 * 50  # кусками по секунде
+    step = 960 * 50  # кусками по секунде (и в 16 бит — тоже кусками, без копии всего эфира)
     pts = 0
-    for i in range(0, len(pcm), step):
-        chunk = pcm[i:i + step]
+    for i in range(0, len(x), step):
+        chunk = (np.clip(x[i:i + step], -1, 1) * 32767).astype("<i2")
         frame = av.AudioFrame.from_ndarray(chunk.reshape(1, -1), format="s16", layout="mono")
         frame.sample_rate = SR
         frame.pts = pts
