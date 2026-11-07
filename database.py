@@ -255,6 +255,17 @@ class Database:
                 )
                 """
             )
+            # Фишки 🪙 (блэкджек и другие игры на интерес): общий баланс человека во всех чатах и в канале
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS coins (
+                    user_id    INTEGER PRIMARY KEY,
+                    name       TEXT,
+                    balance    INTEGER NOT NULL,
+                    last_bonus TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
             # Миграция: у «забытых» помним имя и @ник — чтобы админ мог вернуть их через /remember_me @ник
             cur = await db.execute("PRAGMA table_info(roast_optout)")
             ocols = {r[1] for r in await cur.fetchall()}
@@ -462,6 +473,41 @@ class Database:
             cur = await db.execute("SELECT user_id, COUNT(*) FROM quotes WHERE chat_id = ? GROUP BY user_id",
                                    (chat_id,))
             return {int(r[0]): int(r[1]) for r in await cur.fetchall()}
+
+    # --- фишки 🪙 ---
+
+    async def coins_of(self, user_id: int, name: str, start: int) -> int:
+        """Баланс; нового человека заводим со стартовыми фишками."""
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("INSERT OR IGNORE INTO coins (user_id, name, balance) VALUES (?, ?, ?)",
+                             (user_id, name, start))
+            await db.execute("UPDATE coins SET name = ? WHERE user_id = ?", (name, user_id))
+            await db.commit()
+            cur = await db.execute("SELECT balance FROM coins WHERE user_id = ?", (user_id,))
+            return int((await cur.fetchone())[0])
+
+    async def add_coins(self, user_id: int, delta: int) -> int:
+        """Изменить баланс (может уйти в минус только если так посчитали — игры этого не допускают)."""
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("UPDATE coins SET balance = balance + ? WHERE user_id = ?", (delta, user_id))
+            await db.commit()
+            cur = await db.execute("SELECT balance FROM coins WHERE user_id = ?", (user_id,))
+            row = await cur.fetchone()
+            return int(row[0]) if row else 0
+
+    async def coins_bonus(self, user_id: int, day: str, amount: int, below: int) -> int:
+        """Пособие на мели: раз в день, если баланс меньше below. Сколько выдали (0 — не положено)."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "UPDATE coins SET balance = balance + ?, last_bonus = ? WHERE user_id = ? AND balance < ? "
+                "AND last_bonus != ?", (amount, day, user_id, below, day))
+            await db.commit()
+            return amount if cur.rowcount else 0
+
+    async def coins_top(self, limit: int = 10) -> list[tuple]:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT name, balance FROM coins ORDER BY balance DESC LIMIT ?", (limit,))
+            return list(await cur.fetchall())
 
     # --- коллекционные карточки ---
 

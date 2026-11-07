@@ -119,6 +119,13 @@ def _flag_needed() -> bool:
                                g.chat_id, MAX_GAME_AGE // 3600)
     for key in set(_first_seen) - seen:
         _first_seen.pop(key, None)
+    try:  # открыт стол блэкджека — перезапуск оборвал бы раунд (простой 30 мин — стол закрывается сам)
+        from .blackjack.game import running as bj_running
+
+        if bj_running():
+            need = True
+    except Exception:
+        pass
     try:  # идёт суд чата (≈5 мин) — перезапуск оборвал бы заседание
         from handlers import court
 
