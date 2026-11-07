@@ -151,6 +151,12 @@ async def _set_eleven(message: Message, key: str, db: Database) -> None:
     quota = await ai.eleven_quota(key)
     if quota is None:  # ключ с урезанными правами не видит подписку — проверим коротким словом озвучки
         if not await ai.eleven_speak("Проверка.", key=key):
+            if ai.eleven_geo_blocked():
+                await db.set_setting("eleven_key", key)
+                ai.set_eleven_key(key)
+                await message.answer("⚠️ Ключ сохранил, но ElevenLabs не пускает этот сервер по региону "
+                                     "(geo-restriction) - эфиры пока запасным голосом (gpt-audio).")
+                return
             await message.answer("❌ ElevenLabs не принял ключ - проверь, что он скопирован целиком и что у ключа "
                                  "есть доступ к Text to Speech.")
             return

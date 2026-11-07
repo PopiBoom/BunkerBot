@@ -20,6 +20,7 @@ import logging
 import os
 import random
 import re
+import time
 from typing import Awaitable, Callable
 
 from anthropic import AsyncAnthropic
@@ -2428,6 +2429,14 @@ ELEVEN_MODEL = os.getenv("ELEVEN_MODEL", "").strip() or "eleven_multilingual_v2"
 ELEVEN_VOICE = os.getenv("ELEVEN_VOICE", "").strip() or "nPczCjzI2devNBz1zQrb"  # Brian — низкий голос рассказчика
 NIGHT_SPEAK_MODEL = os.getenv("AI_NIGHT_SPEAK_MODEL", "").strip() or "openai/gpt-audio"
 _eleven_key = ""
+# ElevenLabs отвечает серверу редиректом на geo-restriction.elevenlabs.io — не пускает его по региону (07.11: сервер
+# в DE по ipinfo, но ElevenLabs считает адрес запрещённым). Тогда не стучимся каждый абзац, а ждём ELEVEN_GEO_RETRY.
+ELEVEN_GEO_RETRY = 6 * 3600
+_eleven_geo_until = 0.0
+
+
+def eleven_geo_blocked() -> bool:
+    return time.time() < _eleven_geo_until
 
 
 def set_eleven_key(key: str) -> None:
@@ -2493,6 +2502,7 @@ async def eleven_speak(text: str, horror: bool = False, voice: str | None = None
     """ElevenLabs: PCM 16 бит, 24 кГц, моно. b"" — нет ключа или сбой."""
     import aiohttp
 
+    global _eleven_geo_until
     key = key or eleven_key()
     if not key or not text.strip():
         return b""
@@ -2502,7 +2512,16 @@ async def eleven_speak(text: str, horror: bool = False, voice: str | None = None
     url = f"{ELEVEN_URL}/text-to-speech/{voice or ELEVEN_VOICE}?output_format=pcm_24000"
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120), trust_env=True) as s:
-            async with s.post(url, json=body, headers={"xi-api-key": key}) as r:
+            async with s.post(url, json=body, headers={"xi-api-key": key}, allow_redirects=False) as r:
+                if r.status in (301, 302, 303, 307, 308):
+                    where = r.headers.get("location") or ""
+                    if "geo-restriction" in where:
+                        _eleven_geo_until = time.time() + ELEVEN_GEO_RETRY
+                        logger.warning("eleven: ElevenLabs не пускает этот сервер по региону (%s) — голос запасной, "
+                                       "снова попробую через %d ч", where, ELEVEN_GEO_RETRY // 3600)
+                    else:
+                        logger.warning("eleven: редирект %s на %s", r.status, where)
+                    return b""
                 if r.status != 200:
                     logger.warning("eleven: %s: %s", r.status, (await r.text())[:300])
                     return b""
@@ -2548,7 +2567,7 @@ async def narrate(text: str, horror: bool = False) -> bytes:
     system = HORROR_SPEAK if horror else NIGHT_SPEAK
     voice = os.getenv("AI_NIGHT_VOICE", "").strip() or None
     tries = []
-    if eleven_key():
+    if eleven_key() and not eleven_geo_blocked():  # регион не пускает — сразу запасной голос, без лишних запросов
         tries.append(("ElevenLabs", lambda: eleven_speak(text, horror=horror)))
     tries += [(NIGHT_SPEAK_MODEL, lambda: speak(text, system=system, voice=voice, timeout=120, model=NIGHT_SPEAK_MODEL)),
               (SPEAK_MODEL, lambda: speak(text, system=system, voice=voice, timeout=120))]
