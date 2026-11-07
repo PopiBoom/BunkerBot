@@ -34,11 +34,11 @@ FONT = Path(__file__).resolve().parents[2] / "assets" / "fonts" / "DejaVuSans.tt
 SIZE = 100
 
 
-def draw(symbol: str) -> bytes:
-    """PNG 100×100 с прозрачным фоном: белая фигура с тёмной обводкой или чёрная со светлой."""
+def piece_image(symbol: str, size: int = SIZE):
+    """Картинка фигуры size×size с прозрачным фоном: белая с тёмной обводкой или чёрная со светлой."""
     from PIL import Image, ImageDraw, ImageFont
 
-    big = SIZE * 4  # рисуем крупно и уменьшаем — края гладкие
+    big = size * 4  # рисуем крупно и уменьшаем — края гладкие
     white = symbol.isupper()
     glyph = GLYPH[symbol.upper()]
     font = ImageFont.truetype(str(FONT), int(big * 0.9))
@@ -51,8 +51,13 @@ def draw(symbol: str) -> bytes:
     y = (big - (box[3] - box[1])) / 2 - box[1]
     d.text((x, y), glyph, font=font, fill=(255, 255, 255, 255) if white else (28, 28, 28, 255),
            stroke_width=stroke, stroke_fill=(25, 25, 25, 255) if white else (235, 235, 235, 255))
+    return im.resize((size, size), Image.LANCZOS)
+
+
+def draw(symbol: str) -> bytes:
+    """PNG 100×100 для набора значков."""
     out = io.BytesIO()
-    im.resize((SIZE, SIZE), Image.LANCZOS).save(out, "PNG", optimize=True)
+    piece_image(symbol).save(out, "PNG", optimize=True)
     return out.getvalue()
 
 
