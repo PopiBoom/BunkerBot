@@ -29,6 +29,21 @@ class Config:
         return user_id in self.admin_ids
 
 
+def proxy_all() -> bool:
+    """BOT_PROXY_ALL=1 — через BOT_PROXY идёт ВЕСЬ бот (Claude, OpenRouter, голоса, погода), а не только Telegram."""
+    return os.getenv("BOT_PROXY_ALL", "").strip().lower() in ("1", "true", "yes", "да", "on")
+
+
+def route_all_via(proxy: str) -> None:
+    """Все HTTP-клиенты бота (SDK Claude на httpx, aiohttp с trust_env) берут прокси из переменных окружения."""
+    if not proxy.startswith(("http://", "https://")):
+        # socks5 понимает только Telegram (aiohttp_socks); остальным клиентам нужен HTTP-прокси
+        raise RuntimeError("BOT_PROXY_ALL работает с HTTP-прокси (http://логин:пароль@адрес:порт), не с socks5://")
+    for var in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
+        os.environ[var] = proxy
+    os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
+
+
 def load_config() -> Config:
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
@@ -48,6 +63,8 @@ def load_config() -> Config:
 
     db_path = os.getenv("DB_PATH", "bot.db").strip() or "bot.db"
     proxy = os.getenv("BOT_PROXY", "").strip() or None
+    if proxy and proxy_all():
+        route_all_via(proxy)
 
     return Config(
         token=token,

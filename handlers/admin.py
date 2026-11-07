@@ -171,6 +171,33 @@ async def _set_eleven(message: Message, key: str, db: Database) -> None:
                          "Страшная история - примерно 3 000 символов. Проверь: /horror")
 
 
+@router.message(Command("ip"))
+async def cmd_ip(message: Message, config: Config) -> None:
+    """Через какую страну бот выходит в интернет (проверка прокси: BOT_PROXY и BOT_PROXY_ALL)."""
+    import os
+
+    import aiohttp
+
+    if message.from_user is None or not _is_admin(message.from_user.id, config):
+        await message.answer(texts.ADMIN_ONLY)
+        return
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15), trust_env=True) as s:
+            async with s.get("https://ipinfo.io/json") as r:
+                info = await r.json(content_type=None)
+    except Exception as e:
+        await message.answer(f"🌍 Не смог узнать адрес: {e}")
+        return
+    via_all = bool(os.getenv("HTTPS_PROXY"))
+    await message.answer(
+        f"🌍 <b>Бот выходит в интернет</b>\n\n"
+        f"IP: <code>{info.get('ip', '?')}</code>\n"
+        f"Страна: <b>{info.get('country', '?')}</b>, {info.get('city', '?')}\n"
+        f"Провайдер: {info.get('org', '?')}\n\n"
+        f"Telegram: {'через прокси' if config.proxy else 'напрямую'}\n"
+        f"Claude, голоса и остальное: {'через прокси' if via_all else 'напрямую'}")
+
+
 YANDEX_SAMPLE = "Сейчас три часа сорок минут. На почту эфира пришло письмо. Читаю без изменений."
 
 
