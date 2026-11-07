@@ -26,7 +26,8 @@ from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InlineQuery,
-                           InlineQueryResultArticle, InlineQueryResultCachedGif, InputTextMessageContent, Message,
+                           InlineQueryResultArticle, InlineQueryResultCachedGif, InlineQueryResultCachedMpeg4Gif,
+                           InputTextMessageContent, Message,
                            ReplyParameters)
 
 from config import Config
@@ -487,11 +488,18 @@ async def cb_join(call: CallbackQuery, bot: Bot, db: Database) -> None:
 # ---------- повтор партии гифкой ----------
 
 
-async def _gif(st: dict) -> bytes:
+async def _gif(st: dict) -> BufferedInputFile:
+    """Повтор партии: видео MP4 (Telegram показывает как гифку). Гифку Telegram сам перегонял в видео и при этом
+    терял ходы (владелец: «пропускает некоторые ходы»), поэтому собираем видео сами; не вышло — гифка."""
     from . import replay
 
     minutes = round((time.time() - st["start"]) / 60) if st.get("start") else None
-    return await asyncio.to_thread(replay.replay_gif, st["moves"], st["w"][1], st["b"][1], st["over"], minutes)
+    args = (st["moves"], st["w"][1], st["b"][1], st["over"], minutes)
+    try:
+        return BufferedInputFile(await asyncio.to_thread(replay.replay_video, *args), "chess.mp4")
+    except Exception as e:  # noqa: BLE001 — нет кодека и т.п.: гифка лучше, чем ничего
+        logger.warning("chess: видео повтора не собралось (%s) — шлю гифку", e)
+        return BufferedInputFile(await asyncio.to_thread(replay.replay_gif, *args), "chess.gif")
 
 
 async def _finished(bot: Bot, db: Database, call: CallbackQuery, gid: str, st: dict) -> None:
@@ -514,8 +522,7 @@ async def _finished(bot: Bot, db: Database, call: CallbackQuery, gid: str, st: d
 
     async def send() -> None:
         try:
-            gif = await _gif(done)
-            await bot.send_animation(chat_id, BufferedInputFile(gif, "chess.gif"),
+            await bot.send_animation(chat_id, await _gif(done),
                                      caption=f"🎞 Повтор партии: {html.escape(st['w'][1])} - {html.escape(st['b'][1])}",
                                      reply_parameters=ReplyParameters(message_id=msg_id,
                                                                       allow_sending_without_reply=True))
@@ -541,8 +548,8 @@ async def _cache_gif(bot: Bot, db: Database, gid: str, done: dict) -> str | None
     if not owner:
         return None
     try:
-        msg = await bot.send_animation(owner, BufferedInputFile(await _gif(done), "chess.gif"),
-                                       disable_notification=True)
+        media = await _gif(done)
+        msg = await bot.send_animation(owner, media, disable_notification=True)
         fid = msg.animation.file_id if msg.animation else msg.document.file_id
         try:
             await bot.delete_message(owner, msg.message_id)
@@ -558,6 +565,7 @@ async def _cache_gif(bot: Bot, db: Database, gid: str, done: dict) -> str | None
         cur = {}
     if cur.get("moves") == done["moves"]:  # пока рисовали, там не доиграли новую партию (реванш)
         cur["gif"] = fid
+        cur["gif_kind"] = "mp4" if media.filename.endswith(".mp4") else "gif"
         await db.set_setting(DONE + gid, json.dumps(cur, ensure_ascii=False))
     return fid
 
@@ -587,8 +595,16 @@ async def _inline_replay(query: InlineQuery, bot: Bot, db: Database, config: Con
     if not fid:
         await query.answer([], cache_time=1, is_personal=True)
         return
-    res = InlineQueryResultCachedGif(id="replay", gif_file_id=fid, title="🎞 Повтор партии",
-                                     caption=f"🎞 Повтор партии: {html.escape(done['w'][1])} - {html.escape(done['b'][1])}")
+    caption = f"🎞 Повтор партии: {html.escape(done['w'][1])} - {html.escape(done['b'][1])}"
+    raw = await db.get_setting(DONE + gid, "")
+    try:
+        kind = (json.loads(raw) if raw else {}).get("gif_kind", "gif")
+    except ValueError:
+        kind = "gif"
+    if kind == "mp4":  # повтор видео — свой тип результата (у старых партий осталась гифка)
+        res = InlineQueryResultCachedMpeg4Gif(id="replay", mpeg4_file_id=fid, title="🎞 Повтор партии", caption=caption)
+    else:
+        res = InlineQueryResultCachedGif(id="replay", gif_file_id=fid, title="🎞 Повтор партии", caption=caption)
     await query.answer([res], cache_time=1, is_personal=True)
 
 

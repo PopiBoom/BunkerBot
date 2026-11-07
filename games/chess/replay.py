@@ -387,8 +387,8 @@ def _verdict(board, result: str) -> tuple[str, str]:
     return result, f"{moves} {word}"
 
 
-def replay_gif(moves: list[str], white: str, black: str, result: str, minutes: int | None = None) -> bytes:
-    """Гифка всей партии: стартовая позиция, каждый полуход, в конце — итог."""
+def _render(moves: list[str], white: str, black: str, result: str, minutes: int | None = None):
+    """Кадры повтора и сколько каждый держится (мс): старт, каждый полуход, итог."""
     import chess
 
     board = chess.Board()
@@ -420,8 +420,43 @@ def replay_gif(moves: list[str], white: str, black: str, result: str, minutes: i
     frames.append(_frame(board, white, black, last=board.peek() if plies else None, caption=title, sub=sub,
                          progress=1.0, accent=True, kind=notes[-1][0] if notes else None))
     durations.append(4000)
+    return frames, durations
+
+
+def replay_gif(moves: list[str], white: str, black: str, result: str, minutes: int | None = None) -> bytes:
+    """Гифка всей партии (запасной вариант, если видео не собралось)."""
+    frames, durations = _render(moves, white, black, result, minutes)
     out = io.BytesIO()
     pal = [f.convert("RGB").quantize(colors=128, dither=0) for f in frames]
     pal[0].save(out, "GIF", save_all=True, append_images=pal[1:], duration=durations, loop=0, optimize=True,
                 disposal=1)
     return out.getvalue()
+
+
+VIDEO_FPS = 10
+
+
+def replay_video(moves: list[str], white: str, black: str, result: str, minutes: int | None = None) -> bytes:
+    """Повтор партии видео без звука (MP4, H.264) — Telegram показывает его как гифку. Гифку Telegram сам
+    перегоняет в видео, и при этом ходы пропадали (владелец: «пропускает некоторые ходы»), — собираем видео сами:
+    постоянные 10 кадров/с, каждый ход повторяется столько кадров, сколько должен висеть."""
+    import av
+
+    frames, durations = _render(moves, white, black, result, minutes)
+    buf = io.BytesIO()
+    out = av.open(buf, "w", format="mp4")
+    vs = out.add_stream("libx264", rate=VIDEO_FPS)
+    vs.width, vs.height, vs.pix_fmt = W, H, "yuv420p"
+    vs.options = {"preset": "veryfast", "crf": "24", "tune": "stillimage"}
+    pts = 0
+    for img, ms in zip(frames, durations, strict=True):
+        vf = av.VideoFrame.from_image(img.convert("RGB")).reformat(format="yuv420p")
+        for _ in range(max(1, round(ms * VIDEO_FPS / 1000))):
+            vf.pts = pts
+            pts += 1
+            for packet in vs.encode(vf):
+                out.mux(packet)
+    for packet in vs.encode():
+        out.mux(packet)
+    out.close()
+    return buf.getvalue()
