@@ -199,7 +199,7 @@ def _caption(horror: bool, n: int, topic: str, now: datetime, weather: str) -> s
         subject = (topic or "без темы").strip()
         subject = subject[:1].upper() + subject[1:]
         return (f"🩸 <b>{ai.HORROR_RUBRIC.upper()}</b> · выпуск №{n}\n"
-                f"✉️ Письмо: <i>«{html.escape(subject)}»</i>\n\n"
+                f"✉️ <i>«{html.escape(subject)}»</i>\n\n"
                 f"📻 Радио Волгограда · {when}")
     return f"🎙 <b>НОЧНОЙ ЭФИР</b> · №{n}\n\n🕯 {when}"
 
