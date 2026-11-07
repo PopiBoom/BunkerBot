@@ -1962,6 +1962,8 @@ async def background(bot: Bot, db: Database) -> None:
                     first = await db.get_setting(night.FIRST_KEY, "")
                     if first != "1" or (await db.get_setting(night.HORROR_FIRST_KEY, "")) != "1":
                         _spawn(night.first_tick(bot, db))  # минута-две (ИИ + озвучка) — фон не ждёт
+                    if not night.busy() and await db.get_setting(night.PENDING_KEY, ""):
+                        _spawn(night.resume_tick(bot, db))  # перезапуск посреди сборки эфира — собрать заново
                 except Exception as e:
                     logger.warning("night first tick failed: %s", e)
                 # Сериал про чат — раз в день вечером

@@ -2623,8 +2623,9 @@ async def narrate(text: str, horror: bool = False) -> bytes:
         tries.append(("ElevenLabs", lambda: eleven_speak(text, horror=horror)))
     if yandex_key():
         tries.append((f"Яндекс ({yandex_voice()})", lambda: yandex_speak(text, horror=horror)))
-    tries += [(NIGHT_SPEAK_MODEL, lambda: speak(text, system=system, voice=voice, timeout=120, model=NIGHT_SPEAK_MODEL)),
-              (SPEAK_MODEL, lambda: speak(text, system=system, voice=voice, timeout=120))]
+    # абзац у gpt-audio — секунд 6-10; 60 с на попытку, чтобы зависший сервис не растягивал историю на полчаса
+    tries += [(NIGHT_SPEAK_MODEL, lambda: speak(text, system=system, voice=voice, timeout=60, model=NIGHT_SPEAK_MODEL)),
+              (SPEAK_MODEL, lambda: speak(text, system=system, voice=voice, timeout=60))]
     for name, call in tries:
         pcm = to_pcm24(await call())
         if not pcm:

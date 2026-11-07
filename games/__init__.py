@@ -126,6 +126,13 @@ def _flag_needed() -> bool:
             need = True
     except Exception:
         pass
+    try:  # собирается ночной эфир / страшная история (минуты три) — перезапуск молча оборвал бы сборку
+        from handlers import night
+
+        if night.busy():
+            need = True
+    except Exception:
+        pass
     try:  # идёт суд чата (≈5 мин) — перезапуск оборвал бы заседание
         from handlers import court
 
