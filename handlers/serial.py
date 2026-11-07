@@ -32,7 +32,7 @@ ON_KEY = "serial_on"
 STATE_KEY = "serial:"
 HOUR = 20
 MIN_TODAY = 30
-CAST_MAX = 6
+CAST_MAX = 5          # кандидаты в герои; в серию ИИ берёт 2-4 (все сразу — была каша)
 
 
 def _father_name() -> str:
@@ -91,7 +91,7 @@ async def episode(bot: Bot, db: Database, chat_id: int) -> bool:
     vote = await _poll_choice(bot, chat_id, st)
     dossiers = await db.chat_dossiers(chat_id)
     n = st["n"] + 1
-    msgs = [{"id": r[0], "name": r[2] or "Аноним", "text": r[3]} for r in people[-120:]]
+    msgs = [{"id": r[0], "name": r[2] or "Аноним", "text": r[3]} for r in people[-60:]]  # сырьё, не сценарий
     ep = await ai.serial_episode(st["season"], n, st["episodes"], vote, msgs, dossiers, cast)
     if not ep["text"] or not ep["title"]:
         return False
@@ -117,7 +117,7 @@ async def episode(bot: Bot, db: Database, chat_id: int) -> bool:
     st["poll"] = poll_id
     st["day"] = now.strftime("%Y-%m-%d")
     await db.set_setting(STATE_KEY + str(chat_id), json.dumps(st, ensure_ascii=False))
-    logger.info("сериал %s: серия %s «%s»", chat_id, n, ep["title"])
+    logger.info("сериал %s: серия %s «%s» - %s", chat_id, n, ep["title"], ep.get("premise", ""))
     return True
 
 
