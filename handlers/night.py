@@ -237,9 +237,16 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop) -> di
                                    "проверьте, закрыта ли у вас дверь. Всем до новых встреч, с вами было радио "
                                    "Волгограда!")
         intro, outro = " ".join(intro.split()), " ".join(outro.split())
-        paragraphs = [intro] + story["paragraphs"] + [outro]
-        styles = ["host"] + ["letter"] * len(story["paragraphs"]) + ["host"]
-        glitches = {g + 1 for g in story["glitches"]}  # +1: перед письмом — вступление ведущего
+        paragraphs = [intro] + story["paragraphs"] + [outro]  # для текста черновика
+        # Озвучка крупными кусками (владелец: «однотонно и скучно» — каждый абзац отдельно звучал как диктор с
+        # нуля): вступление, письмо в две части (между ними — сбой эфира), концовка.
+        letter = story["paragraphs"]
+        cut = (story["glitches"][0] + 1) if story["glitches"] else max(1, len(letter) // 2)
+        cut = min(max(1, cut), max(1, len(letter) - 1))
+        parts = [letter[:cut], letter[cut:]] if len(letter) > 1 else [letter]
+        chunks = [intro] + ["\n\n".join(p) for p in parts] + [outro]
+        styles = ["host"] + ["letter"] * len(parts) + ["host"]
+        glitches = {1} if len(parts) > 1 else set()  # сбой — после первой части письма
         await db.set_setting(HORROR_KEY, json.dumps((used + [story["premise"][:160]])[-30:], ensure_ascii=False))
     else:
         try:
@@ -251,20 +258,23 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop) -> di
         if not body:
             raise RuntimeError("ИИ не написал эфир")
         paragraphs = [f"{clock} {cond['line']}".strip()] + body + [f"Это был ночной эфир. {cond['end']}".strip()]
-        styles = ["night"] * len(paragraphs)
+        chunks, styles = paragraphs, ["night"] * len(paragraphs)
         await db.set_setting(TOPICS_KEY, json.dumps((used + [topic])[-30:], ensure_ascii=False))
     n = int(await db.get_setting(HORROR_COUNT_KEY if horror else COUNT_KEY, "0") or 0) + 1
     caption = _caption(horror, n, topic, now, cond["caption"])
     voice = []
-    for i, (p, style) in enumerate(zip(paragraphs, styles, strict=True), 1):
-        await progress(f"🎙 Озвучиваю: {i} из {len(paragraphs)}" + (f" · {ai.last_voice[0]}" if ai.last_voice[0] else ""))
+    for i, (p, style) in enumerate(zip(chunks, styles, strict=True), 1):
+        await progress(f"🎙 Озвучиваю: {i} из {len(chunks)}" + (f" · {ai.last_voice[0]}" if ai.last_voice[0] else ""))
         pcm = await ai.narrate(p, horror=horror, host=style == "host")
         if not pcm:
             return {"ogg": None, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic}
         voice.append(pcm)
     await progress("🎚 Свожу эфир…")
-    mix = await asyncio.to_thread(radio.broadcast, voice, ai.SPEAK_RATE, cond["rain"], int(time.time()), horror,
-                                  glitches)
+    if horror:  # страшная рубрика — как настоящий FM-эфир из студии
+        mix = await asyncio.to_thread(radio.studio, voice, styles, ai.SPEAK_RATE, int(time.time()), glitches)
+    else:       # ночной эфир — «сквозь приёмник», как было
+        mix = await asyncio.to_thread(radio.broadcast, voice, ai.SPEAK_RATE, cond["rain"], int(time.time()), False,
+                                      glitches)
     ogg = await asyncio.to_thread(radio.to_ogg, mix)
     logger.info("ночной эфир №%s%s: «%s», %.0f сек, голос %s", n, " (страшная история)" if horror else "", topic,
                 len(mix) / radio.SR, ai.last_voice[0] or "?")

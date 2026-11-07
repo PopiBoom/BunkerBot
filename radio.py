@@ -273,3 +273,119 @@ def to_ogg(x: np.ndarray, bitrate: int = 48000) -> bytes:
         out.mux(packet)
     out.close()
     return buf.getvalue()
+
+
+# ---------- «студия»: страшная рубрика «радио Волгограда» звучит как настоящий FM-эфир ----------
+# Владелец: «почему голос такой однотонный и скучный? хочу, чтобы как по-настоящему». Прежняя обработка «под
+# приёмник» (полоса 280-3600 Гц, насыщение, выравнивание каждого абзаца по пику) стирала интонацию: шёпот становился
+# таким же громким, как крик. Здесь — полный голос с мягкой компрессией, джингл станции, гул и стук только под
+# письмом, общий уровень на весь голос (тихое остаётся тихим).
+
+def _compress(x: np.ndarray, thresh_db: float = -22.0, ratio: float = 2.5, frame: int = SR // 100) -> np.ndarray:
+    """Мягкий компрессор по уровню 10-мс кадров. Считает и применяет кусками — без копий всего голоса."""
+    n = len(x)
+    if n < frame * 4:
+        return x
+    m = n // frame
+    level = np.empty(m)
+    step = 50_000  # кадров за раз (~8 мин звука — 10 проходов)
+    for i in range(0, m, step):
+        k = min(step, m - i)
+        blk = x[i * frame:(i + k) * frame].reshape(k, frame)
+        level[i:i + k] = 10 * np.log10(np.mean(np.square(blk, dtype=np.float64), axis=1) + 1e-12)
+    gain = np.where(level > thresh_db, (thresh_db + (level - thresh_db) / ratio) - level, 0.0)
+    w = 7  # сгладить ~70 мс, чтобы не «качало»
+    gain = np.convolve(np.pad(gain, (w // 2, w // 2), mode="edge"), np.ones(w) / w, mode="valid")
+    lin = 10 ** (gain / 20)
+    centers = np.arange(m) * frame + frame / 2
+    out = np.empty_like(x)
+    for a in range(0, n, 1 << 20):
+        b = min(a + (1 << 20), n)
+        out[a:b] = x[a:b] * np.interp(np.arange(a, b), centers, lin).astype(np.float32)
+    return out
+
+
+def _bell(f: float, ln: float, amp: float = 1.0) -> np.ndarray:
+    t = np.arange(int(ln * SR)) / SR
+    tone = (np.sin(2 * np.pi * f * t) + 0.35 * np.sin(2 * np.pi * f * 2.0 * t) * np.exp(-t * 6)
+            + 0.18 * np.sin(2 * np.pi * f * 2.76 * t) * np.exp(-t * 9))
+    attack = np.minimum(1, t / 0.004)
+    return (tone * attack * np.exp(-t * 2.6) * amp).astype(np.float32)
+
+
+def _jingle(up: bool = True) -> np.ndarray:
+    """Позывной станции: колокольчики по ля-минору (вверх — в начале, вниз — в конце) и мягкий низ."""
+    notes = [440.0, 523.25, 659.25, 880.0]
+    if not up:
+        notes = notes[::-1][:3]
+    step = int(0.17 * SR)
+    out = np.zeros(step * len(notes) + int(1.6 * SR), dtype=np.float32)
+    for i, f in enumerate(notes):
+        b = _bell(f, 1.6, 0.9 if i < len(notes) - 1 else 1.1)
+        out[i * step:i * step + len(b)] += b
+    t = np.arange(int(0.9 * SR)) / SR
+    sub = (np.sin(2 * np.pi * 55 * t) * np.exp(-t * 4)).astype(np.float32) * 0.6  # мягкий удар снизу
+    out[:len(sub)] += sub
+    return out / (np.abs(out).max() or 1)
+
+
+def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed: int = 0,
+           glitches: set[int] | None = None) -> np.ndarray:
+    """Страшная рубрика как настоящий эфир (float32, 48 кГц, пик ≈ -1 дБ). styles — "host" / "letter" для каждого
+    куска голоса; под кусками письма — гул и далёкий стук, под ведущим — чисто; glitches — после каких кусков
+    вместо паузы сбой эфира."""
+    rng = np.random.default_rng(seed)
+    glitches = glitches or set()
+    pieces, spans, pos = [], [], 0          # spans: (начало, конец, стиль) кусков голоса внутри дорожки голоса
+    for i, pcm in enumerate(voice_chunks):
+        v = _resample(pcm, rate)
+        if not len(v):
+            continue
+        if pieces:
+            prev = styles[i - 1] if i - 1 < len(styles) else "host"
+            gap = (_glitch(rng) * 0.5 if i - 1 in glitches else
+                   np.zeros(int((1.0 if prev != styles[i] else 0.7) * SR), dtype=np.float32))
+            pieces.append(gap)
+            pos += len(gap)
+        pieces.append(v)
+        spans.append((pos, pos + len(v), styles[i] if i < len(styles) else "host"))
+        pos += len(v)
+    voice = np.concatenate(pieces).astype(np.float32) if pieces else np.zeros(SR, dtype=np.float32)
+    del pieces
+    voice = _band(voice, 70, 11000)                         # полный голос, без «приёмника»
+    voice /= max(float(voice.max()), float(-voice.min())) or 1   # один уровень на весь голос: тихое — тихо
+    voice = _compress(voice, -22, 2.5)
+    voice /= max(float(voice.max()), float(-voice.min())) or 1
+
+    head, tail = _jingle(True), _jingle(False)
+    lead = int(0.25 * SR)
+    start = len(head) - int(0.9 * SR) + lead                 # голос вступает, пока джингл ещё звенит
+    n = start + len(voice) + int(0.6 * SR) + len(tail)
+    mix = np.zeros(n, dtype=np.float32)
+    mix[:len(head)] += head * _db(-6)
+    mix[start:start + len(voice)] += voice
+    end = start + len(voice) + int(0.6 * SR)
+    mix[end:end + len(tail)] += tail * _db(-8)
+    # гул и стук — только под письмом, с плавным входом и выходом
+    letters = [(a, b) for a, b, st in spans if st == "letter"]
+    if letters:
+        a, b = start + letters[0][0], start + letters[-1][1]
+        ln = b - a
+        base, phase = rng.uniform(46, 55), rng.uniform(0, 6)
+        bed = np.zeros(ln, dtype=np.float32)
+        p0 = 0
+        while p0 < ln:  # кусками по 30 с — память не растёт с длиной
+            seg_n = min(BED_SEG, ln - p0)
+            bed[p0:p0 + seg_n] = _band(_drone(seg_n, rng, p0 / SR, base, phase), 30, 900)
+            p0 += seg_n
+        fi, fo = min(int(2.0 * SR), ln // 3), min(int(1.5 * SR), ln // 3)
+        bed[:fi] *= np.linspace(0, 1, fi, dtype=np.float32)
+        bed[-fo:] *= np.linspace(1, 0, fo, dtype=np.float32)
+        mix[a:b] += bed * _db(-23)
+    for i in range(0, n, BED_SEG):  # еле слышный «воздух» студии — чтобы не было цифровой тишины
+        seg = mix[i:i + BED_SEG]
+        seg += rng.standard_normal(len(seg), dtype=np.float32) * np.float32(_db(-66))
+    mix = _band(mix, 30, 15000)
+    mix /= max(float(mix.max()), float(-mix.min())) or 1
+    mix *= _db(-1)
+    return mix

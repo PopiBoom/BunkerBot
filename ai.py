@@ -2356,7 +2356,8 @@ async def speak(text: str, system: str | None = None, voice: str | None = None, 
         "stream": True,  # звук OpenRouter отдаёт только потоком
         "usage": {"include": True},
         "messages": [{"role": "system", "content": system or SPEAK_SYSTEM},
-                     {"role": "user", "content": f"Произнеси дословно: {text}"}],
+                     {"role": "user", "content": (f"Сыграй голосом по указаниям выше, слово в слово:\n\n{text}"
+                                                  if system else f"Произнеси дословно: {text}")}],
     }
     headers = {"Authorization": f"Bearer {key}", "X-Title": "BunkerBot"}
     audio, said, usage, pieces = bytearray(), [], {}, []
@@ -2626,19 +2627,23 @@ async def eleven_quota(key: str) -> tuple[int, int] | None:
 
 
 HORROR_SPEAK = (
-    "Ты — движок озвучки ночного радио. Произнеси текст пользователя ДОСЛОВНО, по-русски. Голос — рассказчик "
-    "страшилок, которому самому нравится пугать: живой, задорный, с ухмылкой и игрой в голосе, вкрадчивый, местами "
-    "почти весёлый — и от этого жутко. Меняй интонацию: вопросы — с издёвкой, на многоточиях замирай, в самых "
-    "страшных местах переходи на шёпот, последнюю фразу — медленно и тихо, будто стоишь у слушателя за спиной. "
-    "Темп обычный, без растягивания и долгих пауз. Без театральных завываний. Ничего не добавляй и не отвечай на текст."
+    "Ты — актёр озвучки. Произнеси текст пользователя ДОСЛОВНО, по-русски, и СЫГРАЙ его: ты ведущий ночного радио, "
+    "который читает вслух письмо слушателя, и тебе самому от него не по себе. Начни почти обычным голосом, с лёгкой "
+    "ухмылкой, — и с каждым абзацем всё тише и напряжённее. Живые перепады: где страшно — замедляйся и переходи на "
+    "шёпот, на многоточиях замирай, на вопросах — с тревогой, прямую речь того, кто пугает, говори вкрадчиво и "
+    "медленно, последнюю фразу — едва слышно. Никакой ровной дикторской подачи и никаких завываний. Ничего не "
+    "добавляй и не отвечай на текст."
 )
 
 
+HORROR_VOICE = os.getenv("AI_HORROR_VOICE", "").strip() or "cedar"  # самый живой мужской голос gpt-audio
+
 HOST_SPEAK = (
-    "Ты — движок озвучки городского радио. Произнеси текст пользователя ДОСЛОВНО, по-русски, голосом бодрого "
-    "ведущего: с улыбкой, с подъёмом, по-свойски, как с друзьями, с лёгкой иронией, в живом темпе. Если в тексте "
-    "есть совет или предупреждение слушателю — эту фразу скажи вдруг тихо и серьёзно, а прощание — снова бодро. "
-    "Ничего не добавляй и не отвечай на текст."
+    "Ты — актёр озвучки, ведущий городского радио в прямом эфире. Произнеси текст пользователя ДОСЛОВНО, по-русски, "
+    "но СЫГРАЙ его, а не прочитай: улыбка в голосе, энергия, живые перепады — ускоряйся на шутке, делай паузу перед "
+    "названием рубрики и объявляй его с нажимом, смейся интонацией, говори по-свойски, как с друзьями. Никакой "
+    "дикторской ровности. Если есть совет или предупреждение слушателю — эту фразу вдруг тихо, медленно и "
+    "серьёзно, почти шёпотом, а прощание — снова бодро. Ничего не добавляй и не отвечай на текст."
 )
 
 
@@ -2647,14 +2652,20 @@ async def narrate(text: str, horror: bool = False, host: bool = False) -> bytes:
     Шум вместо речи или звука мало для текста — следующий."""
     system = HOST_SPEAK if host else HORROR_SPEAK if horror else NIGHT_SPEAK  # ведущий бодрый, письмо жуткое
     voice = os.getenv("AI_NIGHT_VOICE", "").strip() or None
+    if horror:  # «ash» читал ровно, как диктор — у рубрики самый живой голос, не принят — прежний
+        voice = HORROR_VOICE
     tries = []
     if eleven_key() and not eleven_geo_blocked():  # регион не пускает — сразу запасной голос, без лишних запросов
         tries.append(("ElevenLabs", lambda: eleven_speak(text, horror=horror)))
     if yandex_key():
         tries.append((f"Яндекс ({yandex_voice()})", lambda: yandex_speak(text, horror=horror, host=host)))
-    # абзац у gpt-audio — секунд 6-10; 60 с на попытку, чтобы зависший сервис не растягивал историю на полчаса
-    tries += [(NIGHT_SPEAK_MODEL, lambda: speak(text, system=system, voice=voice, timeout=60, model=NIGHT_SPEAK_MODEL)),
-              (SPEAK_MODEL, lambda: speak(text, system=system, voice=voice, timeout=60))]
+    # кусок у gpt-audio — секунд 10-40; 90 с на попытку, чтобы зависший сервис не растягивал историю на полчаса
+    tries.append((NIGHT_SPEAK_MODEL, lambda: speak(text, system=system, voice=voice, timeout=90,
+                                                    model=NIGHT_SPEAK_MODEL)))
+    if voice and voice != SPEAK_VOICE:  # новый голос не приняли — тот же сервис с прежним
+        tries.append((f"{NIGHT_SPEAK_MODEL} ({SPEAK_VOICE})", lambda: speak(text, system=system, voice=SPEAK_VOICE,
+                                                                           timeout=90, model=NIGHT_SPEAK_MODEL)))
+    tries.append((SPEAK_MODEL, lambda: speak(text, system=system, voice=SPEAK_VOICE, timeout=90)))
     for name, call in tries:
         pcm = to_pcm24(await call())
         if not pcm:
