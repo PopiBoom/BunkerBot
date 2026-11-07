@@ -1956,6 +1956,13 @@ async def background(bot: Bot, db: Database) -> None:
                     await channel_posts.tick(bot, db)
                 except Exception as e:
                     logger.warning("channel posts tick failed: %s", e)
+                # Первый ночной эфир — владельцу в личку сам, один раз
+                try:
+                    from handlers import night
+                    if (await db.get_setting(night.FIRST_KEY, "")) != "1":
+                        _spawn(night.first_tick(bot, db))  # минута-две (ИИ + озвучка) — фон не ждёт
+                except Exception as e:
+                    logger.warning("night first tick failed: %s", e)
                 # Сериал про чат — раз в день вечером
                 try:
                     from handlers import serial

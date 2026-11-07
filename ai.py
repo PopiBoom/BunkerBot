@@ -2327,8 +2327,9 @@ def _same_words(a: str, b: str) -> float:
     return len(wa & wb) / len(wa) if wa else 1.0
 
 
-async def speak(text: str) -> bytes:
-    """Озвучить реплику: PCM 16 бит, 24 кГц, моно. b"" — нет ключа, сбой или модель сказала не то."""
+async def speak(text: str, system: str | None = None, voice: str | None = None, timeout: float = 60) -> bytes:
+    """Озвучить реплику: PCM 16 бит, 24 кГц, моно. b"" — нет ключа, сбой или модель сказала не то.
+    system/voice — для ночного эфира (спокойный голос ведущего вместо дерзкого пацана из войса)."""
     import aiohttp
     import base64
 
@@ -2338,16 +2339,16 @@ async def speak(text: str) -> bytes:
     body = {
         "model": SPEAK_MODEL,
         "modalities": ["text", "audio"],
-        "audio": {"voice": SPEAK_VOICE, "format": "pcm16"},
+        "audio": {"voice": voice or SPEAK_VOICE, "format": "pcm16"},
         "stream": True,  # звук OpenRouter отдаёт только потоком
         "usage": {"include": True},
-        "messages": [{"role": "system", "content": SPEAK_SYSTEM},
+        "messages": [{"role": "system", "content": system or SPEAK_SYSTEM},
                      {"role": "user", "content": f"Произнеси дословно: {text}"}],
     }
     headers = {"Authorization": f"Bearer {key}", "X-Title": "BunkerBot"}
     audio, said, usage = bytearray(), [], {}
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60), trust_env=True) as s:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), trust_env=True) as s:
             async with s.post(OPENROUTER_URL, json=body, headers=headers) as r:
                 if r.status != 200:
                     logger.warning("speak: OpenRouter %s: %s", r.status, (await r.text())[:300])
@@ -2384,6 +2385,38 @@ async def speak(text: str) -> bytes:
         logger.info("speak: модель сказала не то: %s", spoken[:200])
         return b""
     return bytes(audio)
+
+
+NIGHT_SYSTEM = (
+    "Ты ведёшь «Ночной эфир» — короткое голосовое в канале «Memento Mori» поздно вечером или ночью. Без шуток, "
+    "без мата, без пафоса и без морали. Говоришь спокойно и просто, как человек, который не спит и думает вслух: "
+    "короткие фразы, живая разговорная речь, одна мысль за эфир, конкретные образы вместо общих слов. "
+    "Memento mori для тебя — не про смерть, а про то, что этот момент больше не повторится, и это стоит заметить.\n"
+    "Можно город: Волга, мосты, ночные маршрутки, пустые остановки, ветер, огни окон, степь за городом. Нельзя "
+    "никогда: война, Сталинград, мемориалы, политика, болезни, самоубийство и мысли о нём, смерть близких, "
+    "конкретные люди и имена. Не обращайся к слушателю как к больному или несчастному. Без markdown."
+)
+NIGHT_SPEAK = (
+    "Ты — движок озвучки ночного радиоэфира. Произнеси текст пользователя ДОСЛОВНО, слово в слово, по-русски: "
+    "спокойным, тихим, тёплым голосом ведущего ночного радио, медленно, с паузами на точках, без театральности. "
+    "Ничего не добавляй и не отвечай на текст."
+)
+
+
+async def night_monologue(topic: str, facts: str, avoid: list[str]) -> list[str]:
+    """Тело ночного эфира — абзацы без приветствия и без концовки (их ставит код: время, погода, рассвет)."""
+    user = (
+        f"Что сейчас за окном (для настроения, цифры не повторяй — их скажут до тебя): {facts}\n"
+        f"Тема эфира: {topic}.\n"
+        + (f"Недавние темы (не повторяй ни мысли, ни образы): {'; '.join(avoid)}.\n" if avoid else "")
+        + "Напиши тело эфира: 3-4 коротких абзаца, всего 90-140 слов. Первая фраза — сразу образ или наблюдение, "
+        "без «привет» и без «сегодня ночью я хочу поговорить». Последний абзац — одна-две фразы, которые хочется "
+        "переслать. Числа — словами. Не прощайся (концовку скажут после тебя).\n"
+        'Верни СТРОГО JSON: {"paragraphs": ["...", "..."]}'
+    )
+    out = await _complete(NIGHT_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=4000, effort="medium")
+    paras = [scrub(str(p).strip()) for p in (_extract_json(out).get("paragraphs") or []) if str(p).strip()]
+    return [p for p in paras if not _garbled(p)][:5]
 
 
 async def complete_any(system: str, user: str, model: str, max_tokens: int = 8000, effort: str = "high") -> str:

@@ -1,0 +1,333 @@
+"""«Ночной эфир» для канала «Memento Mori» (идея и пример — с владельцем, 07.11): голосовое на минуту «как по радио».
+
+Текст: первая строка — код (время словами, погода в Волгограде с open-meteo), тело — ИИ (ai.night_monologue,
+Opus, тема из TOPICS, без шуток и без имён — в эфир не идёт ничего из чата), концовка — код («До рассвета — …»,
+рассвет с open-meteo, без сети — по формуле). Голос — ai.speak с NIGHT_SPEAK (спокойный ведущий), по абзацу;
+звук — radio.py (полоса приёмника, эфир, ветер или дождь по погоде, позывной) → OGG/Opus.
+Публикует не сам: черновик — голосовым в личку админу с кнопками «В канал / Переписать / Выкинуть».
+/night — новый черновик (≈$0.02). Первый эфир бот прислал владельцу сам после обновления (night_first_sent).
+"""
+from __future__ import annotations
+
+import asyncio
+import html
+import json
+import logging
+import math
+import os
+import random
+import time
+from datetime import date, datetime, timedelta, timezone
+
+from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+import ai
+from config import Config
+from database import Database
+
+logger = logging.getLogger("night")
+router = Router(name="night")
+
+MSK = timezone(timedelta(hours=3))
+LAT, LON = 48.708, 44.513                     # Волгоград
+DRAFT_KEY = "night_draft"
+COUNT_KEY = "night_no"
+FIRST_KEY = "night_first_sent"
+TOPICS_KEY = "night_topics"
+TOPICS = [
+    "обычные дни, которые не запоминаются", "люди за соседними окнами", "дорога домой ночью",
+    "последний раз, о котором не знаешь, что он последний", "то, что мы откладываем на потом", "тишина",
+    "старые фотографии в телефоне", "голоса, которые помнишь", "город, который не спит", "первый холод",
+    "то, что оставляем на завтра", "письма, которые не отправили", "свет в чужих окнах",
+    "песня, которая напоминает о ком-то", "люди, которые были рядом в какой-то год", "что мы любили в детстве",
+    "привычки как след, который мы оставляем", "ожидание", "река, которая течёт, пока мы спим",
+    "звёзды — свет, который шёл к нам тысячи лет", "остановка, на которой ты стоял сотни раз",
+    "разговоры, которые не случились", "утро, которое обязательно будет",
+]
+_lock = asyncio.Lock()
+
+# ---------- числа словами (для голоса: «два часа четырнадцать минут») ----------
+
+_U_M = ["ноль", "один", "два", "три", "четыре", "пять", "шесть", "семь", "восемь", "девять", "десять",
+        "одиннадцать", "двенадцать", "тринадцать", "четырнадцать", "пятнадцать", "шестнадцать", "семнадцать",
+        "восемнадцать", "девятнадцать"]
+_TENS = {2: "двадцать", 3: "тридцать", 4: "сорок", 5: "пятьдесят"}
+
+
+def _num(n: int, fem: bool = False) -> str:
+    """0–59 словами; fem — «одна/две» (минуты)."""
+    n = abs(n)
+    tens, units = (_TENS[n // 10], n % 10) if n >= 20 else ("", n)
+    if tens and not units:
+        return tens
+    word = _U_M[units]
+    if fem and units in (1, 2):
+        word = {1: "одна", 2: "две"}[units]
+    return f"{tens} {word}".strip()
+
+
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    n = abs(n) % 100
+    if 11 <= n <= 19:
+        return many
+    return one if n % 10 == 1 else few if n % 10 in (2, 3, 4) else many
+
+
+def _clock(dt: datetime) -> str:
+    h, m = dt.hour, dt.minute
+    head = f"{_num(h)} {_plural(h, 'час', 'часа', 'часов')}"
+    return (head + " ровно") if m == 0 else f"{head} {_num(m, fem=True)} {_plural(m, 'минута', 'минуты', 'минут')}"
+
+
+def _span(sec: float) -> str:
+    mins = max(1, round(sec / 60))
+    h, m = divmod(mins, 60)
+    parts = []
+    if h:
+        parts.append(f"{_num(h)} {_plural(h, 'час', 'часа', 'часов')}")
+    if m:
+        parts.append(f"{_num(m, fem=True)} {_plural(m, 'минута', 'минуты', 'минут')}")
+    return " ".join(parts)
+
+
+# ---------- погода и солнце ----------
+
+
+async def _weather() -> dict | None:
+    """Сейчас в Волгограде и восход/закат на 2 дня (open-meteo, без ключа)."""
+    import aiohttp
+
+    url = ("https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}&current=temperature_2m,wind_speed_10m,"
+           "wind_direction_10m,precipitation,weather_code&daily=sunrise,sunset&timezone=Europe%2FMoscow"
+           "&wind_speed_unit=ms&forecast_days=2").format(LAT, LON)
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10), trust_env=True) as s:
+            async with s.get(url) as r:
+                data = await r.json(content_type=None)
+        return data if data.get("current") else None
+    except Exception as e:
+        logger.info("night: погода не загрузилась: %s", e)
+        return None
+
+
+def _sun(day: date, rise: bool) -> datetime:
+    """Восход/закат по формуле (если погода не загрузилась), МСК, точность ±2 мин."""
+    jd = day.toordinal() + 1721424.5  # полночь этой даты (с полуднем ceil уводил на сутки вперёд)
+    n = math.ceil(jd - 2451545.0 + 0.0008)
+    j_star = n - LON / 360
+    m = (357.5291 + 0.98560028 * j_star) % 360
+    mr = math.radians(m)
+    c = 1.9148 * math.sin(mr) + 0.02 * math.sin(2 * mr) + 0.0003 * math.sin(3 * mr)
+    lam = math.radians((m + c + 180 + 102.9372) % 360)
+    j_transit = 2451545.0 + j_star + 0.0053 * math.sin(mr) - 0.0069 * math.sin(2 * lam)
+    dec = math.asin(math.sin(lam) * math.sin(math.radians(23.4397)))
+    phi = math.radians(LAT)
+    cos_w = (math.sin(math.radians(-0.833)) - math.sin(phi) * math.sin(dec)) / (math.cos(phi) * math.cos(dec))
+    w = math.degrees(math.acos(max(-1, min(1, cos_w))))
+    j = j_transit - w / 360 if rise else j_transit + w / 360
+    return datetime.fromtimestamp((j - 2440587.5) * 86400, tz=timezone.utc).astimezone(MSK)
+
+
+_WEATHER = [((0,), "ясно"), ((1, 2, 3), "облачно"), ((45, 48), "туман"), ((51, 53, 55, 56, 57), "морось"),
+            ((61, 63, 65, 66, 67, 80, 81, 82), "дождь"), ((71, 73, 75, 77, 85, 86), "снег"), ((95, 96, 99), "гроза")]
+_DIRS = ["северный", "северо-восточный", "восточный", "юго-восточный", "южный", "юго-западный", "западный",
+         "северо-западный"]
+
+
+def _conditions(w: dict | None, now: datetime) -> dict:
+    """Строка для голоса, подпись, для ИИ — и что слышно за окном (дождь или ветер), сколько до рассвета/заката."""
+    out = {"line": "", "caption": "", "facts": "", "rain": False}
+    sunrises, sunsets = [], []
+    if w:
+        cur = w["current"]
+        t = round(cur.get("temperature_2m", 0))
+        wind = round(cur.get("wind_speed_10m", 0))
+        wdir = cur.get("wind_direction_10m", 0) or 0
+        code = int(cur.get("weather_code", 0) or 0)
+        cond = next((name for codes, name in _WEATHER if code in codes), "")
+        out["rain"] = cond in ("дождь", "морось", "гроза") or (cur.get("precipitation") or 0) > 0
+        temp_w = "ноль" if t == 0 else ("плюс " if t > 0 else "минус ") + _num(t)
+        wind_w = ("ветер с Волги" if 30 <= wdir <= 150 else f"ветер {_DIRS[int((wdir + 22.5) // 45) % 8]}")
+        wind_w += f" - {_num(wind)} {_plural(wind, 'метр', 'метра', 'метров')} в секунду" if wind else ""
+        out["line"] = f"В Волгограде {temp_w}{', ' + cond if cond else ''}, {wind_w}."
+        out["caption"] = f"{t:+d}°{', ' + cond if cond else ''}"
+        out["facts"] = f"{t:+d}°, {cond or 'без осадков'}, ветер {wind} м/с"
+        for s in w.get("daily", {}).get("sunrise", []):
+            sunrises.append(datetime.fromisoformat(s).replace(tzinfo=MSK))
+        for s in w.get("daily", {}).get("sunset", []):
+            sunsets.append(datetime.fromisoformat(s).replace(tzinfo=MSK))
+    today = now.date()
+    sunrises = sunrises or [_sun(today, True), _sun(today + timedelta(days=1), True)]
+    sunsets = sunsets or [_sun(today, False), _sun(today + timedelta(days=1), False)]
+    rise = next((s for s in sunrises if s > now), None)
+    sset = next((s for s in sunsets if s > now), None)
+    day_now = rise and sset and sset < rise  # закат раньше рассвета — сейчас день
+    if day_now:
+        out["end"] = f"До заката - {_span((sset - now).total_seconds())}."
+    elif rise:
+        out["end"] = f"До рассвета - {_span((rise - now).total_seconds())}."
+    else:
+        out["end"] = ""
+    month = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь",
+             "декабрь"][now.month - 1]
+    out["facts"] = f"{month}, {now:%H:%M}, " + (out["facts"] or "погода неизвестна") + (
+        ", день" if day_now else ", ночь")
+    return out
+
+
+# ---------- эфир ----------
+
+
+async def make_episode(db: Database) -> dict:
+    """{"ogg": bytes | None, "paragraphs": [...], "caption": str, "n": int}. Без ключа OpenRouter — без звука."""
+    import radio
+
+    now = datetime.now(MSK)
+    cond = _conditions(await _weather(), now)
+    try:
+        used = json.loads(await db.get_setting(TOPICS_KEY, "[]") or "[]")
+    except ValueError:
+        used = []
+    topic = random.choice([t for t in TOPICS if t not in used[-12:]] or TOPICS)
+    body = await ai.night_monologue(topic, cond["facts"], used[-4:])
+    if not body:
+        raise RuntimeError("ИИ не написал эфир")
+    paragraphs = [f"{_clock(now).capitalize()}. {cond['line']}".strip()] + body + \
+                 [f"Это был ночной эфир. {cond['end']}".strip()]
+    await db.set_setting(TOPICS_KEY, json.dumps((used + [topic])[-30:], ensure_ascii=False))
+    n = int(await db.get_setting(COUNT_KEY, "0") or 0) + 1
+    caption = f"🎙 <b>Ночной эфир №{n}</b> · {now:%H:%M}" + (f" · {html.escape(cond['caption'])}"
+                                                            if cond["caption"] else "")
+    voice = []
+    for p in paragraphs:
+        pcm = await ai.speak(p, system=ai.NIGHT_SPEAK, voice=os.getenv("AI_NIGHT_VOICE", "").strip() or None,
+                             timeout=120)
+        if not pcm:  # одна повторная попытка — потом без звука
+            pcm = await ai.speak(p, system=ai.NIGHT_SPEAK, timeout=120)
+        if not pcm:
+            return {"ogg": None, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic}
+        voice.append(pcm)
+    mix = await asyncio.to_thread(radio.broadcast, voice, ai.SPEAK_RATE, cond["rain"], int(time.time()))
+    ogg = await asyncio.to_thread(radio.to_ogg, mix)
+    logger.info("ночной эфир №%s: тема «%s», %.0f сек", n, topic, len(mix) / radio.SR)
+    return {"ogg": ogg, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic}
+
+
+def _kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ В канал", callback_data="nr:pub"),
+        InlineKeyboardButton(text="🔄 Переписать", callback_data="nr:redo"),
+        InlineKeyboardButton(text="🗑 Выкинуть", callback_data="nr:del")]])
+
+
+async def send_draft(bot: Bot, db: Database, chat_id: int) -> bool:
+    """Собрать эфир и прислать черновик в личку на одобрение."""
+    async with _lock:
+        try:
+            await bot.send_chat_action(chat_id, "record_voice")
+        except Exception:
+            pass
+        ep = await make_episode(db)
+        text = "\n\n".join(ep["paragraphs"])
+        if not ep["ogg"]:
+            await bot.send_message(chat_id, f"{ep['caption']}\n\n{html.escape(text)}\n\n<i>Озвучить не вышло: нет ключа "
+                                            "OpenRouter (/setkey) или сбой озвучки. Это текст эфира.</i>")
+            return False
+        msg = await bot.send_voice(chat_id, BufferedInputFile(ep["ogg"], "night.ogg"), reply_markup=_kb(),
+                                   caption=f"{ep['caption']}\n\n<i>Черновик. Текст:</i>\n"
+                                           f"<blockquote expandable>{html.escape(text)[:800]}</blockquote>")
+        await db.set_setting(DRAFT_KEY, json.dumps({"file_id": msg.voice.file_id, "caption": ep["caption"],
+                                                    "n": ep["n"], "msg": msg.message_id, "chat": chat_id},
+                                                   ensure_ascii=False))
+        return True
+
+
+@router.message(Command("night"))
+async def cmd_night(message: Message, bot: Bot, db: Database) -> None:
+    """/night — новый ночной эфир черновиком в личку."""
+    if not ai.available():
+        await message.answer("ИИ недоступен - эфир не написать.")
+        return
+    uid = message.from_user.id
+    if message.chat.type != "private":
+        try:
+            await bot.send_message(uid, "🎙 Собираю ночной эфир - минута-две…")
+        except Exception:
+            await message.answer("Напиши боту /start в личку - черновик эфира приходит туда.")
+            return
+    else:
+        await message.answer("🎙 Собираю ночной эфир - минута-две…")
+    try:
+        await send_draft(bot, db, uid)
+    except Exception as e:
+        logger.exception("night draft failed")
+        await bot.send_message(uid, f"Эфир не собрался: {html.escape(str(e))[:200]}")
+
+
+@router.callback_query(F.data.startswith("nr:"))
+async def cb_night(call: CallbackQuery, bot: Bot, db: Database, config: Config) -> None:
+    if not config.is_admin(call.from_user.id):
+        await call.answer("Это для админа.", show_alert=True)
+        return
+    try:
+        draft = json.loads(await db.get_setting(DRAFT_KEY, "") or "{}")
+    except ValueError:
+        draft = {}
+    action = (call.data or "")[3:]
+    if not draft or draft.get("msg") != (call.message.message_id if call.message else None):
+        await call.answer("Этот черновик уже неактуален.", show_alert=True)
+        return
+
+    async def mark(text: str) -> None:
+        try:
+            await bot.edit_message_caption(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                           caption=f"{draft['caption']}\n\n{text}", reply_markup=None)
+        except TelegramBadRequest:
+            pass
+
+    if action == "pub":
+        from handlers.channel_posts import channel_id, mark_own
+
+        channel = await channel_id(bot, db)
+        if not channel:
+            await call.answer("Не нашёл канал.", show_alert=True)
+            return
+        sent = await bot.send_voice(channel, draft["file_id"], caption=draft["caption"])
+        await mark_own(db, sent.message_id)
+        await db.set_setting(COUNT_KEY, str(draft["n"]))
+        await db.set_setting(DRAFT_KEY, "")
+        await call.answer("Опубликовано в канале.")
+        await mark("✅ Опубликовано в канале.")
+    elif action == "del":
+        await db.set_setting(DRAFT_KEY, "")
+        await call.answer("Выкинул.")
+        await mark("🗑 Выкинуто.")
+    elif action == "redo":
+        await db.set_setting(DRAFT_KEY, "")
+        await call.answer("Переписываю - минута-две.")
+        await mark("🔄 Переписан - новый ниже.")
+        try:
+            await send_draft(bot, db, call.message.chat.id)
+        except Exception as e:
+            logger.exception("night redo failed")
+            await bot.send_message(call.message.chat.id, f"Эфир не собрался: {html.escape(str(e))[:200]}")
+
+
+async def first_tick(bot: Bot, db: Database) -> None:
+    """Из фона: первый эфир — владельцу в личку сам, один раз после обновления (просьба: «закинь в личку»)."""
+    if (await db.get_setting(FIRST_KEY, "")) == "1":
+        return
+    raw = os.getenv("BOT_FATHER_ID", "") or os.getenv("ADMIN_IDS", "").replace(";", ",").split(",")[0]
+    try:
+        owner = int(raw.strip())
+    except ValueError:
+        return
+    await db.set_setting(FIRST_KEY, "1")  # один раз, даже если не выйдет (не долбить каждые 30 сек)
+    try:
+        await bot.send_message(owner, "🎙 Первый ночной эфир - черновик, в канал уйдёт только по кнопке.")
+        await send_draft(bot, db, owner)
+    except Exception:
+        logger.exception("night: первый эфир не ушёл")

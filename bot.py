@@ -34,6 +34,7 @@ from handlers.admin import auto_backup_loop
 from handlers.collect import router as collect_router
 from handlers.court import observe as court_observe
 from handlers.court import router as court_router
+from handlers.night import router as night_router
 from handlers.protocol import router as protocol_router
 from handlers.serial import router as serial_router
 from handlers.roast import background as roast_background
@@ -184,6 +185,7 @@ async def main() -> None:
     dp.include_router(protocol_router)  # /protocol
     dp.include_router(court_router)     # /sud
     dp.include_router(serial_router)    # /serial
+    dp.include_router(night_router)     # /night — ночной эфир, черновик в личку
     # Стёб-бот последним: ловит все остальные сообщения групп
     dp.include_router(roast_router)
 
