@@ -3,8 +3,11 @@
 Админ: /sud ответом на сообщение человека (это сообщение — повод, статья 1) или /sud @ник. Дальше:
 1) ИИ-прокурор (ai.court_charges) предъявляет 2-3 статьи — улики ДОСЛОВНО из его сообщений за неделю (ИИ даёт
    только id, текст подставляет код); нет ни одной настоящей улики — «оправдан за отсутствием состава».
-2) Защита DEFENSE_TIME: кнопка «🛡 Стать адвокатом» — первый нажавший (не подсудимый) защищает, его следующее
-   сообщение — речь; первое сообщение подсудимого — последнее слово (ловит observe() из middleware в bot.py).
+2) Защита: адвоката ждём LAWYER_WAIT (кнопка «🛡 Стать адвокатом» — первый нажавший, не подсудимый); выбрали —
+   у него SPEECH_TIME на речь (все его сообщения в это время); последнее слово — ответ подсудимого на сообщение
+   суда (иначе все его сообщения за это время). Оба высказались — ещё GRACE сек и голосование; за 30 сек —
+   напоминание. Ловит observe() из middleware в bot.py. (Было: 2 мин на всё, и ЛЮБОЕ сообщение подсудимого без
+   адвоката сразу запускало голосование — владелец: «так мало времени на выбор адвоката и на защиту».)
 3) Голосование VOTE_TIME, тайное: «Виновен / Оправдать», подсудимый не голосует, голос можно поменять.
 4) Приговор: слово судьи (ai.court_verdict) + картинка (cards.render_verdict). Ничья — оправдан; никто не
    проголосовал — решает судья (виновен). Виновен — прозвище на сутки и 🤡 на каждое его сообщение PUNISH сек.
@@ -32,7 +35,9 @@ logger = logging.getLogger("court")
 router = Router(name="court")
 
 MSK = timezone(timedelta(hours=3))
-DEFENSE_TIME = 120     # сек на адвоката и последнее слово
+LAWYER_WAIT = 180      # сек ждём, пока кто-то нажмёт «Стать адвокатом»
+SPEECH_TIME = 180      # сек адвокату на речь с момента, как он вызвался
+GRACE = 30             # сек после того, как высказались оба (вдруг допишут), — и голосование
 VOTE_TIME = 120        # сек на голосование
 PUNISH = 24 * 3600     # сек: прозвище и 🤡 на каждое сообщение
 EVIDENCE_DAYS = 7      # улики — из сообщений за столько дней
@@ -93,12 +98,17 @@ async def observe(message: Message, bot: Bot, db: Database) -> None:
     text = (message.text or message.caption or "").strip()
     if not c or c["phase"] != "defense" or not text or text.startswith("/"):
         return
-    if c["lawyer"] and uid == c["lawyer"][0] and not c["defense"]:
-        c["defense"] = text[:300]
-    elif uid == c["defendant"][0] and not c["last_word"]:
-        c["last_word"] = text[:300]
-    if (c["defense"] or not c["lawyer"]) and c["last_word"] and c.get("wake"):
-        c["wake"].set()  # оба высказались — к голосованию, не дожидаясь таймера
+    rt = message.reply_to_message
+    to_court = bool(rt and rt.message_id == c.get("msg_id"))
+    if c["lawyer"] and uid == c["lawyer"][0]:
+        c["defense"] = (c["defense"] + " / " + text if c["defense"] else text)[:400]  # речь бывает в несколько сообщений
+    elif uid == c["defendant"][0] and not c.get("last_word_final"):
+        if to_court:  # ответ на сообщение суда — это и есть последнее слово
+            c["last_word"], c["last_word_final"] = text[:300], True
+        else:
+            c["last_word"] = (c["last_word"] + " / " + text if c["last_word"] else text)[:300]
+    if c["lawyer"] and c["defense"] and c["last_word"]:  # оба высказались — ещё чуть-чуть, и голосование
+        c["deadline"] = min(c["deadline"], time.time() + GRACE)
 
 
 def _court_kb() -> InlineKeyboardMarkup:
@@ -189,13 +199,13 @@ async def cmd_sud(message: Message, command: CommandObject, bot: Bot, db: Databa
         lines += [f"<b>{html.escape(title)}</b>", html.escape(quote)]
     if c["speech"]:
         lines += ["", f"🗣 <i>{html.escape(c['speech'])}</i>"]
-    lines += ["", "🛡 Кто адвокат? Первый нажавший защищает - пиши речь следом.",
-              f"🎤 {html.escape(name)}, твоё последнее слово - следующим сообщением.",
-              f"⏳ Через {DEFENSE_TIME // 60} мин - голосование присяжных."]
+    lines += ["", f"🛡 Кто адвокат? Первый нажавший защищает, на речь - {SPEECH_TIME // 60} мин.",
+              f"🎤 {html.escape(name)}, последнее слово - ответом на это сообщение.",
+              f"⏳ Адвоката ждём {LAWYER_WAIT // 60} мин, потом голосование присяжных."]
     sent = await bot.send_message(chat_id, "\n".join(lines), reply_markup=_court_kb())
     c["msg_id"] = sent.message_id
     c["phase"] = "defense"
-    c["wake"] = asyncio.Event()
+    c["deadline"] = time.time() + LAWYER_WAIT
     task = asyncio.create_task(_run(bot, db, chat_id, c))
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
@@ -214,10 +224,12 @@ async def cb_lawyer(call: CallbackQuery, bot: Bot) -> None:
         await call.answer(f"Адвокат уже есть: {c['lawyer'][1]}.")
         return
     c["lawyer"] = (call.from_user.id, _name(call.from_user))
-    await call.answer("Ты адвокат. Пиши речь в защиту следующим сообщением.", show_alert=True)
+    c["deadline"] = max(c["deadline"], time.time() + SPEECH_TIME)  # на речь — полное время, сколько бы ни прошло
+    await call.answer(f"Ты адвокат. Пиши речь в защиту - у тебя {SPEECH_TIME // 60} мин.", show_alert=True)
     try:
         await bot.send_message(call.message.chat.id,
-                               f"🛡 Адвокат: <b>{html.escape(c['lawyer'][1])}</b>. Суд слушает защиту.")
+                               f"🛡 Адвокат: <b>{html.escape(c['lawyer'][1])}</b>. Суд слушает защиту - "
+                               f"{SPEECH_TIME // 60} мин.")
     except Exception as e:
         logger.debug("lawyer note: %s", e)
 
@@ -253,10 +265,15 @@ async def _run(bot: Bot, db: Database, chat_id: int, c: dict) -> None:
     from handlers.roast import _send_card
 
     try:
-        try:
-            await asyncio.wait_for(c["wake"].wait(), DEFENSE_TIME)
-        except asyncio.TimeoutError:
-            pass
+        reminded = False
+        while (left := c["deadline"] - time.time()) > 0:  # срок двигают кнопка адвоката и речи (observe)
+            if left <= 30 and not reminded and left > 5:
+                reminded = True
+                try:
+                    await bot.send_message(chat_id, "⏳ Через 30 сек - голосование присяжных.")
+                except Exception as e:
+                    logger.debug("court reminder: %s", e)
+            await asyncio.sleep(min(1.0, left))
         c["phase"] = "vote"
         try:
             await bot.edit_message_reply_markup(chat_id=chat_id, message_id=c["msg_id"], reply_markup=None)
