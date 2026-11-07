@@ -25,15 +25,23 @@ fi
 "${G[@]}" fetch -q origin "$BRANCH"
 LOCAL="$("${G[@]}" rev-parse HEAD)"
 REMOTE="$("${G[@]}" rev-parse "origin/$BRANCH")"
-[ "$LOCAL" = "$REMOTE" ] && exit 0
+if [ "$LOCAL" = "$REMOTE" ]; then rm -f "$DIR/.update_waiting"; exit 0; fi
 
 # Идёт игра (бот держит файл-флаг свежим) — не перезапускаемся, иначе партия оборвётся.
 # Флаг старше 2 минут — бот не работает или игр нет, тогда обновляемся.
 FLAG="$DIR/.game_running"
+WAIT="$DIR/.update_waiting"   # с какого момента обновление ждёт конца игры
 if [ -f "$FLAG" ] && [ $(( $(date +%s) - $(stat -c %Y "$FLAG") )) -lt 120 ]; then
-  echo "Идёт игра — обновлюсь до ${REMOTE:0:7} после партии"
-  exit 0
+  [ -f "$WAIT" ] || touch "$WAIT"
+  # Страховка: ждём не дольше 3 часов — флаг мог застрять из-за ошибки (зависший стол, игра), а без обновления
+  # не приедет и исправление.
+  if [ $(( $(date +%s) - $(stat -c %Y "$WAIT") )) -lt 10800 ]; then
+    echo "Идёт игра — обновлюсь до ${REMOTE:0:7} после партии"
+    exit 0
+  fi
+  logger -t bunkerbot "флаг игры держится больше 3 ч — обновляюсь всё равно"
 fi
+rm -f "$WAIT"
 
 OLD_REQ="$("${G[@]}" show HEAD:requirements.txt | sha1sum)"
 "${G[@]}" reset -q --hard "origin/$BRANCH"

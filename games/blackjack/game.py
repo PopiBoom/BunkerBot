@@ -129,8 +129,11 @@ _bg: set[asyncio.Task] = set()
 
 
 def running() -> bool:
-    """Открытый стол — сервер не перезапускаем (иначе раунд оборвётся)."""
-    return any(t.phase != "closed" for t in _tables.values())
+    """Живой стол — сервер не перезапускаем (иначе раунд оборвётся). Только если за ним что-то происходит: стол, где
+    давно никто ничего не жмёт (или упал таймер, который его закрывает), обновления не держит."""
+    now = time.time()
+    return any(t.phase != "closed" and now - t.last_action < (10 * 60 if t.phase == "play" else IDLE_CLOSE)
+               for t in _tables.values())
 
 
 def _name(u) -> str:
