@@ -1443,6 +1443,139 @@ async def week_show(samples: dict[str, list[tuple[int, str]]], dossiers: dict[st
     return {"nominations": noms[:5], "news": news[:4], "jabs": jabs, "horoscope": horo[:8]}
 
 
+# ---------- протокол, суд, сериал (handlers/protocol.py, court.py, serial.py) ----------
+
+
+def _ok(t) -> str:
+    """Текст ИИ для картинок и подписей: запретные слова вон, шутка про внешность или каша — пусто."""
+    t = scrub(str(t or "").strip())
+    return "" if about_looks(t) or _garbled(t) else t
+
+
+def _mid(v) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+async def protocol(messages: list[dict]) -> dict:
+    """Протокол происшествия по срачу: {"violator", "victim", "place", "story", "explanation_id", "witnesses",
+    "seized", "article"}. messages — [{"id", "name", "text"}] от старых к новым."""
+    user = (
+        "Переписка чата (последний срач или движуха):\n" + _msgs_block(messages) + "\n\n"
+        "Составь по ней ПРОТОКОЛ об «административном правонарушении», как дежурный мент: канцелярский стиль "
+        "(«гр. Вася, находясь в состоянии…», «публично заявил», «на замечание ответил»), а смешно — от того, что "
+        "этим языком описана ерунда из чата. Только реальные события и люди из переписки, по порядку.\n"
+        "violator — имя главного нарушителя ровно как в переписке, можно с прозвищем «он же …» по его словам; "
+        "victim — кто пострадал и как («гр. Петя (моральный ущерб)»), или пусто; place — где именно (ветка про что, "
+        "3-6 слов, без «чат»); story — «Обстоятельства», 3-5 предложений, с точным временем, если видно, "
+        "цитаты — ТОЛЬКО дословно из переписки, мат в цитатах оставь; explanation_id — id сообщения нарушителя, "
+        "которое звучит как его «объяснение» (или null); witnesses — свидетели через запятую, «гр. Имя» и смешная "
+        "пометка в скобках у одного; seized — что «изъято» (смешной предмет по теме, «1 (одна) шаурма, недоеденная»); "
+        "article — «ст. N КоАП Чата «Название»» по сути нарушения.\n"
+        + _SAFE_TOPICS +
+        ' Верни СТРОГО JSON: {"violator": "", "victim": "", "place": "", "story": "", "explanation_id": null, '
+        '"witnesses": "", "seized": "", "article": ""}'
+    )
+    out = await _complete(ROAST_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=5000)
+    data = _extract_json(out)
+    said = [str(m["text"]) for m in messages]
+    story = _fix_quotes(_ok(data.get("story")), said)
+    return {"violator": _ok(data.get("violator")), "victim": _ok(data.get("victim")), "place": _ok(data.get("place")),
+            "story": await fix_looks(story) if story else "", "explanation_id": _mid(data.get("explanation_id")),
+            "witnesses": _ok(data.get("witnesses")), "seized": _ok(data.get("seized")),
+            "article": _ok(data.get("article"))}
+
+
+async def court_charges(name: str, dossier: str, messages: list[dict], promises: list[str]) -> dict:
+    """Обвинение в суде чата: {"charges": [{"title", "msg_id", "note"}], "speech", "nickname"}."""
+    prom = "\n".join(f"<promise>{p}</promise>" for p in promises)
+    user = (
+        f"Подсудимый: {json.dumps(name, ensure_ascii=False)}.\n<dossier>{dossier}</dossier>\n"
+        f"Его сообщения за последнее время:\n{_msgs_block(messages)}\n"
+        + (f"Его обещания, срок которых вышел:\n{prom}\n" if prom else "")
+        + "\nТы — прокурор в шуточном «суде чата». Предъяви ему 2-3 статьи обвинения — ТОЛЬКО за реальные слова и "
+        "поступки из сообщений выше: слитые обещания, нытьё, понты, враньё, тупые заявления, токсичность. "
+        "charges: title — «Ст. 1 · Название статьи» (смешно и коротко: «Нытьё в особо крупном», «Слив обещаний»), "
+        "msg_id — id его сообщения-улики (обязательно из списка), note — короткое пояснение после цитаты (до 8 "
+        "слов: «пришёл через полтора часа», «4 раза за неделю») или пусто. speech — обвинительная речь, 2-3 злых "
+        "предложения с матом. nickname — позорное прозвище на сутки, если его признают виновным (1-3 слова, по "
+        "его же преступлениям). " + _SAFE_TOPICS +
+        ' Верни СТРОГО JSON: {"charges": [{"title": "", "msg_id": 0, "note": ""}], "speech": "", "nickname": ""}'
+    )
+    out = await _complete(ROAST_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=5000)
+    data = _extract_json(out)
+    charges = []
+    for c in data.get("charges") or []:
+        if isinstance(c, dict) and _ok(c.get("title")):
+            charges.append({"title": _ok(c["title"]), "msg_id": _mid(c.get("msg_id")), "note": _ok(c.get("note"))})
+    speech = _ok(data.get("speech"))
+    return {"charges": charges[:3], "speech": await fix_looks(speech) if speech else "",
+            "nickname": _ok(data.get("nickname"))[:40]}
+
+
+async def court_verdict(name: str, charges: list[str], defense: str, last_word: str, guilty: bool,
+                        votes: str, accuser: str) -> str:
+    """Слово судьи после голосования: 2-3 предложения, с учётом речи адвоката и последнего слова."""
+    user = (
+        f"Шуточный суд чата над {json.dumps(name, ensure_ascii=False)}. Обвинение: {'; '.join(charges)}.\n"
+        + (f"Речь адвоката: <msg>{defense}</msg>\n" if defense else "Адвоката не нашлось.\n")
+        + (f"Последнее слово подсудимого: <msg>{last_word}</msg>\n" if last_word else "Последнего слова не было.\n")
+        + f"Присяжные: {votes} — {'ВИНОВЕН' if guilty else 'ОПРАВДАН'}.\n"
+        + ("Ты — судья. Огласи приговор: 2-3 злых предложения с матом, обыграй речь адвоката или последнее слово "
+           "(если были) — по их словам. " if guilty else
+           f"Ты — судья. Огласи оправдание, 2-3 злых предложения: подсудимому повезло, а обвинитель "
+           f"{json.dumps(accuser, ensure_ascii=False)} зря потратил время суда — поглумись над ним. ")
+        + _SAFE_TOPICS + _JSON_REPLY
+    )
+    out = await _complete(ROAST_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=3000)
+    try:
+        text = str(_extract_json(out).get("text", ""))
+    except (ValueError, AttributeError):
+        text = out
+    text = _ok(text)
+    return await fix_looks(text) if text else ""
+
+
+SERIAL_SYSTEM_NOTE = (
+    " Сейчас ты пишешь ежедневный сериал про этот чат: участники — герои, у каждого свой характер по досье и "
+    "тому, как он пишет. Пиши как сценарист злого ситкома: живо, смешно, коротко, с матом в репликах, по-русски. "
+    "Никакого секса и романтики между участниками, никаких пошлостей про реальных людей."
+)
+
+
+async def serial_episode(season: int, episode: int, previous: list[dict], vote: str, messages: list[dict],
+                         dossiers: dict[str, str], cast: list[str]) -> dict:
+    """Серия: {"title", "logline", "text", "summary", "options": [3], "cast": [имена]}.
+
+    previous — прошлые серии [{"n", "title", "summary"}], vote — что выбрал чат в прошлом опросе (или пусто),
+    messages — переписка за день, dossiers — {имя: досье} героев."""
+    prev = "\n".join(f"Серия {p['n']} «{p['title']}»: {p['summary']}" for p in previous[-5:])
+    user = (
+        f"Сезон {season}, серия {episode}.\n"
+        + (f"Что было раньше:\n{prev}\n" if prev else "Это первая серия: познакомь с героями.\n")
+        + (f"Чат проголосовал, что будет дальше: «{vote}» — с этого и начни.\n" if vote else "")
+        + f"Герои (по досье):\n{_dossiers_block({n: dossiers.get(n, '') for n in cast})}\n"
+        f"Что было в чате сегодня (вплети 1-2 реальных события, перевернув в сюжет):\n{_msgs_block(messages)}\n\n"
+        "Напиши новую серию. title — название серии (2-4 слова, смешное); logline — одна фраза-тизер; text — сама "
+        "серия, 700-1100 знаков, 2-3 абзаца, с короткими репликами героев в кавычках, заканчивается клиффхэнгером; "
+        "summary — 1-2 предложения, что произошло (для следующей серии); options — ровно 3 коротких варианта "
+        "«что дальше» для опроса (до 60 знаков каждый, разные и смешные); cast — имена героев этой серии ровно "
+        "как в списке. Батя (создатель бота) — тоже герой, если он в списке. " + _SAFE_TOPICS +
+        ' Верни СТРОГО JSON: {"title": "", "logline": "", "text": "", "summary": "", "options": ["", "", ""], '
+        '"cast": []}'
+    )
+    out = await _complete(ROAST_SYSTEM + SERIAL_SYSTEM_NOTE + " Отвечаешь строго JSON.", user, max_tokens=8000,
+                          effort="medium")
+    data = _extract_json(out)
+    text = _ok(data.get("text"))
+    opts = [_ok(o)[:100] for o in data.get("options") or [] if _ok(o)]
+    return {"title": _ok(data.get("title"))[:60], "logline": _ok(data.get("logline")),
+            "text": await fix_looks(text) if text else "", "summary": _ok(data.get("summary")),
+            "options": opts[:3], "cast": [str(c) for c in data.get("cast") or [] if str(c) in cast][:6]}
+
+
 DEMOT_SYSTEM = (
     "Ты пишешь подписи к демотиваторам — как лучшие русские демотиваторы: чёрная рамка, КРУПНОЕ слово-понятие "
     "и под ним меткий циничный вывод про жизнь. Юмор — в неожиданном выводе, который картинка вдруг "

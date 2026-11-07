@@ -300,6 +300,10 @@ async def _maybe_react(bot: Bot, db: Database, message: Message, is_father: bool
     if rate <= 0:
         return
     chat_id = message.chat.id
+    from handlers.court import nickname as court_nick
+
+    if message.from_user and court_nick(chat_id, message.from_user.id):
+        return  # осуждённый судом чата: на нём и так 🤡 — другой реакцией его не перебиваем
     if is_father:
         if random.random() < min(1.0, rate * 2):
             await _react(bot, chat_id, message.message_id, random.choice(["❤", "🔥", "👍", "💯"]))
@@ -1952,6 +1956,12 @@ async def background(bot: Bot, db: Database) -> None:
                     await channel_posts.tick(bot, db)
                 except Exception as e:
                     logger.warning("channel posts tick failed: %s", e)
+                # Сериал про чат — раз в день вечером
+                try:
+                    from handlers import serial
+                    await serial.tick(bot, db)
+                except Exception as e:
+                    logger.warning("serial tick failed: %s", e)
                 # Тишина в чате — «вопрос дня»
                 try:
                     from handlers import fun
@@ -1959,6 +1969,12 @@ async def background(bot: Bot, db: Database) -> None:
                         await fun.quiet_kick(bot, db, chat_id)
                 except Exception as e:
                     logger.warning("fun tick failed: %s", e)
+            # Коллекционные карточки — без ИИ, раз в день в случайный момент
+            try:
+                from handlers import collect
+                await collect.tick(bot, db)
+            except Exception as e:
+                logger.warning("cards tick failed: %s", e)
             # Опросы «Кто из нас…» закрываем всегда — даже если стёб выключен (итоги тогда без прожарки)
             try:
                 from handlers import fun

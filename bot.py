@@ -30,6 +30,11 @@ from games.chess.game import note_forward as note_chess_forward
 from handlers import (admin_router, compare_router, fun_router, help_router, menu_router, quotes_router,
                       roast_router, stats_router, user_router)
 from handlers.admin import auto_backup_loop
+from handlers.collect import router as collect_router
+from handlers.court import observe as court_observe
+from handlers.court import router as court_router
+from handlers.protocol import router as protocol_router
+from handlers.serial import router as serial_router
 from handlers.roast import background as roast_background
 
 logging.basicConfig(
@@ -103,6 +108,11 @@ class AdminOnlyCommands(BaseMiddleware):
         if event.is_automatic_forward:  # пост канала в чате — под ним комментарии, игры их не удаляют
             note_channel_post(event.chat.id, event.message_id)
             note_chess_forward(event)  # /chess_post ждёт, где пост появился в комментариях
+        try:  # суд чата: речь адвоката, последнее слово, 🤡 осуждённым (сообщение идёт дальше как обычно)
+            if data.get("db") is not None and data.get("bot") is not None:
+                await court_observe(event, data["bot"], data["db"])
+        except Exception as e:
+            logger.debug("court observe: %s", e)
         cmd = command_name(event.text or event.caption or "")
         if cmd and cmd not in PUBLIC_COMMANDS:
             cfg = data.get("config")
@@ -168,6 +178,10 @@ async def main() -> None:
     dp.include_router(quotes_router)
     dp.include_router(stats_router)
     dp.include_router(fun_router)
+    dp.include_router(collect_router)   # карточки участников: «Поймать», альбом, /collection
+    dp.include_router(protocol_router)  # /protocol
+    dp.include_router(court_router)     # /sud
+    dp.include_router(serial_router)    # /serial
     # Стёб-бот последним: ловит все остальные сообщения групп
     dp.include_router(roast_router)
 

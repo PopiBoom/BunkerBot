@@ -241,6 +241,20 @@ class Database:
                 )
                 """
             )
+            # Коллекционные карточки участников: кто (owner) поймал чью карточку (user_id) какой редкости, сколько раз
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS card_owned (
+                    chat_id  INTEGER NOT NULL,
+                    owner_id INTEGER NOT NULL,
+                    user_id  INTEGER NOT NULL,
+                    rarity   TEXT NOT NULL,
+                    count    INTEGER NOT NULL DEFAULT 1,
+                    first_ts INTEGER NOT NULL,
+                    PRIMARY KEY (chat_id, owner_id, user_id, rarity)
+                )
+                """
+            )
             # Миграция: у «забытых» помним имя и @ник — чтобы админ мог вернуть их через /remember_me @ник
             cur = await db.execute("PRAGMA table_info(roast_optout)")
             ocols = {r[1] for r in await cur.fetchall()}
@@ -448,6 +462,28 @@ class Database:
             cur = await db.execute("SELECT user_id, COUNT(*) FROM quotes WHERE chat_id = ? GROUP BY user_id",
                                    (chat_id,))
             return {int(r[0]): int(r[1]) for r in await cur.fetchall()}
+
+    # --- коллекционные карточки ---
+
+    async def add_card(self, chat_id: int, owner_id: int, user_id: int, rarity: str) -> int:
+        """Сколько теперь у owner таких карточек (1 — новая)."""
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO card_owned (chat_id, owner_id, user_id, rarity, count, first_ts) VALUES (?, ?, ?, ?, 1, ?) "
+                "ON CONFLICT(chat_id, owner_id, user_id, rarity) DO UPDATE SET count = count + 1",
+                (chat_id, owner_id, user_id, rarity, int(time.time())))
+            await db.commit()
+            cur = await db.execute("SELECT count FROM card_owned WHERE chat_id = ? AND owner_id = ? AND user_id = ? "
+                                   "AND rarity = ?", (chat_id, owner_id, user_id, rarity))
+            row = await cur.fetchone()
+            return int(row[0]) if row else 1
+
+    async def cards_of(self, chat_id: int, owner_id: int) -> list[tuple]:
+        """[(user_id, rarity, count, first_ts)] — альбом одного человека."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT user_id, rarity, count, first_ts FROM card_owned WHERE chat_id = ? AND "
+                                   "owner_id = ? ORDER BY first_ts", (chat_id, owner_id))
+            return list(await cur.fetchall())
 
     # --- статистика чата (без ИИ) ---
 
@@ -737,8 +773,9 @@ class Database:
             await db.execute("DELETE FROM dossiers WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
             await db.execute("DELETE FROM quotes WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
             # «всё о тебе удалено» — значит, и пол, и обещания, и счёт «клоуна дня» тоже
-            for table in ("user_gender", "promises", "clown_stats"):
+            for table in ("user_gender", "promises", "clown_stats", "card_owned"):
                 await db.execute(f"DELETE FROM {table} WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+            await db.execute("DELETE FROM card_owned WHERE chat_id = ? AND owner_id = ?", (chat_id, user_id))
             await db.execute(
                 "INSERT INTO roast_optout (chat_id, user_id, name, username) VALUES (?, ?, ?, ?) "
                 "ON CONFLICT(chat_id, user_id) DO UPDATE SET name = excluded.name, username = excluded.username",

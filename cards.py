@@ -242,3 +242,349 @@ def render_demotivator(photo: bytes, title: str, subtitle: str, side: int = 1000
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=90)
     return buf.getvalue()
+
+
+# ---------- коллекционные карточки участников (handlers/collect.py) ----------
+
+RARITY = {  # цвет рамки, фон, звёзды
+    "обычная": ((150, 156, 168), (40, 43, 50), "★"),
+    "редкая": ((80, 150, 255), (22, 34, 60), "★★"),
+    "легендарная": ((240, 190, 70), (52, 38, 14), "★★★"),
+}
+
+
+def _avatar(name: str, size: int, photo: bytes | None, seed: int) -> Image.Image:
+    """Круглая аватарка: фото профиля, а нет его — первая буква имени на цветном градиенте."""
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
+    im = None
+    if photo:
+        try:
+            src = Image.open(io.BytesIO(photo)).convert("RGB")
+            side = min(src.size)
+            src = src.crop(((src.width - side) // 2, (src.height - side) // 2,
+                            (src.width + side) // 2, (src.height + side) // 2))
+            im = src.resize((size, size), Image.LANCZOS).convert("RGBA")
+        except Exception:
+            im = None
+    if im is None:
+        import random
+
+        rnd = random.Random(seed)
+        c1 = tuple(rnd.randint(60, 200) for _ in range(3))
+        c2 = tuple(min(255, v + 50) for v in c1)
+        im = Image.new("RGBA", (size, size))
+        d = ImageDraw.Draw(im)
+        for i in range(size):
+            t = i / size
+            d.line((0, i, size, i), fill=tuple(int(c1[k] * (1 - t) + c2[k] * t) for k in range(3)) + (255,))
+        letter = (_plain(name)[:1] or "?").upper()
+        d.text((size / 2, size / 2), letter, font=_bold(int(size * 0.5)), fill=(255, 255, 255), anchor="mm")
+    out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    out.paste(im, (0, 0), mask)
+    return out
+
+
+def collect_card(name: str, title: str, rarity: str, stats: list[tuple[str, int]], num: int, total: int,
+                 quote: str = "", photo: bytes | None = None, seed: int = 0) -> Image.Image:
+    """Карточка 600×880: рамка по редкости, аватарка, имя, титул, 4 характеристики 1–99, у легендарной — цитата."""
+    w, h = 600, 880
+    col, bg, stars = RARITY.get(rarity, RARITY["обычная"])
+    im = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    d.rounded_rectangle((0, 0, w - 1, h - 1), radius=36, fill=col)
+    d.rounded_rectangle((14, 14, w - 15, h - 15), radius=28, fill=bg)
+    if rarity == "легендарная":  # золотые блики
+        glow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(glow)
+        for i in range(-3, 8):
+            x = i * 110
+            gd.polygon([(x, 0), (x + 40, 0), (x - 160, h), (x - 200, h)], fill=(255, 230, 150, 18))
+        mask = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(mask).rounded_rectangle((14, 14, w - 15, h - 15), radius=28, fill=255)
+        im.paste(Image.alpha_composite(im, glow), (0, 0), mask)
+        d = ImageDraw.Draw(im)
+    d.text((40, 44), f"№ {num:02d}/{max(total, num):02d}", font=_mono(24), fill=col)
+    d.text((w - 40, 44), stars, font=_bold(30), fill=col, anchor="ra")
+    ring = Image.new("RGBA", (270, 270), (0, 0, 0, 0))
+    ImageDraw.Draw(ring).ellipse((0, 0, 269, 269), fill=col)
+    im.alpha_composite(ring, ((w - 270) // 2, 96))
+    im.alpha_composite(_avatar(name, 250, photo, seed), ((w - 250) // 2, 106))
+    nm = _plain(name)
+    size = 54
+    while size > 30 and d.textlength(nm, font=_bold(size)) > w - 80:
+        size -= 4
+    d.text((w / 2, 402), nm, font=_bold(size), fill=TEXT, anchor="mm")
+    if title:
+        d.text((w / 2, 452), _wrap(d, _plain(title), _regular(28), w - 80, 1)[0], font=_regular(28), fill=col,
+               anchor="mm")
+    y = 500
+    for label, val in stats[:4]:
+        val = max(1, min(99, int(val)))
+        d.text((44, y), label, font=_mono(22), fill=MUTED)
+        d.text((w - 44, y), str(val), font=_bold(24), fill=TEXT, anchor="ra")
+        d.rounded_rectangle((44, y + 32, w - 44, y + 44), radius=6, fill=(255, 255, 255, 28))
+        d.rounded_rectangle((44, y + 32, 44 + max(12, int((w - 88) * val / 99)), y + 44), radius=6, fill=col)
+        y += 64
+    if quote:
+        for i, line in enumerate(_wrap(d, f"«{_plain(quote)}»", _serif(24), w - 100, 2)):
+            d.text((w / 2, y + 12 + i * 32), line, font=_serif(24), fill=(250, 236, 200), anchor="mm")
+    d.text((w / 2, h - 44), rarity.upper(), font=_bold(24), fill=col, anchor="mm")
+    return im
+
+
+def render_collect_card(*args, **kwargs) -> bytes:
+    card = collect_card(*args, **kwargs)
+    img = Image.new("RGB", (card.width + 80, card.height + 80), BG)
+    img.paste(card, (40, 40), card)
+    return _png(img)
+
+
+def render_album(owner: str, entries: list[dict], deck: int) -> bytes:
+    """Альбом /collection: entries — [{"name","rarity","count","stats","num","photo"}] пойманные (лучшая редкость
+    на человека), остальное до deck — пустые «?»."""
+    w = 1000
+    cw, ch, gap = 200, 293, 24
+    slots = max(deck, len(entries))
+    slots = min(max(slots, 4), 24)
+    rows = (slots + 3) // 4
+    h = 250 + rows * (ch + gap) + 40
+    img = _noise(Image.new("RGB", (w, h), BG), 5)
+    d = ImageDraw.Draw(img)
+    d.text((PAD, 56), f"КОЛЛЕКЦИЯ · {_plain(owner).upper()}"[:40], font=_mono(28), fill=GOLD)
+    d.text((PAD - 4, 96), f"{len(entries)} из {max(deck, len(entries))} карточек", font=_bold(60), fill=TEXT)
+    by = {r: sum(1 for e in entries if e["rarity"] == r) for r in RARITY}
+    dup = sum(max(0, e["count"] - 1) for e in entries)
+    d.text((PAD, 176), f"легендарных {by['легендарная']} · редких {by['редкая']} · обычных {by['обычная']}"
+                       + (f" · повторов {dup}" if dup else ""), font=_regular(28), fill=MUTED)
+    x0 = (w - (4 * cw + 3 * gap)) // 2
+    for i in range(slots):
+        x, y = x0 + (i % 4) * (cw + gap), 250 + (i // 4) * (ch + gap)
+        if i < len(entries):
+            e = entries[i]
+            c = collect_card(e["name"], "", e["rarity"], e["stats"], e["num"], deck, photo=e.get("photo"),
+                             seed=e["num"]).resize((cw, ch), Image.LANCZOS)
+            img.paste(c, (x, y), c)
+            if e["count"] > 1:
+                d.ellipse((x + cw - 56, y - 12, x + cw + 10, y + 54), fill=CLOWN_RED)
+                d.text((x + cw - 23, y + 21), f"×{e['count']}", font=_bold(26), fill=(255, 255, 255), anchor="mm")
+        else:
+            d.rounded_rectangle((x, y, x + cw, y + ch), radius=14, outline=LINE, width=3, fill=(24, 24, 30))
+            d.text((x + cw / 2, y + ch / 2), "?", font=_bold(90), fill=(60, 62, 70), anchor="mm")
+    return _png(img)
+
+
+# ---------- суд чата (handlers/court.py) ----------
+
+
+def _stamp(text: str, size: int, color: tuple, angle: float) -> Image.Image:
+    """Прямоугольная печать с потёртостями, повёрнутая."""
+    import random
+
+    f = _bold(size)
+    tw = ImageDraw.Draw(Image.new("RGBA", (10, 10))).textlength(text, font=f)
+    w, h = int(tw + size * 1.2), int(size * 1.6)
+    im = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    d.rounded_rectangle((4, 4, w - 4, h - 4), radius=10, outline=color + (235,), width=max(4, size // 9))
+    d.text((w / 2, h / 2), text, font=f, fill=color + (235,), anchor="mm")
+    rnd = random.Random(3)
+    px = im.load()
+    for _ in range(w * h // 9):
+        x, y = rnd.randrange(w), rnd.randrange(h)
+        r, g, b, a = px[x, y]
+        if a:
+            px[x, y] = (r, g, b, int(a * rnd.uniform(0.15, 0.7)))
+    return im.rotate(angle, expand=True, resample=Image.BICUBIC)
+
+
+def render_verdict(case_no: int, date: str, name: str, charges: list[tuple[str, str]], guilty: bool, votes_for: int,
+                   votes_against: int, lawyer: str, defense: str, nickname: str) -> bytes:
+    """Приговор: дело №, подсудимый, статьи с цитатами, вердикт присяжных полоской, адвокат, наказание, печать."""
+    w = 1000
+    img = _noise(Image.new("RGB", (w, 2200), BG), 11)
+    d = ImageDraw.Draw(img)
+    d.text((PAD, 60), f"СУД ЧАТА · ДЕЛО № {case_no} · {date}", font=_mono(28), fill=CLOWN_RED)
+    d.text((PAD - 4, 104), "ПРИГОВОР", font=_bold(84), fill=TEXT)
+    d.text((PAD, 206), "ПОДСУДИМЫЙ", font=_mono(24), fill=MUTED)
+    nm = _wrap(d, _plain(name), _bold(60), 470, 1)[0]
+    d.text((PAD, 238), nm, font=_bold(60), fill=GOLD)
+    y = 336
+    box_top = y
+    y += 70
+    for title, quote in charges[:3]:
+        for line in _wrap(d, _plain(title), _bold(32), w - 2 * PAD - 60, 2):
+            d.text((PAD + 30, y), line, font=_bold(32), fill=TEXT)
+            y += 44
+        for line in _wrap(d, _plain(quote), _regular(30), w - 2 * PAD - 60, 3):
+            d.text((PAD + 30, y), line, font=_regular(30), fill=(200, 200, 196))
+            y += 40
+        y += 22
+    d.rounded_rectangle([PAD, box_top, w - PAD, y + 4], radius=20, outline=LINE, width=2)
+    d.text((PAD + 30, box_top + 22), "СОСТАВ ПРЕСТУПЛЕНИЯ", font=_mono(24), fill=CLOWN_RED)
+    y += 44
+    d.text((PAD, y), "ВЕРДИКТ ПРИСЯЖНЫХ", font=_mono(24), fill=MUTED)
+    y += 42
+    bw = w - 2 * PAD
+    total = votes_for + votes_against
+    d.rounded_rectangle([PAD, y, PAD + bw, y + 34], radius=17, fill=(44, 46, 54))
+    if total:
+        d.rounded_rectangle([PAD, y, PAD + max(34, int(bw * votes_for / total)), y + 34], radius=17,
+                            fill=CLOWN_RED if votes_for else (44, 46, 54))
+    y += 48
+    d.text((PAD, y), f"Виновен: {votes_for}", font=_bold(30), fill=CLOWN_RED)
+    d.text((w - PAD, y), f"Оправдать: {votes_against}", font=_bold(30), fill=MUTED, anchor="ra")
+    y += 70
+    if lawyer:
+        line = f"АДВОКАТ: {_plain(lawyer)}" + (f" · «{_plain(defense)}»" if defense else "")
+        for part in _wrap(d, line, _regular(28), w - 2 * PAD, 2):
+            d.text((PAD, y), part, font=_regular(28), fill=MUTED)
+            y += 38
+    else:
+        d.text((PAD, y), "АДВОКАТ: не нашёлся - даже друзья не впряглись", font=_regular(28), fill=MUTED)
+        y += 38
+    y += 26
+    if guilty:
+        d.rounded_rectangle([PAD, y, w - PAD, y + 196], radius=20, fill=PANEL, outline=LINE, width=2)
+        d.text((PAD + 30, y + 22), "НАКАЗАНИЕ · 24 ЧАСА", font=_mono(24), fill=GOLD)
+        d.text((PAD + 30, y + 66), _wrap(d, f"Прозвище: «{_plain(nickname)}»", _bold(32), w - 2 * PAD - 60, 1)[0],
+               font=_bold(32), fill=TEXT)
+        face = _clown(48)
+        img.paste(face, (PAD + 26, y + 108), face)
+        d.text((PAD + 84, y + 116), "клоун на каждое сообщение", font=_bold(32), fill=TEXT)
+        y += 230
+    else:
+        d.rounded_rectangle([PAD, y, w - PAD, y + 120], radius=20, fill=PANEL, outline=LINE, width=2)
+        d.text((PAD + 30, y + 22), "РЕШЕНИЕ", font=_mono(24), fill=GOLD)
+        d.text((PAD + 30, y + 64), "Оправдан. Пока что.", font=_bold(32), fill=TEXT)
+        y += 154
+    d.text((PAD, y), "СУДЬЯ: ПИЗДЮК · ОБЖАЛОВАНИЮ НЕ ПОДЛЕЖИТ", font=_mono(22), fill=MUTED)
+    h = y + 70
+    img = img.crop((0, 0, w, h)).convert("RGBA")
+    st = _stamp("ВИНОВЕН" if guilty else "ОПРАВДАН", 74 if guilty else 64,
+                CLOWN_RED if guilty else (80, 190, 120), 14)
+    img.alpha_composite(st, (w - st.width - 40, 120))
+    img = img.convert("RGB")
+    _stripes(img, 0)
+    _stripes(img, h - 16)
+    return _png(img)
+
+
+# ---------- протокол происшествия (handlers/protocol.py) ----------
+
+
+def render_protocol(no: int, when: str, place: str, violator: str, victim: str, story: str, explanation: str,
+                    witnesses: str, seized: str, article: str) -> bytes:
+    """Бланк протокола: бумага, печатные поля, «машинописный» текст, подпись и синяя круглая печать."""
+    import math
+    import random
+
+    from PIL import ImageFilter
+
+    w, h = 1000, 2400
+    paper = (243, 237, 222)
+    img = Image.new("RGB", (w, h), paper)
+    rnd = random.Random(no)
+    px = img.load()
+    for _ in range(w * h // 6):  # фактура бумаги
+        x, y = rnd.randrange(w), rnd.randrange(h)
+        v = rnd.randint(-10, 6)
+        r, g, b = px[x, y]
+        px[x, y] = (r + v, g + v, b + v)
+    img = img.filter(ImageFilter.GaussianBlur(0.6))
+    d = ImageDraw.Draw(img)
+    ink, blue, typed, label_col = (40, 38, 36), (40, 60, 150), (30, 30, 34), (90, 86, 80)
+    d.text((w / 2, 70), f"ПРОТОКОЛ № {no:04d}", font=_serif(46, True), fill=ink, anchor="mm")
+    d.text((w / 2, 116), "об административном правонарушении в чате", font=_serif(28), fill=ink, anchor="mm")
+    d.line((70, 150, w - 70, 150), fill=ink, width=2)
+    y = 178
+
+    def field(label: str, value: str, y: int) -> int:
+        if not value:
+            return y
+        d.text((70, y), label, font=_serif(24), fill=label_col)
+        lx = 70 + d.textlength(label, font=_serif(24)) + 14
+        lines = _wrap(d, _plain(value), _mono(26), w - 70 - lx, 3)
+        for i, line in enumerate(lines):
+            yy = y + i * 46
+            d.text((lx, yy - 2), line, font=_mono(26), fill=typed)
+            d.line((lx, yy + 32, w - 70, yy + 32), fill=(150, 144, 134), width=1)
+        return y + 46 * len(lines) + 14
+
+    y = field("Дата и время:", when, y)
+    y = field("Место:", place, y)
+    y = field("Нарушитель:", violator, y)
+    y = field("Потерпевший:", victim, y)
+    y += 10
+    d.text((70, y), "Обстоятельства:", font=_serif(24), fill=label_col)
+    y += 40
+    for line in _wrap(d, _plain(story), _mono(26), w - 140, 14):
+        d.text((70, y), line, font=_mono(26), fill=typed)
+        y += 40
+    y += 20
+    y = field("Объяснение нарушителя:", f"«{_plain(explanation)}»" if explanation else "", y)
+    y = field("Свидетели:", witnesses, y)
+    y = field("Изъято:", seized, y)
+    y = field("Квалификация:", article, y)
+    y += 40
+    d.text((70, y), "Протокол составил:", font=_serif(24), fill=label_col)
+    d.text((70, y + 40), "ст. лейтенант Пиздюк", font=_mono(28), fill=typed)
+    d.line((560, y + 70, 900, y + 70), fill=ink, width=1)
+    pts = [(580 + i * 4, y + 56 - 18 * math.sin(i / 5) - (i % 7)) for i in range(70)]
+    d.line(pts, fill=blue, width=3)
+    d.text((730, y + 80), "(подпись)", font=_serif(18), fill=(120, 116, 110), anchor="ma")
+    y += 130
+    d.text((70, y), "С протоколом ознакомлен, от подписи отказался.", font=_serif(22), fill=label_col)
+    h = y + 90
+    img = img.crop((0, 0, w, h)).convert("RGBA")
+    s = 300
+    st = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(st)
+    sd.ellipse((6, 6, s - 6, s - 6), outline=blue + (200,), width=6)
+    sd.ellipse((40, 40, s - 40, s - 40), outline=blue + (200,), width=3)
+    ring = "ДЕЖУРНАЯ ЧАСТЬ ЧАТА · ВОЛГОГРАД · "
+    for i, ch in enumerate(ring):
+        a = 2 * math.pi * i / len(ring) - math.pi / 2
+        cx, cy = s / 2 + 118 * math.cos(a), s / 2 + 118 * math.sin(a)
+        g = Image.new("RGBA", (40, 40), (0, 0, 0, 0))
+        ImageDraw.Draw(g).text((20, 20), ch, font=_bold(22), fill=blue + (210,), anchor="mm")
+        g = g.rotate(-math.degrees(a) - 90, resample=Image.BICUBIC)
+        st.alpha_composite(g, (int(cx - 20), int(cy - 20)))
+    sd.text((s / 2, s / 2 - 16), "ДЛЯ", font=_bold(30), fill=blue + (210,), anchor="mm")
+    sd.text((s / 2, s / 2 + 22), "СРАЧЕЙ", font=_bold(34), fill=blue + (210,), anchor="mm")
+    st = st.rotate(-12, resample=Image.BICUBIC)
+    img.alpha_composite(st, (w - 340, h - 330))
+    return _png(img.convert("RGB"))
+
+
+# ---------- сериал про чат (handlers/serial.py) ----------
+
+
+def render_serial_cover(season: int, episode: int, title: str, logline: str, cast: list[str]) -> bytes:
+    """Обложка серии: тёмный кинематографичный градиент, «ЧАТ · СЕЗОН 1 · СЕРИЯ N», название, логлайн, в ролях."""
+    w, h = 1000, 640
+    img = Image.new("RGB", (w, h), (10, 10, 14))
+    d = ImageDraw.Draw(img)
+    for i in range(h):
+        t = i / h
+        d.line((0, i, w, i), fill=(int(40 * (1 - t) + 10), int(18 * (1 - t) + 10), int(60 * (1 - t) + 14)))
+    img = _noise(img, episode)
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, w, 44), fill=(0, 0, 0))
+    d.rectangle((0, h - 44, w, h), fill=(0, 0, 0))
+    d.text((PAD, 96), f"ЧАТ · СЕЗОН {season} · СЕРИЯ {episode}", font=_mono(30), fill=GOLD)
+    y = 150
+    size = 84
+    t = f"«{_plain(title).upper()}»"
+    while size > 48 and len(_wrap(d, t, _serif(size, True), w - 2 * PAD, 3)) > 2:
+        size -= 6
+    for line in _wrap(d, t, _serif(size, True), w - 2 * PAD, 2):
+        d.text((PAD - 4, y), line, font=_serif(size, True), fill=TEXT)
+        y += int(size * 1.2)
+    for line in _wrap(d, _plain(logline), _regular(30), w - 2 * PAD, 2):
+        d.text((PAD, y + 20), line, font=_regular(30), fill=(200, 196, 210))
+        y += 42
+    if cast:
+        d.text((PAD, h - 120), _wrap(d, "В РОЛЯХ:  " + " · ".join(_plain(c) for c in cast[:6]), _mono(24),
+                                     w - 2 * PAD, 1)[0], font=_mono(24), fill=MUTED)
+    return _png(img)
