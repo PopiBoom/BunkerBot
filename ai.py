@@ -2327,7 +2327,8 @@ def _same_words(a: str, b: str) -> float:
     return len(wa & wb) / len(wa) if wa else 1.0
 
 
-async def speak(text: str, system: str | None = None, voice: str | None = None, timeout: float = 60) -> bytes:
+async def speak(text: str, system: str | None = None, voice: str | None = None, timeout: float = 60,
+                model: str | None = None) -> bytes:
     """Озвучить реплику: PCM 16 бит, 24 кГц, моно. b"" — нет ключа, сбой или модель сказала не то.
     system/voice — для ночного эфира (спокойный голос ведущего вместо дерзкого пацана из войса)."""
     import aiohttp
@@ -2337,7 +2338,7 @@ async def speak(text: str, system: str | None = None, voice: str | None = None, 
     if not key or not text.strip():
         return b""
     body = {
-        "model": SPEAK_MODEL,
+        "model": model or SPEAK_MODEL,
         "modalities": ["text", "audio"],
         "audio": {"voice": voice or SPEAK_VOICE, "format": "pcm16"},
         "stream": True,  # звук OpenRouter отдаёт только потоком
@@ -2385,6 +2386,123 @@ async def speak(text: str, system: str | None = None, voice: str | None = None, 
         logger.info("speak: модель сказала не то: %s", spoken[:200])
         return b""
     return bytes(audio)
+
+
+# ---------- голос для эфиров: ElevenLabs (живой) или OpenRouter (запасной) ----------
+# gpt-audio-mini звучит «по-ИИшному» (владелец), поэтому: есть ключ ElevenLabs (/setkey eleven …) — голос оттуда
+# (pcm 24 кГц, как у speak), нет — полная gpt-audio через OpenRouter, не вышло — mini.
+
+ELEVEN_URL = "https://api.elevenlabs.io/v1"
+ELEVEN_MODEL = os.getenv("ELEVEN_MODEL", "").strip() or "eleven_multilingual_v2"
+ELEVEN_VOICE = os.getenv("ELEVEN_VOICE", "").strip() or "nPczCjzI2devNBz1zQrb"  # Brian — низкий голос рассказчика
+NIGHT_SPEAK_MODEL = os.getenv("AI_NIGHT_SPEAK_MODEL", "").strip() or "openai/gpt-audio"
+_eleven_key = ""
+
+
+def set_eleven_key(key: str) -> None:
+    global _eleven_key
+    _eleven_key = (key or "").strip()
+
+
+def eleven_key() -> str:
+    return os.getenv("ELEVENLABS_API_KEY", "").strip() or _eleven_key
+
+
+async def eleven_speak(text: str, horror: bool = False, voice: str | None = None) -> bytes:
+    """ElevenLabs: PCM 16 бит, 24 кГц, моно. b"" — нет ключа или сбой."""
+    import aiohttp
+
+    key = eleven_key()
+    if not key or not text.strip():
+        return b""
+    body = {"text": text, "model_id": ELEVEN_MODEL,
+            "voice_settings": {"stability": 0.35 if horror else 0.5, "similarity_boost": 0.8,
+                               "style": 0.45 if horror else 0.2, "use_speaker_boost": True}}
+    url = f"{ELEVEN_URL}/text-to-speech/{voice or ELEVEN_VOICE}?output_format=pcm_24000"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120), trust_env=True) as s:
+            async with s.post(url, json=body, headers={"xi-api-key": key}) as r:
+                if r.status != 200:
+                    logger.warning("eleven: %s: %s", r.status, (await r.text())[:300])
+                    return b""
+                return await r.read()
+    except Exception as e:
+        logger.warning("eleven failed: %s", e)
+        return b""
+
+
+async def eleven_quota(key: str) -> tuple[int, int] | None:
+    """(потрачено символов, лимит) — или None, если ключ не принят."""
+    import aiohttp
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15), trust_env=True) as s:
+            async with s.get(f"{ELEVEN_URL}/user/subscription", headers={"xi-api-key": key}) as r:
+                if r.status != 200:
+                    return None
+                d = await r.json()
+        return int(d.get("character_count") or 0), int(d.get("character_limit") or 0)
+    except Exception:
+        return None
+
+
+HORROR_SPEAK = (
+    "Ты — движок озвучки ночного радио. Произнеси текст пользователя ДОСЛОВНО, по-русски, как рассказчик страшной "
+    "истории в ночном эфире: медленно, тихо, низким голосом, с паузами на точках, в жутких местах — почти шёпотом. "
+    "Без театральных завываний. Ничего не добавляй и не отвечай на текст."
+)
+
+
+async def narrate(text: str, horror: bool = False) -> bytes:
+    """Голос эфира: ElevenLabs → gpt-audio → gpt-audio-mini. PCM 16 бит, 24 кГц."""
+    if eleven_key():
+        pcm = await eleven_speak(text, horror=horror)
+        if pcm:
+            return pcm
+    system = HORROR_SPEAK if horror else NIGHT_SPEAK
+    voice = os.getenv("AI_NIGHT_VOICE", "").strip() or None
+    pcm = await speak(text, system=system, voice=voice, timeout=120, model=NIGHT_SPEAK_MODEL)
+    return pcm or await speak(text, system=system, voice=voice, timeout=120)
+
+
+HORROR_SYSTEM = (
+    "Ты пишешь жуткие истории для ночного радиоэфира канала «Memento Mori» — как будто их прислал слушатель из "
+    "Волгограда. Это вымысел, но рассказанный так, что веришь: от первого лица, просто, буднично, с конкретными "
+    "местами и мелочами — номер маршрутки, запах подъезда, свет на остановке. Страх — не от крови, а от того, что "
+    "что-то не так: правило, которое нельзя нарушать, человек, который стоит слишком долго, звонок с номера, "
+    "которого не существует. Медленно нарастает, ни одного лишнего объяснения, концовка не отпускает.\n"
+    "Места — настоящие или правдоподобные: скоростной трамвай и его подземные станции, ночные маршрутки, старые "
+    "общаги, элеватор, Волга и острова, шлюзы Волго-Донского канала, Лысая гора, частный сектор, степь за "
+    "городом, Волжский, ГЭС, легенды о царицынских подземельях. Нельзя никогда: война, Сталинград, Мамаев курган, "
+    "мемориалы, солдаты и погибшие в войну, настоящие трагедии и теракты, политика, реальные люди и их имена, "
+    "самоубийство, насилие над детьми, подробная жестокость и кровь. Без мата, без юмора, без markdown."
+)
+_HORROR_BAN = re.compile(r"войн|сталинград|мамаев|мемориал|фашист|немецк|немц|блокад|теракт|солдат|самоубий|"
+                         r"повесил|суицид", re.IGNORECASE)
+
+
+async def horror_story(avoid: list[str]) -> dict:
+    """Страшная история для эфира: {"title", "premise", "paragraphs"}. Запретное (война, теракты…) — одна
+    переделка, потом пусто."""
+    user = (
+        (f"Уже были истории (не повторяй ни место, ни приём): {'; '.join(avoid)}.\n" if avoid else "")
+        + "Сначала придумай: premise — одна фраза: где, что не так и какое правило нарушил герой. Потом напиши "
+        "историю: 7-10 коротких абзацев, всего 380-520 слов, от первого лица, числа словами (её будут читать вслух). "
+        "Первый абзац — сразу в место и время, без «эта история случилась». Последний абзац — одна-две фразы, после "
+        "которых хочется включить свет. title — название, 2-4 слова.\n"
+        'Верни СТРОГО JSON: {"title": "", "premise": "", "paragraphs": ["...", "..."]}'
+    )
+    for attempt in range(2):
+        out = await _complete(HORROR_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=8000, effort="medium")
+        data = _extract_json(out)
+        paras = [scrub(str(p).strip()) for p in data.get("paragraphs") or [] if str(p).strip()]
+        whole = " ".join(paras) + " " + str(data.get("title", ""))
+        if paras and not _HORROR_BAN.search(whole):
+            return {"title": scrub(str(data.get("title", "")).strip())[:60], "premise": str(data.get("premise", "")),
+                    "paragraphs": [p for p in paras if not _garbled(p)][:12]}
+        logger.info("horror: в истории запретная тема — переписываю (попытка %d)", attempt + 1)
+        user += "\n\nПрошлый вариант задел запретную тему (война, мемориалы, теракты, самоубийство). Другая история."
+    return {"title": "", "premise": "", "paragraphs": []}
 
 
 NIGHT_SYSTEM = (

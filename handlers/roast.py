@@ -1959,7 +1959,8 @@ async def background(bot: Bot, db: Database) -> None:
                 # Первый ночной эфир — владельцу в личку сам, один раз
                 try:
                     from handlers import night
-                    if (await db.get_setting(night.FIRST_KEY, "")) != "1":
+                    first = await db.get_setting(night.FIRST_KEY, "")
+                    if first != "1" or (await db.get_setting(night.HORROR_FIRST_KEY, "")) != "1":
                         _spawn(night.first_tick(bot, db))  # минута-две (ИИ + озвучка) — фон не ждёт
                 except Exception as e:
                     logger.warning("night first tick failed: %s", e)

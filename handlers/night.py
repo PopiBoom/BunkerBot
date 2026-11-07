@@ -6,6 +6,10 @@ Opus, тема из TOPICS, без шуток и без имён — в эфир
 звук — radio.py (полоса приёмника, эфир, ветер или дождь по погоде, позывной) → OGG/Opus.
 Публикует не сам: черновик — голосовым в личку админу с кнопками «В канал / Переписать / Выкинуть».
 /night — новый черновик (≈$0.02). Первый эфир бот прислал владельцу сам после обновления (night_first_sent).
+/horror — «страшная история» (просьба владельца: «очень жуткое про Волгоград, можно вымышленное»): «история, которую
+прислал слушатель» (ai.horror_story — от первого лица, правило, которое нельзя нарушать; война/мемориалы/теракты —
+нельзя), под голосом гул и далёкий стук (radio, horror=True), 2-4 мин. Голос — ai.narrate: ElevenLabs по ключу
+(/setkey eleven …), без него — gpt-audio (mini звучал «по-ИИшному»).
 """
 from __future__ import annotations
 
@@ -36,6 +40,8 @@ LAT, LON = 48.708, 44.513                     # Волгоград
 DRAFT_KEY = "night_draft"
 COUNT_KEY = "night_no"
 FIRST_KEY = "night_first_sent"
+HORROR_FIRST_KEY = "horror_first_sent"
+HORROR_KEY = "horror_titles"
 TOPICS_KEY = "night_topics"
 TOPICS = [
     "обычные дни, которые не запоминаются", "люди за соседними окнами", "дорога домой ночью",
@@ -181,38 +187,51 @@ def _conditions(w: dict | None, now: datetime) -> dict:
 # ---------- эфир ----------
 
 
-async def make_episode(db: Database) -> dict:
-    """{"ogg": bytes | None, "paragraphs": [...], "caption": str, "n": int}. Без ключа OpenRouter — без звука."""
+async def make_episode(db: Database, horror: bool = False) -> dict:
+    """{"ogg": bytes | None, "paragraphs": [...], "caption": str, "n": int}. Без голоса — без звука (текстом)."""
     import radio
 
     now = datetime.now(MSK)
     cond = _conditions(await _weather(), now)
-    try:
-        used = json.loads(await db.get_setting(TOPICS_KEY, "[]") or "[]")
-    except ValueError:
-        used = []
-    topic = random.choice([t for t in TOPICS if t not in used[-12:]] or TOPICS)
-    body = await ai.night_monologue(topic, cond["facts"], used[-4:])
-    if not body:
-        raise RuntimeError("ИИ не написал эфир")
-    paragraphs = [f"{_clock(now).capitalize()}. {cond['line']}".strip()] + body + \
-                 [f"Это был ночной эфир. {cond['end']}".strip()]
-    await db.set_setting(TOPICS_KEY, json.dumps((used + [topic])[-30:], ensure_ascii=False))
+    clock = f"{_clock(now).capitalize()}."
+    if horror:
+        try:
+            used = json.loads(await db.get_setting(HORROR_KEY, "[]") or "[]")
+        except ValueError:
+            used = []
+        story = await ai.horror_story(used[-10:])
+        if not story["paragraphs"]:
+            raise RuntimeError("ИИ не написал историю")
+        topic = story["title"] or "без названия"
+        paragraphs = ([f"{clock} Это ночной эфир. Сегодня - история, которую нам прислал слушатель. Он просил не "
+                       "называть его имени."] + story["paragraphs"]
+                      + [f"Это был ночной эфир. {cond['end']} Не выключайте свет.".replace("  ", " ")])
+        await db.set_setting(HORROR_KEY, json.dumps((used + [f"{topic}: {story['premise']}"[:160]])[-30:],
+                                                    ensure_ascii=False))
+    else:
+        try:
+            used = json.loads(await db.get_setting(TOPICS_KEY, "[]") or "[]")
+        except ValueError:
+            used = []
+        topic = random.choice([t for t in TOPICS if t not in used[-12:]] or TOPICS)
+        body = await ai.night_monologue(topic, cond["facts"], used[-4:])
+        if not body:
+            raise RuntimeError("ИИ не написал эфир")
+        paragraphs = [f"{clock} {cond['line']}".strip()] + body + [f"Это был ночной эфир. {cond['end']}".strip()]
+        await db.set_setting(TOPICS_KEY, json.dumps((used + [topic])[-30:], ensure_ascii=False))
     n = int(await db.get_setting(COUNT_KEY, "0") or 0) + 1
-    caption = f"🎙 <b>Ночной эфир №{n}</b> · {now:%H:%M}" + (f" · {html.escape(cond['caption'])}"
-                                                            if cond["caption"] else "")
+    head = f"🕯 <b>Ночной эфир №{n} · «{html.escape(topic)}»</b>" if horror else f"🎙 <b>Ночной эфир №{n}</b>"
+    caption = head + f" · {now:%H:%M}" + (f" · {html.escape(cond['caption'])}" if cond["caption"] else "")
     voice = []
     for p in paragraphs:
-        pcm = await ai.speak(p, system=ai.NIGHT_SPEAK, voice=os.getenv("AI_NIGHT_VOICE", "").strip() or None,
-                             timeout=120)
-        if not pcm:  # одна повторная попытка — потом без звука
-            pcm = await ai.speak(p, system=ai.NIGHT_SPEAK, timeout=120)
+        pcm = await ai.narrate(p, horror=horror)
         if not pcm:
             return {"ogg": None, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic}
         voice.append(pcm)
-    mix = await asyncio.to_thread(radio.broadcast, voice, ai.SPEAK_RATE, cond["rain"], int(time.time()))
+    mix = await asyncio.to_thread(radio.broadcast, voice, ai.SPEAK_RATE, cond["rain"], int(time.time()), horror)
     ogg = await asyncio.to_thread(radio.to_ogg, mix)
-    logger.info("ночной эфир №%s: тема «%s», %.0f сек", n, topic, len(mix) / radio.SR)
+    logger.info("ночной эфир №%s%s: «%s», %.0f сек, голос %s", n, " (страшная история)" if horror else "", topic,
+                len(mix) / radio.SR, "ElevenLabs" if ai.eleven_key() else "OpenRouter")
     return {"ogg": ogg, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic}
 
 
@@ -223,30 +242,36 @@ def _kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🗑 Выкинуть", callback_data="nr:del")]])
 
 
-async def send_draft(bot: Bot, db: Database, chat_id: int) -> bool:
+async def send_draft(bot: Bot, db: Database, chat_id: int, horror: bool = False) -> bool:
     """Собрать эфир и прислать черновик в личку на одобрение."""
     async with _lock:
         try:
             await bot.send_chat_action(chat_id, "record_voice")
         except Exception:
             pass
-        ep = await make_episode(db)
+        ep = await make_episode(db, horror=horror)
         text = "\n\n".join(ep["paragraphs"])
         if not ep["ogg"]:
-            await bot.send_message(chat_id, f"{ep['caption']}\n\n{html.escape(text)}\n\n<i>Озвучить не вышло: нет ключа "
-                                            "OpenRouter (/setkey) или сбой озвучки. Это текст эфира.</i>")
+            await bot.send_message(chat_id, f"{ep['caption']}\n\n{html.escape(text)[:3200]}\n\n<i>Озвучить не вышло: нет "
+                                            "ключа OpenRouter или ElevenLabs (/setkey) или сбой озвучки. Это текст.</i>")
             return False
         msg = await bot.send_voice(chat_id, BufferedInputFile(ep["ogg"], "night.ogg"), reply_markup=_kb(),
                                    caption=f"{ep['caption']}\n\n<i>Черновик. Текст:</i>\n"
                                            f"<blockquote expandable>{html.escape(text)[:800]}</blockquote>")
         await db.set_setting(DRAFT_KEY, json.dumps({"file_id": msg.voice.file_id, "caption": ep["caption"],
-                                                    "n": ep["n"], "msg": msg.message_id, "chat": chat_id},
-                                                   ensure_ascii=False))
+                                                    "n": ep["n"], "msg": msg.message_id, "chat": chat_id,
+                                                    "horror": horror}, ensure_ascii=False))
         return True
 
 
+@router.message(Command("horror"))
+async def cmd_horror(message: Message, bot: Bot, db: Database) -> None:
+    """/horror — страшная история про Волгоград черновиком в личку."""
+    await cmd_night(message, bot, db, horror=True)
+
+
 @router.message(Command("night"))
-async def cmd_night(message: Message, bot: Bot, db: Database) -> None:
+async def cmd_night(message: Message, bot: Bot, db: Database, horror: bool = False) -> None:
     """/night — новый ночной эфир черновиком в личку."""
     if not ai.available():
         await message.answer("ИИ недоступен - эфир не написать.")
@@ -254,14 +279,15 @@ async def cmd_night(message: Message, bot: Bot, db: Database) -> None:
     uid = message.from_user.id
     if message.chat.type != "private":
         try:
-            await bot.send_message(uid, "🎙 Собираю ночной эфир - минута-две…")
+            await bot.send_message(uid, "🕯 Пишу страшную историю - минуты три…" if horror
+                                   else "🎙 Собираю ночной эфир - минута-две…")
         except Exception:
             await message.answer("Напиши боту /start в личку - черновик эфира приходит туда.")
             return
     else:
-        await message.answer("🎙 Собираю ночной эфир - минута-две…")
+        await message.answer("🕯 Пишу страшную историю - минуты три…" if horror else "🎙 Собираю ночной эфир - минута-две…")
     try:
-        await send_draft(bot, db, uid)
+        await send_draft(bot, db, uid, horror=horror)
     except Exception as e:
         logger.exception("night draft failed")
         await bot.send_message(uid, f"Эфир не собрался: {html.escape(str(e))[:200]}")
@@ -310,15 +336,18 @@ async def cb_night(call: CallbackQuery, bot: Bot, db: Database, config: Config) 
         await call.answer("Переписываю - минута-две.")
         await mark("🔄 Переписан - новый ниже.")
         try:
-            await send_draft(bot, db, call.message.chat.id)
+            await send_draft(bot, db, call.message.chat.id, horror=bool(draft.get("horror")))
         except Exception as e:
             logger.exception("night redo failed")
             await bot.send_message(call.message.chat.id, f"Эфир не собрался: {html.escape(str(e))[:200]}")
 
 
 async def first_tick(bot: Bot, db: Database) -> None:
-    """Из фона: первый эфир — владельцу в личку сам, один раз после обновления (просьба: «закинь в личку»)."""
+    """Из фона: первый эфир — владельцу в личку сам, один раз после обновления (просьба: «закинь в личку»); первая
+    страшная история — так же."""
     if (await db.get_setting(FIRST_KEY, "")) == "1":
+        if (await db.get_setting(HORROR_FIRST_KEY, "")) != "1":
+            await _first_horror(bot, db)
         return
     raw = os.getenv("BOT_FATHER_ID", "") or os.getenv("ADMIN_IDS", "").replace(";", ",").split(",")[0]
     try:
@@ -331,3 +360,19 @@ async def first_tick(bot: Bot, db: Database) -> None:
         await send_draft(bot, db, owner)
     except Exception:
         logger.exception("night: первый эфир не ушёл")
+
+
+async def _first_horror(bot: Bot, db: Database) -> None:
+    raw = os.getenv("BOT_FATHER_ID", "") or os.getenv("ADMIN_IDS", "").replace(";", ",").split(",")[0]
+    try:
+        owner = int(raw.strip())
+    except ValueError:
+        return
+    await db.set_setting(HORROR_FIRST_KEY, "1")
+    try:
+        await bot.send_message(owner, "🕯 Первая страшная история для ночного эфира - черновик, в канал только по кнопке."
+                               + ("" if ai.eleven_key() else "\nГолос пока запасной (gpt-audio). Живой голос - "
+                                  "ключ ElevenLabs: /setkey eleven <ключ>."))
+        await send_draft(bot, db, owner, horror=True)
+    except Exception:
+        logger.exception("night: первая страшная история не ушла")

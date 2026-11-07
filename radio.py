@@ -107,10 +107,29 @@ def _ident() -> np.ndarray:
     return np.concatenate(out) * 0.5
 
 
-def broadcast(voice_chunks: list[bytes], rate: int = 24000, rain: bool = False, seed: int = 0) -> np.ndarray:
-    """Весь эфир (float32, 48 кГц, моно, пик ≈ -1 дБ)."""
+def _drone(n: int, rng: np.random.Generator) -> np.ndarray:
+    """Для страшной истории: низкий гул (две близкие ноты — биения) и редкие глухие удары где-то далеко."""
+    t = np.arange(n) / SR
+    base = rng.uniform(46, 55)
+    hum = np.sin(2 * np.pi * base * t) + 0.7 * np.sin(2 * np.pi * (base * 1.007) * t) + \
+        0.25 * np.sin(2 * np.pi * base * 2.01 * t)
+    hum *= 0.6 + 0.4 * np.sin(2 * np.pi * 0.05 * t + rng.uniform(0, 6))
+    knocks = np.zeros(n)
+    for pos in rng.integers(int(4 * SR), max(int(4 * SR) + 1, n), size=max(1, int(n / SR / 14))):
+        for k in range(rng.integers(1, 4)):  # стук: 1-3 удара
+            p = pos + k * int(0.42 * SR)
+            ln = min(int(0.25 * SR), n - p)
+            if ln > 0:
+                knocks[p:p + ln] += np.sin(2 * np.pi * 70 * np.arange(ln) / SR) * np.exp(-np.arange(ln) / 1800)
+    out = 0.6 * hum / (np.abs(hum).max() or 1) + 0.9 * knocks
+    return out / (np.abs(out).max() or 1)
+
+
+def broadcast(voice_chunks: list[bytes], rate: int = 24000, rain: bool = False, seed: int = 0,
+              horror: bool = False) -> np.ndarray:
+    """Весь эфир (float32, 48 кГц, моно, пик ≈ -1 дБ). horror — гул, далёкий стук и паузы длиннее."""
     rng = np.random.default_rng(seed)
-    pause = np.zeros(int(0.85 * SR), dtype=np.float32)
+    pause = np.zeros(int((1.3 if horror else 0.85) * SR), dtype=np.float32)
     parts = []
     for i, pcm in enumerate(voice_chunks):
         v = _resample(pcm, rate)
@@ -141,6 +160,8 @@ def broadcast(voice_chunks: list[bytes], rate: int = 24000, rain: bool = False, 
     bed_n = n - (len(intro_tune) - int(0.5 * SR))
     bed = _db(-33) * _static(bed_n, rng)
     bed += _db(-25 if rain else -24) * _band(_rain(bed_n, rng) if rain else _wind(bed_n, rng), 200, 4200)
+    if horror:  # гул и стук — не сквозь приёмник, «в комнате» у слушателя
+        bed += _db(-24) * _band(_drone(bed_n, rng), 30, 900)
     bed = _fade(bed, 0.8, 0.3)
     mix[n - bed_n:] += bed
     # конец: всплеск эфира и щелчок выключения
@@ -151,7 +172,7 @@ def broadcast(voice_chunks: list[bytes], rate: int = 24000, rain: bool = False, 
         burst = burst / (np.abs(burst).max() or 1) * np.linspace(0.05, 0.45, burst_n)
         mix[end:] += burst
         mix[-200:] = 0
-    mix = _band(mix, 120, 7500)
+    mix = _band(mix, 35 if horror else 120, 7500)
     mix /= np.abs(mix).max() or 1
     return (mix * _db(-1)).astype(np.float32)
 

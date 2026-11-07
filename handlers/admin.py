@@ -96,10 +96,15 @@ async def cmd_setkey(message: Message, command: CommandObject, db: Database, con
     import ai
 
     arg = (command.args or "").strip()
+    if arg.lower().startswith(("eleven", "11labs", "elevenlabs")):
+        await _set_eleven(message, arg.split(maxsplit=1)[1].strip() if len(arg.split()) > 1 else "", db)
+        return
     if not arg:
         await message.answer(
             "🔑 <b>Ключ OpenRouter</b>\n\n<code>/setkey sk-or-...</code> — сохранить (сообщение с ключом удалю)\n"
-            "<code>/setkey off</code> — удалить\n\n"
+            "<code>/setkey off</code> — удалить\n"
+            "<code>/setkey eleven ключ</code> — живой голос ночного эфира (ElevenLabs), <code>/setkey eleven off</code>"
+            " — убрать\n\n"
             f"Сейчас: {'есть ✅' if ai.openrouter_available() else 'нет'}. Ключ хранится в базе бота на сервере, "
             "в GitHub не попадает (но есть в файлах /backup — их не пересылай).")
         return
@@ -123,6 +128,36 @@ async def cmd_setkey(message: Message, command: CommandObject, db: Database, con
     ai.set_openrouter_key(arg)
     await message.answer(f"✅ Ключ OpenRouter сохранён на сервере, сообщение с ним удалил.\n"
                          f"Баланс: <b>${balance:.2f}</b>. Теперь работают /compare и Gemini в постах.")
+
+
+async def _set_eleven(message: Message, key: str, db: Database) -> None:
+    """Ключ ElevenLabs — голос ночного эфира (handlers/night.py). Как и OpenRouter: в базу, сообщение удаляем."""
+    import ai
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    if not key:
+        await message.answer("🔑 <b>ElevenLabs</b> - живой голос для ночного эфира и страшных историй.\n\n"
+                             "<code>/setkey eleven ключ</code> - сохранить, <code>/setkey eleven off</code> - убрать.\n"
+                             f"Сейчас: {'есть ✅' if ai.eleven_key() else 'нет (голос запасной, gpt-audio)'}.")
+        return
+    if key.lower() in ("off", "удалить", "-"):
+        await db.set_setting("eleven_key", "")
+        ai.set_eleven_key("")
+        await message.answer("🔑 Ключ ElevenLabs удалён - эфиры снова запасным голосом.")
+        return
+    quota = await ai.eleven_quota(key)
+    if quota is None:
+        await message.answer("❌ ElevenLabs не принял ключ - проверь, что он скопирован целиком.")
+        return
+    await db.set_setting("eleven_key", key)
+    ai.set_eleven_key(key)
+    used, limit = quota
+    await message.answer(f"✅ Ключ ElevenLabs сохранён на сервере, сообщение с ним удалил.\n"
+                         f"Символов в этом месяце: {used:,} из {limit:,}. Страшная история - примерно 3 000 символов."
+                         .replace(",", " "))
 
 
 async def _openrouter_balance(key: str) -> float | None:
