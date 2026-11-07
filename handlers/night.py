@@ -215,8 +215,8 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop) -> di
             raise RuntimeError("ИИ не написал историю")
         topic = story["subject"] or story["title"] or "без темы"
         sent = now.replace(hour=random.randint(2, 4), minute=random.randint(1, 59))
-        intro = (f"{clock} Это ночной эфир «Мементо мори». Доброй ночи тем, кто не спит. Сегодня на почту эфира "
-                 f"пришло письмо." + (f" Тема: «{story['subject']}»." if story["subject"] else "")
+        intro = (f"{clock} Ночной эфир «Мементо мори». На почту эфира пришло письмо."
+                 + (f" Тема: «{story['subject']}»." if story["subject"] else "")
                  + f" Отправлено в {_clock(sent)} ночи. Читаю без изменений.")
         paragraphs = [intro] + story["paragraphs"] + ([story["outro"]] if story["outro"] else []) \
             + [f"Это был ночной эфир. {cond['end']} Не выключайте свет.".replace("  ", " ")]
