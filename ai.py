@@ -2508,6 +2508,12 @@ async def eleven_speak(text: str, horror: bool = False, voice: str | None = None
                     return b""
                 data = await r.read()
                 ctype = r.headers.get("content-type") or ""
+                if "audio" not in ctype and "octet" not in ctype:  # вместо звука — страница (блок по стране, прокси…)
+                    page = data[:4000].decode("utf-8", "replace")
+                    m = re.search(r"<title[^>]*>(.*?)</title>", page, re.IGNORECASE | re.DOTALL)
+                    gist = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", m.group(1) if m else page)).strip()[:200]
+                    logger.warning("eleven: вместо звука %s (%d байт) с %s: %s", ctype, len(data), r.url.host, gist)
+                    return b""
                 logger.info("eleven: %s, %d байт (≈%.1f с), начало %s", ctype, len(data), len(data) / 48000, data[:4])
                 return data if "pcm" in ctype else to_pcm24(data)  # сказали «pcm» — по первым байтам не гадаем
     except Exception as e:
