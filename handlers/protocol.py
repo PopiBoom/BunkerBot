@@ -3,6 +3,7 @@
 Админ пишет /protocol (ответом на сообщение, с которого всё началось, — тогда с него; иначе последние MSGS
 сообщений). ИИ (Opus, ai.protocol, ≈$0.01) — нарушитель, потерпевший, обстоятельства, свидетели, «изъято», статья;
 «объяснение нарушителя» — ДОСЛОВНО его сообщение (ИИ даёт только id). Картинка — cards.render_protocol.
+ОДИН эпизод (первая версия клеила цитаты из четырёх веток — владелец: «бессмыслица»), ≤ 2 цитат — см. ai.protocol.
 """
 from __future__ import annotations
 
@@ -51,7 +52,7 @@ async def cmd_protocol(message: Message, bot: Bot, db: Database) -> None:
         return
     await bot.send_chat_action(chat_id, "upload_photo")
     try:
-        p = await ai.protocol(_as_dicts(rows))
+        p = await ai.protocol(_as_dicts(rows), start_id=rt.message_id if rt else None)
     except Exception as e:
         logger.warning("protocol AI failed: %s", e)
         await temp_reply(message, "Не вышло составить протокол - попробуй ещё раз.")

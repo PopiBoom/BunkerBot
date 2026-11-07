@@ -1,6 +1,6 @@
 """/sud — суд чата (идея и макет приговора — с владельцем, 07.11).
 
-Админ: /sud ответом на сообщение человека или /sud @ник. Дальше:
+Админ: /sud ответом на сообщение человека (это сообщение — повод, статья 1) или /sud @ник. Дальше:
 1) ИИ-прокурор (ai.court_charges) предъявляет 2-3 статьи — улики ДОСЛОВНО из его сообщений за неделю (ИИ даёт
    только id, текст подставляет код); нет ни одной настоящей улики — «оправдан за отсутствием состава».
 2) Защита DEFENSE_TIME: кнопка «🛡 Стать адвокатом» — первый нажавший (не подсудимый) защищает, его следующее
@@ -152,8 +152,14 @@ async def cmd_sud(message: Message, command: CommandObject, bot: Bot, db: Databa
         await bot.send_chat_action(chat_id, "typing")
         promises = [p["what"] for p in await db.promises_due_between(chat_id, int(time.time()) - 14 * 86400,
                                                                      int(time.time())) if p["name"] == name]
+        main = None
+        if rt and rt.from_user and rt.from_user.id == uid and (rt.text or rt.caption):
+            # повод для суда — сообщение, ответом на которое подали иск: статья 1 за него
+            main = {"id": rt.message_id, "text": rt.text or rt.caption}
+            if rt.message_id not in {r[0] for r in rows}:
+                rows.append((rt.message_id, uid, name, main["text"], int(rt.date.timestamp())))
         res = await ai.court_charges(name, await db.get_dossier(chat_id, uid),
-                                     [{"id": r[0], "name": r[2], "text": r[3]} for r in rows], promises)
+                                     [{"id": r[0], "name": r[2], "text": r[3]} for r in rows], promises, main=main)
     except Exception as e:
         logger.warning("court charges failed: %s", e)
         c["phase"] = "done"

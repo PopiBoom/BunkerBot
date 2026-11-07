@@ -535,7 +535,7 @@ def render_protocol(no: int, when: str, place: str, violator: str, victim: str, 
     d.text((730, y + 80), "(подпись)", font=_serif(18), fill=(120, 116, 110), anchor="ma")
     y += 130
     d.text((70, y), "С протоколом ознакомлен, от подписи отказался.", font=_serif(22), fill=label_col)
-    h = y + 90
+    h = y + 150  # место под печать: она ставится ниже статьи, на подпись (раньше налезала на «Квалификацию»)
     img = img.crop((0, 0, w, h)).convert("RGBA")
     s = 300
     st = Image.new("RGBA", (s, s), (0, 0, 0, 0))
@@ -553,7 +553,7 @@ def render_protocol(no: int, when: str, place: str, violator: str, victim: str, 
     sd.text((s / 2, s / 2 - 16), "ДЛЯ", font=_bold(30), fill=blue + (210,), anchor="mm")
     sd.text((s / 2, s / 2 + 22), "СРАЧЕЙ", font=_bold(34), fill=blue + (210,), anchor="mm")
     st = st.rotate(-12, resample=Image.BICUBIC)
-    img.alpha_composite(st, (w - 340, h - 330))
+    img.alpha_composite(st, (w - 340, h - st.height - 10))
     return _png(img.convert("RGB"))
 
 
