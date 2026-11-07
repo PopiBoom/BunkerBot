@@ -12,7 +12,8 @@ Opus, тема из TOPICS, без шуток и без имён — в эфир
 (ai.horror_story: каждый раз новый приём из HORROR_ENGINES, эскалация в три ступени, удар по самому близкому, без
 клише и бытовой завязки; война/мемориалы/теракты — нельзя), приписка ведущего (что случилось, когда редакция
 ответила автору), в самых жутких местах — сбой эфира (radio glitches), под голосом гул и далёкий стук, 3-5 мин. Голос — ai.narrate: ElevenLabs по ключу
-(/setkey eleven …), без него — gpt-audio (mini звучал «по-ИИшному»).
+(/setkey eleven …; на сервере закрыт по региону), Яндекс SpeechKit (/setkey yandex …), без них — gpt-audio
+(mini звучал «по-ИИшному»).
 """
 from __future__ import annotations
 
@@ -239,7 +240,7 @@ async def make_episode(db: Database, horror: bool = False) -> dict:
                                   glitches)
     ogg = await asyncio.to_thread(radio.to_ogg, mix)
     logger.info("ночной эфир №%s%s: «%s», %.0f сек, голос %s", n, " (страшная история)" if horror else "", topic,
-                len(mix) / radio.SR, "ElevenLabs" if ai.eleven_key() else "OpenRouter")
+                len(mix) / radio.SR, ai.last_voice[0] or "?")
     return {"ogg": ogg, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic}
 
 
@@ -379,8 +380,8 @@ async def _first_horror(bot: Bot, db: Database) -> None:
     await db.set_setting(HORROR_FIRST_KEY, "1")
     try:
         await bot.send_message(owner, "🕯 Первая страшная история для ночного эфира - черновик, в канал только по кнопке."
-                               + ("" if ai.eleven_key() else "\nГолос пока запасной (gpt-audio). Живой голос - "
-                                  "ключ ElevenLabs: /setkey eleven <ключ>."))
+                               + ("" if ai.yandex_key() or ai.eleven_key() else "\nГолос пока запасной (gpt-audio). "
+                                  "Живой голос - ключ Яндекс SpeechKit: /setkey yandex <ключ>."))
         await send_draft(bot, db, owner, horror=True)
     except Exception:
         logger.exception("night: первая страшная история не ушла")

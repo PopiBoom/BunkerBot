@@ -205,7 +205,12 @@ Telegram-бот на aiogram 3 + Claude API. Владелец общается �
   Проверено 07.11 на живом ключе владельца (ключ урезан: /user/subscription → 401 missing user_read, озвучка — ок).
   НА СЕРВЕРЕ ElevenLabs НЕ РАБОТАЕТ: 302 → geo-restriction.elevenlabs.io (сервер по ipinfo в DE, но ElevenLabs адрес
   не пускает). `eleven_speak` редирект не открывает: видит geo — `_eleven_geo_until` на 6 ч, `narrate` сразу берёт
-  gpt-audio. Обходить их блокировку (прокси/реле) не делаем; варианты голоса — Яндекс SpeechKit или лучше gpt-audio.
+  gpt-audio. Обходить их блокировку (прокси/реле) не делаем — владелец просил «весь бот через прокси», отказал.
+  Яндекс SpeechKit (выбор владельца 07.11): `ai.yandex_ogg/yandex_speak` (API v1 tts:synthesize, oggopus, ru-RU,
+  speed 0.9 в /horror), ключ — API-ключ сервисного аккаунта с ролью ai.speechkit-tts.user: `/setkey yandex AQVN…`
+  (проверка словом «Проверка», настройка `yandex_key`), затем образцы голосов `YANDEX_VOICES` (ermil, filipp, zahar,
+  madirus) голосовыми с кнопкой «Выбрать» (`yv:`, настройка `yandex_voice`); `/setkey yandex голоса` — снова.
+  Порядок в `narrate`: ElevenLabs (если не geo) → Яндекс → gpt-audio → mini; кто озвучил — `ai.last_voice`, в лог.
   Второй живой эфир — «20 сек и нет слов» (голос пустой, остались паузы и сбои): озвучка шлёт звук потоком кусками, и
   если каждый кусок — отдельный файл (WAV/MP3), целиком декодируется только первый. `ai.pieces_to_pcm` пробует целиком
   и по кускам, берёт длиннее; `narrate` отбрасывает голос короче 35 % от ожидаемого по тексту (`expected_secs`,

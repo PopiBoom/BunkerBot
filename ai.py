@@ -2540,6 +2540,57 @@ async def eleven_speak(text: str, horror: bool = False, voice: str | None = None
         return b""
 
 
+# Яндекс SpeechKit (API v1): живые русские голоса, пускает сервер, где ElevenLabs закрыт по региону (07.11, выбор
+# владельца). Ключ — API-ключ сервисного аккаунта с ролью ai.speechkit-tts.user (/setkey yandex …), folderId не нужен.
+YANDEX_TTS_URL = "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize"
+YANDEX_VOICES = {"ermil": "Ермил", "filipp": "Филипп", "zahar": "Захар", "madirus": "Мадирус"}  # мужские
+_yandex = {"key": "", "voice": ""}
+
+
+def set_yandex(key: str | None = None, voice: str | None = None) -> None:
+    if key is not None:
+        _yandex["key"] = key.strip()
+    if voice is not None:
+        _yandex["voice"] = voice.strip()
+
+
+def yandex_key() -> str:
+    return os.getenv("YANDEX_API_KEY", "").strip() or _yandex["key"]
+
+
+def yandex_voice() -> str:
+    v = os.getenv("YANDEX_VOICE", "").strip() or _yandex["voice"]
+    return v if v in YANDEX_VOICES else "ermil"
+
+
+async def yandex_ogg(text: str, horror: bool = False, voice: str | None = None, key: str | None = None) -> bytes:
+    """Яндекс SpeechKit: OGG/Opus (годится прямо как голосовое). b"" — нет ключа или сбой (причина — в лог)."""
+    import aiohttp
+
+    key = key or yandex_key()
+    if not key or not text.strip():
+        return b""
+    form = {"text": text[:4900], "lang": "ru-RU", "voice": voice or yandex_voice(), "format": "oggopus",
+            "speed": "0.9" if horror else "1.0"}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60), trust_env=True) as s:
+            async with s.post(YANDEX_TTS_URL, data=form, headers={"Authorization": f"Api-Key {key}"}) as r:
+                data = await r.read()
+                if r.status != 200 or not data.startswith(b"OggS"):
+                    logger.warning("yandex: %s: %s", r.status, data[:300].decode("utf-8", "replace"))
+                    return b""
+                logger.info("yandex: %s, %d байт", form["voice"], len(data))
+                return data
+    except Exception as e:
+        logger.warning("yandex failed: %s", e)
+        return b""
+
+
+async def yandex_speak(text: str, horror: bool = False, voice: str | None = None, key: str | None = None) -> bytes:
+    """Яндекс SpeechKit → PCM 16 бит, 24 кГц, моно (как у остальных голосов эфира)."""
+    return to_pcm24(await yandex_ogg(text, horror=horror, voice=voice, key=key))
+
+
 async def eleven_quota(key: str) -> tuple[int, int] | None:
     """(потрачено символов, лимит) — или None, если ключ не принят."""
     import aiohttp
@@ -2563,12 +2614,15 @@ HORROR_SPEAK = (
 
 
 async def narrate(text: str, horror: bool = False) -> bytes:
-    """Голос эфира: ElevenLabs → gpt-audio → gpt-audio-mini. PCM 16 бит, 24 кГц. Шум вместо речи — следующий."""
+    """Голос эфира: ElevenLabs → Яндекс SpeechKit → gpt-audio → gpt-audio-mini. PCM 16 бит, 24 кГц.
+    Шум вместо речи или звука мало для текста — следующий."""
     system = HORROR_SPEAK if horror else NIGHT_SPEAK
     voice = os.getenv("AI_NIGHT_VOICE", "").strip() or None
     tries = []
     if eleven_key() and not eleven_geo_blocked():  # регион не пускает — сразу запасной голос, без лишних запросов
         tries.append(("ElevenLabs", lambda: eleven_speak(text, horror=horror)))
+    if yandex_key():
+        tries.append((f"Яндекс ({yandex_voice()})", lambda: yandex_speak(text, horror=horror)))
     tries += [(NIGHT_SPEAK_MODEL, lambda: speak(text, system=system, voice=voice, timeout=120, model=NIGHT_SPEAK_MODEL)),
               (SPEAK_MODEL, lambda: speak(text, system=system, voice=voice, timeout=120))]
     for name, call in tries:
@@ -2583,8 +2637,12 @@ async def narrate(text: str, horror: bool = False) -> bytes:
             logger.warning("narrate: %s вернул %.1f с звука на текст ≈ %.1f с — пробую следующий",
                            name, _secs(pcm), expected_secs(text))
             continue
+        last_voice[0] = name
         return pcm
     return b""
+
+
+last_voice = [""]  # каким сервисом озвучен последний абзац эфира — для лога
 
 
 HORROR_SYSTEM = (

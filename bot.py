@@ -161,6 +161,7 @@ async def main() -> None:
     ai.set_usage_sink(db.add_ai_usage)  # учёт токенов и стоимости запросов к ИИ
     ai.set_openrouter_key(await db.get_setting("openrouter_key", ""))  # ключ, присланный боту через /setkey
     ai.set_eleven_key(await db.get_setting("eleven_key", ""))  # голос ночного эфира (/setkey eleven …)
+    ai.set_yandex(await db.get_setting("yandex_key", ""), await db.get_setting("yandex_voice", ""))  # /setkey yandex
 
     dp = Dispatcher(storage=MemoryStorage())
     # Прокидываем зависимости в обработчики (aiogram подставит по имени параметра)

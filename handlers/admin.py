@@ -10,7 +10,7 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import texts
 from config import Config
@@ -99,12 +99,16 @@ async def cmd_setkey(message: Message, command: CommandObject, db: Database, con
     if arg.lower().startswith(("eleven", "11labs", "elevenlabs")):
         await _set_eleven(message, arg.split(maxsplit=1)[1].strip() if len(arg.split()) > 1 else "", db)
         return
+    if arg.lower().startswith(("yandex", "яндекс", "speechkit")):
+        await _set_yandex(message, arg.split(maxsplit=1)[1].strip() if len(arg.split()) > 1 else "", db)
+        return
     if not arg:
         await message.answer(
             "🔑 <b>Ключ OpenRouter</b>\n\n<code>/setkey sk-or-...</code> — сохранить (сообщение с ключом удалю)\n"
             "<code>/setkey off</code> — удалить\n"
-            "<code>/setkey eleven ключ</code> — живой голос ночного эфира (ElevenLabs), <code>/setkey eleven off</code>"
-            " — убрать\n\n"
+            "<code>/setkey yandex ключ</code> — голос ночного эфира и /horror (Яндекс SpeechKit), "
+            "<code>/setkey yandex off</code> — убрать\n"
+            "<code>/setkey eleven ключ</code> — голос ElevenLabs (на этом сервере закрыт по региону)\n\n"
             f"Сейчас: {'есть ✅' if ai.openrouter_available() else 'нет'}. Ключ хранится в базе бота на сервере, "
             "в GitHub не попадает (но есть в файлах /backup — их не пересылай).")
         return
@@ -165,6 +169,73 @@ async def _set_eleven(message: Message, key: str, db: Database) -> None:
     tail = ("Символов в этом месяце: {:,} из {:,}. ".format(*quota).replace(",", " ") if quota else "")
     await message.answer(f"✅ Ключ ElevenLabs сохранён на сервере, сообщение с ним удалил.\n{tail}"
                          "Страшная история - примерно 3 000 символов. Проверь: /horror")
+
+
+YANDEX_SAMPLE = "Сейчас три часа сорок минут. На почту эфира пришло письмо. Читаю без изменений."
+
+
+async def _set_yandex(message: Message, key: str, db: Database) -> None:
+    """Ключ Яндекс SpeechKit — голос ночного эфира и /horror. В базу, сообщение с ключом удаляем; потом образцы
+    голосов с кнопкой «выбрать»."""
+    import ai
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    if not key:
+        await message.answer("🔑 <b>Яндекс SpeechKit</b> - голос ночного эфира и страшных историй.\n\n"
+                             "<code>/setkey yandex ключ</code> - сохранить (API-ключ сервисного аккаунта, начинается "
+                             "с <code>AQVN</code>), <code>/setkey yandex off</code> - убрать, "
+                             "<code>/setkey yandex голоса</code> - прослушать и выбрать голос.\n"
+                             f"Сейчас: {'есть ✅, голос ' + ai.YANDEX_VOICES[ai.yandex_voice()] if ai.yandex_key() else 'нет'}.")
+        return
+    if key.lower() in ("off", "удалить", "-"):
+        await db.set_setting("yandex_key", "")
+        ai.set_yandex(key="")
+        await message.answer("🔑 Ключ Яндекса удалён - эфиры снова запасным голосом.")
+        return
+    if key.lower() not in ("голоса", "voices", "голос"):
+        if not await ai.yandex_ogg("Проверка.", key=key):
+            await message.answer("❌ Яндекс не принял ключ. Нужен API-ключ СЕРВИСНОГО аккаунта с ролью "
+                                 "<code>ai.speechkit-tts.user</code> и платёжный аккаунт в Yandex Cloud. Подробности "
+                                 "ошибки - в логе бота (строка «yandex:»).")
+            return
+        await db.set_setting("yandex_key", key)
+        ai.set_yandex(key=key)
+        await message.answer("✅ Ключ Яндекс SpeechKit сохранён на сервере, сообщение с ним удалил.\n"
+                             "Сейчас пришлю образцы голосов - выбери кнопкой под понравившимся.")
+    elif not ai.yandex_key():
+        await message.answer("Сначала ключ: <code>/setkey yandex ключ</code>.")
+        return
+    for voice, name in ai.YANDEX_VOICES.items():
+        ogg = await ai.yandex_ogg(YANDEX_SAMPLE, horror=True, voice=voice)
+        if not ogg:
+            continue
+        mark = " ✅ (сейчас)" if voice == ai.yandex_voice() else ""
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"Выбрать: {name}",
+                                                                         callback_data=f"yv:{voice}")]])
+        await message.answer_voice(BufferedInputFile(ogg, f"{voice}.ogg"), caption=f"🎙 {name}{mark}", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("yv:"))
+async def cb_yandex_voice(call: CallbackQuery, db: Database, config: Config) -> None:
+    import ai
+
+    if not _is_admin(call.from_user.id, config):
+        await call.answer("Только админ.", show_alert=True)
+        return
+    voice = (call.data or "").split(":", 1)[1]
+    if voice not in ai.YANDEX_VOICES:
+        await call.answer()
+        return
+    await db.set_setting("yandex_voice", voice)
+    ai.set_yandex(voice=voice)
+    await call.answer(f"Голос эфира: {ai.YANDEX_VOICES[voice]}")
+    try:
+        await call.message.answer(f"✅ Голос эфира - {ai.YANDEX_VOICES[voice]}. Проверь: /horror")
+    except Exception:
+        pass
 
 
 async def _openrouter_balance(key: str) -> float | None:
