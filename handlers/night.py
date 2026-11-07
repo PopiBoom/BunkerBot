@@ -43,6 +43,7 @@ MSK = timezone(timedelta(hours=3))
 LAT, LON = 48.708, 44.513                     # Волгоград
 DRAFT_KEY = "night_draft"
 COUNT_KEY = "night_no"
+HORROR_COUNT_KEY = "horror_no"   # у рубрики страшных историй — свой счёт выпусков
 FIRST_KEY = "night_first_sent"
 HORROR_FIRST_KEY = "horror_first_sent"
 HORROR_KEY = "horror_titles"
@@ -191,6 +192,18 @@ def _conditions(w: dict | None, now: datetime) -> dict:
 # ---------- эфир ----------
 
 
+def _caption(horror: bool, n: int, topic: str, now: datetime, weather: str) -> str:
+    """Подпись к голосовому (и в канале): рубрика, номер выпуска, тема письма, время и погода."""
+    when = f"{now:%H:%M}" + (f" · {html.escape(weather)}" if weather else "")
+    if horror:
+        subject = (topic or "без темы").strip()
+        subject = subject[:1].upper() + subject[1:]
+        return (f"🩸 <b>{ai.HORROR_RUBRIC.upper()}</b> · выпуск №{n}\n"
+                f"✉️ Письмо: <i>«{html.escape(subject)}»</i>\n\n"
+                f"📻 Радио Волгограда · {when}")
+    return f"🎙 <b>НОЧНОЙ ЭФИР</b> · №{n}\n\n🕯 {when}"
+
+
 async def _noop(_text: str) -> None:
     return None
 
@@ -210,16 +223,22 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop) -> di
             used = json.loads(await db.get_setting(HORROR_KEY, "[]") or "[]")
         except ValueError:
             used = []
-        story = await ai.horror_story(used[-10:])
+        day = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"][now.weekday()]
+        facts = (f"сейчас {_clock(now)}, {day}; " + (cond["line"] or "погода неизвестна")
+                 + ("; на улице светло" if cond["end"].startswith("До заката") else "; на улице темно"))
+        story = await ai.horror_story(used[-10:], facts)
         if not story["paragraphs"]:
             raise RuntimeError("ИИ не написал историю")
         topic = story["subject"] or story["title"] or "без темы"
-        sent = now.replace(hour=random.randint(2, 4), minute=random.randint(1, 59))
-        intro = (f"{clock} Ночной эфир «Мементо мори». На почту эфира пришло письмо."
-                 + (f" Тема: «{story['subject']}»." if story["subject"] else "")
-                 + f" Отправлено в {_clock(sent)} ночи. Читаю без изменений.")
-        paragraphs = [intro] + story["paragraphs"] + ([story["outro"]] if story["outro"] else []) \
-            + [f"Это был ночной эфир. {cond['end']} Не выключайте свет.".replace("  ", " ")]
+        # ведущий «радио Волгограда» (владелец: «как будто разговариваешь со зрителем»); ИИ промолчал — запасной
+        intro = story["intro"] or (f"Хей, всем привет, ребята! Это радио Волгограда. {cond['line']} И ваша любимая "
+                                   f"рубрика - «{ai.HORROR_RUBRIC}». Нам прислали кучу писем, и вот одно из них.")
+        outro = story["outro"] or ("Вот такая вот история, друзья. Надеюсь, с автором всё в порядке. А вы - "
+                                   "проверьте, закрыта ли у вас дверь. Всем до новых встреч, с вами было радио "
+                                   "Волгограда!")
+        intro, outro = " ".join(intro.split()), " ".join(outro.split())
+        paragraphs = [intro] + story["paragraphs"] + [outro]
+        styles = ["host"] + ["letter"] * len(story["paragraphs"]) + ["host"]
         glitches = {g + 1 for g in story["glitches"]}  # +1: перед письмом — вступление ведущего
         await db.set_setting(HORROR_KEY, json.dumps((used + [story["premise"][:160]])[-30:], ensure_ascii=False))
     else:
@@ -232,14 +251,14 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop) -> di
         if not body:
             raise RuntimeError("ИИ не написал эфир")
         paragraphs = [f"{clock} {cond['line']}".strip()] + body + [f"Это был ночной эфир. {cond['end']}".strip()]
+        styles = ["night"] * len(paragraphs)
         await db.set_setting(TOPICS_KEY, json.dumps((used + [topic])[-30:], ensure_ascii=False))
-    n = int(await db.get_setting(COUNT_KEY, "0") or 0) + 1
-    head = f"🕯 <b>Ночной эфир №{n} · «{html.escape(topic)}»</b>" if horror else f"🎙 <b>Ночной эфир №{n}</b>"
-    caption = head + f" · {now:%H:%M}" + (f" · {html.escape(cond['caption'])}" if cond["caption"] else "")
+    n = int(await db.get_setting(HORROR_COUNT_KEY if horror else COUNT_KEY, "0") or 0) + 1
+    caption = _caption(horror, n, topic, now, cond["caption"])
     voice = []
-    for i, p in enumerate(paragraphs, 1):
+    for i, (p, style) in enumerate(zip(paragraphs, styles, strict=True), 1):
         await progress(f"🎙 Озвучиваю: {i} из {len(paragraphs)}" + (f" · {ai.last_voice[0]}" if ai.last_voice[0] else ""))
-        pcm = await ai.narrate(p, horror=horror)
+        pcm = await ai.narrate(p, horror=horror, host=style == "host")
         if not pcm:
             return {"ogg": None, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic}
         voice.append(pcm)
@@ -288,12 +307,12 @@ async def _send_draft(bot: Bot, db: Database, chat_id: int, horror: bool, progre
     ep = await make_episode(db, horror=horror, progress=progress)
     text = "\n\n".join(ep["paragraphs"])
     if not ep["ogg"]:
-        await bot.send_message(chat_id, f"{ep['caption']}\n\n{html.escape(text)[:3200]}\n\n<i>Озвучить не вышло: нет "
+        await bot.send_message(chat_id, f"{ep['caption']}\n\n{html.escape(text[:3200])}\n\n<i>Озвучить не вышло: нет "
                                         "ключа (/setkey yandex или OpenRouter) или сбой озвучки. Это текст.</i>")
         return False
     msg = await bot.send_voice(chat_id, BufferedInputFile(ep["ogg"], "night.ogg"), reply_markup=_kb(),
                                caption=f"{ep['caption']}\n\n<i>Черновик. Текст:</i>\n"
-                                       f"<blockquote expandable>{html.escape(text)[:800]}</blockquote>")
+                                       f"<blockquote expandable>{html.escape(text[:780])}</blockquote>")
     await db.set_setting(DRAFT_KEY, json.dumps({"file_id": msg.voice.file_id, "caption": ep["caption"],
                                                 "n": ep["n"], "msg": msg.message_id, "chat": chat_id,
                                                 "horror": horror}, ensure_ascii=False))
@@ -363,7 +382,7 @@ async def cb_night(call: CallbackQuery, bot: Bot, db: Database, config: Config) 
             return
         sent = await bot.send_voice(channel, draft["file_id"], caption=draft["caption"])
         await mark_own(db, sent.message_id)
-        await db.set_setting(COUNT_KEY, str(draft["n"]))
+        await db.set_setting(HORROR_COUNT_KEY if draft.get("horror") else COUNT_KEY, str(draft["n"]))
         await db.set_setting(DRAFT_KEY, "")
         await call.answer("Опубликовано в канале.")
         await mark("✅ Опубликовано в канале.")
@@ -373,7 +392,7 @@ async def cb_night(call: CallbackQuery, bot: Bot, db: Database, config: Config) 
         await mark("🗑 Выкинуто.")
     elif action == "redo":
         await db.set_setting(DRAFT_KEY, "")
-        await call.answer("Переписываю - минута-две.")
+        await call.answer("Переписываю - минуты три." if draft.get("horror") else "Переписываю - минута-две.")
         await mark("🔄 Переписан - новый ниже.")
         try:
             await send_draft(bot, db, call.message.chat.id, horror=bool(draft.get("horror")))

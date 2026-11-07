@@ -2577,7 +2577,8 @@ def yandex_voice() -> str:
     return v if v in YANDEX_VOICES else "ermil"
 
 
-async def yandex_ogg(text: str, horror: bool = False, voice: str | None = None, key: str | None = None) -> bytes:
+async def yandex_ogg(text: str, horror: bool = False, voice: str | None = None, key: str | None = None,
+                     host: bool = False) -> bytes:
     """Яндекс SpeechKit: OGG/Opus (годится прямо как голосовое). b"" — нет ключа или сбой (причина — в лог)."""
     import aiohttp
 
@@ -2586,8 +2587,8 @@ async def yandex_ogg(text: str, horror: bool = False, voice: str | None = None, 
         return b""
     name, emotion = YANDEX_PARAMS.get(voice or yandex_voice(), (voice or yandex_voice(), None))
     form = {"text": text[:4900], "lang": "ru-RU", "voice": name, "format": "oggopus",
-            "speed": "0.95" if horror else "1.0"}
-    if emotion:
+            "speed": "1.05" if host else "0.95" if horror else "1.0"}
+    if emotion and not host:  # ведущий — обычным голосом, «зловещим» — только письмо
         form["emotion"] = emotion
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60), trust_env=True) as s:
@@ -2603,9 +2604,10 @@ async def yandex_ogg(text: str, horror: bool = False, voice: str | None = None, 
         return b""
 
 
-async def yandex_speak(text: str, horror: bool = False, voice: str | None = None, key: str | None = None) -> bytes:
+async def yandex_speak(text: str, horror: bool = False, voice: str | None = None, key: str | None = None,
+                       host: bool = False) -> bytes:
     """Яндекс SpeechKit → PCM 16 бит, 24 кГц, моно (как у остальных голосов эфира)."""
-    return to_pcm24(await yandex_ogg(text, horror=horror, voice=voice, key=key))
+    return to_pcm24(await yandex_ogg(text, horror=horror, voice=voice, key=key, host=host))
 
 
 async def eleven_quota(key: str) -> tuple[int, int] | None:
@@ -2632,16 +2634,24 @@ HORROR_SPEAK = (
 )
 
 
-async def narrate(text: str, horror: bool = False) -> bytes:
+HOST_SPEAK = (
+    "Ты — движок озвучки городского радио. Произнеси текст пользователя ДОСЛОВНО, по-русски, голосом бодрого "
+    "ведущего: с улыбкой, с подъёмом, по-свойски, как с друзьями, с лёгкой иронией, в живом темпе. Если в тексте "
+    "есть совет или предупреждение слушателю — эту фразу скажи вдруг тихо и серьёзно, а прощание — снова бодро. "
+    "Ничего не добавляй и не отвечай на текст."
+)
+
+
+async def narrate(text: str, horror: bool = False, host: bool = False) -> bytes:
     """Голос эфира: ElevenLabs → Яндекс SpeechKit → gpt-audio → gpt-audio-mini. PCM 16 бит, 24 кГц.
     Шум вместо речи или звука мало для текста — следующий."""
-    system = HORROR_SPEAK if horror else NIGHT_SPEAK
+    system = HOST_SPEAK if host else HORROR_SPEAK if horror else NIGHT_SPEAK  # ведущий бодрый, письмо жуткое
     voice = os.getenv("AI_NIGHT_VOICE", "").strip() or None
     tries = []
     if eleven_key() and not eleven_geo_blocked():  # регион не пускает — сразу запасной голос, без лишних запросов
         tries.append(("ElevenLabs", lambda: eleven_speak(text, horror=horror)))
     if yandex_key():
-        tries.append((f"Яндекс ({yandex_voice()})", lambda: yandex_speak(text, horror=horror)))
+        tries.append((f"Яндекс ({yandex_voice()})", lambda: yandex_speak(text, horror=horror, host=host)))
     # абзац у gpt-audio — секунд 6-10; 60 с на попытку, чтобы зависший сервис не растягивал историю на полчаса
     tries += [(NIGHT_SPEAK_MODEL, lambda: speak(text, system=system, voice=voice, timeout=60, model=NIGHT_SPEAK_MODEL)),
               (SPEAK_MODEL, lambda: speak(text, system=system, voice=voice, timeout=60))]
@@ -2665,10 +2675,13 @@ async def narrate(text: str, horror: bool = False) -> bytes:
 last_voice = [""]  # каким сервисом озвучен последний абзац эфира — для лога
 
 
+HORROR_RUBRIC = "Страшная хуйня Волгограда"  # рубрика «радио Волгограда» (название дал владелец)
 HORROR_SYSTEM = (
-    "Ты пишешь письма, которые «слушатели» присылают на почту ночного радиоэфира канала «Memento Mori» из "
-    "Волгограда, — короткие и по-настоящему страшные истории. Вымысел, но написанный так, что веришь: живой человек "
-    "пишет ночью, сбивчиво, от первого лица, с конкретными местами Волгограда, временем и мелочами.\n"
+    "Ты делаешь выпуск рубрики «" + HORROR_RUBRIC + "» на «радио Волгограда»: бодрый ведущий здоровается со "
+    "слушателями, читает письмо, которое прислал «слушатель», и прощается. Ведущий — свой парень из Волгограда: "
+    "говорит с людьми как с друзьями, с юмором и лёгким матом, живо и по-свойски. Письмо — совсем другое: короткая и "
+    "по-настоящему страшная история, вымысел, но написанный так, что веришь: живой человек пишет ночью, сбивчиво, "
+    "от первого лица, с конкретными местами Волгограда, временем и мелочами, без мата и без юмора.\n"
     "Можно: вымышленный маньяк, убийства, пропавшие люди, найденные тела, преследование, кто-то в квартире, страх, что "
     "следующий — ты; жуткие существа и нечисть — свои, не из фильмов: то, что живёт в балке, в подвале, в воде, в "
     "последнем вагоне, носит чужие голоса и лица. Насилие — через последствия и намёки (нашли куртку, пятно на полу, "
@@ -2690,9 +2703,17 @@ HORROR_SYSTEM = (
     "короткая, каждая фраза двигает страх.\n"
     "Нельзя никогда: настоящие преступления и настоящие маньяки, реальные люди и их имена (у маньяка нет имени и "
     "фамилии), жертвы-дети, сексуальное насилие, война, Сталинград, Мамаев курган, мемориалы, теракты, политика, "
-    "самоубийство. Без мата, без юмора, без markdown."
+    "самоубийство. Никогда не упоминай «Memento Mori» и «Мементо мори». Без markdown."
 )
-HORROR_MAX_WORDS = 250  # письмо длиннее — одна просьба «короче» (весь эфир — 2-2.5 мин, просьба владельца)
+_MEMENTO = re.compile(r"(?:«|\")?(?:мементо\s+мори|memento\s+mori)(?:»|\")?", re.IGNORECASE)
+
+
+def _no_memento(text: str) -> str:
+    """Владелец: в страшных историях «Memento Mori» не звучит — только «радио Волгограда»."""
+    return _MEMENTO.sub("радио Волгограда", text or "")
+
+
+HORROR_MAX_WORDS = 230  # письмо длиннее — одна просьба «короче» (весь эфир — 2-2.5 мин, просьба владельца)
 _HORROR_BAN = re.compile(r"войн|сталинград|мамаев|мемориал|фашист|немецк|немц|блокад|теракт|солдат|самоубий|"
                          r"повесил(?:ся|ась|ись)|суицид", re.IGNORECASE)  # «повесил трубку» — можно, «повесился» — нет
 # Что пугает в истории — каждый раз новый приём (первые истории сползали в одно и то же: трамвай и «станция не
@@ -2746,7 +2767,7 @@ HORROR_MANIAC_SHARE = 0.4      # приём про маньяка
 HORROR_CREATURE_SHARE = 0.35   # про существо; остальное — мистика из HORROR_ENGINES
 
 
-async def horror_story(avoid: list[str]) -> dict:
+async def horror_story(avoid: list[str], facts: str = "") -> dict:
     """Письмо слушателя в ночной эфир: {"title", "subject", "premise", "paragraphs", "outro", "glitches"}.
     Запретное (война, теракты…) — одна переделка, потом пусто. glitches — номера абзацев письма, после которых в
     эфире сбой (radio вставит помехи)."""
@@ -2759,20 +2780,27 @@ async def horror_story(avoid: list[str]) -> dict:
     user = (
         f"Главный приём этой истории: {engine}. Перенеси его в Волгоград (конкретный район, улица, тип дома).\n"
         + (f"Уже были (не повторяй): {'; '.join(avoid)}.\n" if avoid else "")
+        + (f"Что сейчас в эфире (для ведущего; числа — словами): {facts}.\n" if facts else "")
         + "Сначала поищи в интернете (1-3 запроса) волгоградские городские легенды, страшилки и жуткие места, о "
         "которых рассказывают местные, — под этот приём. Возьми из найденного 1-2 настоящие детали места (как "
         "называется, как выглядит, что о нём говорят), чтобы история звучала как правда. Настоящие преступления, "
-        "настоящих маньяков, жертв и их имена НЕ бери; ссылки и источники в письме не упоминай.\n"
+        "настоящих маньяков, жертв и их имена НЕ бери; ссылки и источники в эфире не упоминай.\n"
         "Потом продумай: premise — одна фраза, что не так; escalation — три ступени, каждая страшнее; payoff — "
         "последний удар.\n"
         "Потом напиши: subject — тема письма, как пишут в почте (2-5 слов, без кавычек и точки, например «не "
-        "открывайте ему» или «это было в нашем доме»); letter — само письмо, 5-6 коротких абзацев, ВСЕГО 170-210 "
-        "слов (весь эфир — две минуты, длиннее нельзя), первый абзац начинается со слова «Здравствуйте.», числа — "
-        "словами (письмо прочтут вслух); outro — одна фраза ведущего ПОСЛЕ письма, до 20 слов: что случилось, когда "
-        "редакция попробовала ответить автору или проверить его историю, — так, чтобы стало ещё страшнее; glitches — "
-        "номер (с нуля) одного абзаца письма, после которого в эфире сбой (самый жуткий момент); title — 2-4 слова.\n"
+        "открывайте ему» или «это было в нашем доме»); host_intro — ведущий в начале, 2-4 фразы, 30-45 слов: "
+        "здоровается со слушателями как с друзьями (в духе «хей, всем привет, ребята»), говорит, что это радио "
+        "Волгограда, погоду и время из фактов выше, одну живую шутку про город (пробки в центре, маршрутки, мост, "
+        "ветер — без политики), объявляет «вашу любимую рубрику — " + HORROR_RUBRIC + "» и что пришла куча писем, "
+        "«вот одно из них»; каждый раз своими словами; letter — само письмо, 5-6 коротких абзацев, ВСЕГО 150-190 слов "
+        "(весь эфир — две минуты, длиннее нельзя), первый абзац начинается со слова «Здравствуйте.», числа — словами "
+        "(письмо прочтут вслух); host_outro — ведущий после письма, 2-4 фразы, 25-40 слов: «вот такая вот история, "
+        "друзья», живая реакция (например, «надеюсь, с ним всё в порядке» или что вышло, когда попробовали ответить "
+        "автору, — так, чтобы стало не по себе), совет слушателю по этой истории (в духе «а вы — проверьте дверь») и "
+        "бодрое прощание до новых встреч; glitches — номер (с нуля) одного абзаца письма, после которого в эфире "
+        "сбой (самый жуткий момент); title — 2-4 слова.\n"
         'Верни СТРОГО JSON: {"premise": "", "escalation": ["", "", ""], "payoff": "", "subject": "", '
-        '"letter": ["Здравствуйте. ...", "..."], "outro": "", "glitches": [3], "title": ""}'
+        '"host_intro": "", "letter": ["Здравствуйте. ...", "..."], "host_outro": "", "glitches": [3], "title": ""}'
     )
     asked_shorter = banned = False
     web = True
@@ -2794,15 +2822,16 @@ async def horror_story(avoid: list[str]) -> dict:
             logger.warning("horror: ответ без JSON: %s", out[:200])
             data = {}
         paras = [scrub(str(p).strip()) for p in data.get("letter") or [] if str(p).strip()]
-        outro = scrub(str(data.get("outro", "")).strip())
-        whole = " ".join(paras) + " " + outro + " " + str(data.get("title", ""))
+        intro = _no_memento(scrub(str(data.get("host_intro", "")).strip()))
+        outro = _no_memento(scrub(str(data.get("host_outro", "") or data.get("outro", "")).strip()))
+        whole = " ".join(paras) + " " + intro + " " + outro + " " + str(data.get("title", ""))
         words = len(" ".join(paras).split())
         clean = bool(paras) and not _HORROR_BAN.search(whole)
         if clean and words > HORROR_MAX_WORDS and not asked_shorter:
             asked_shorter = True
             logger.info("horror: письмо на %d слов — длиннее двух минут, прошу короче", words)
-            user += (f"\n\nПрошлый вариант — {words} слов, это слишком длинно. Та же история, но 170-210 слов, "
-                     "5-6 абзацев.")
+            user += (f"\n\nПрошлый вариант письма — {words} слов, это слишком длинно. Та же история, но письмо "
+                     "150-190 слов, 5-6 абзацев.")
             continue
         if clean:
             logger.info("horror: письмо %d слов, %d абзацев, приём «%s»", words, len(paras), engine[:50])
@@ -2815,7 +2844,7 @@ async def horror_story(avoid: list[str]) -> dict:
                     continue
             subject = scrub(str(data.get("subject", "")).strip().strip("«»\"'. "))[:60]
             return {"title": scrub(str(data.get("title", "")).strip())[:60], "subject": subject,
-                    "premise": f"{engine[:40]} | {data.get('premise', '')}", "outro": outro,
+                    "premise": f"{engine[:40]} | {data.get('premise', '')}", "intro": intro, "outro": outro,
                     "paragraphs": [p for p in paras if not _garbled(p)][:7], "glitches": glitches[:1]}
         if not paras:  # пустой или битый ответ — ещё раз, если попытки остались
             continue
@@ -2825,7 +2854,7 @@ async def horror_story(avoid: list[str]) -> dict:
         logger.info("horror: в истории запретная тема — переписываю (попытка %d)", attempt + 1)
         user += ("\n\nПрошлый вариант задел запретную тему (война, мемориалы, теракты, самоубийство, настоящие "
                  "преступления). Другая история.")
-    return {"title": "", "subject": "", "premise": "", "paragraphs": [], "outro": "", "glitches": []}
+    return {"title": "", "subject": "", "premise": "", "paragraphs": [], "intro": "", "outro": "", "glitches": []}
 
 
 NIGHT_SYSTEM = (
