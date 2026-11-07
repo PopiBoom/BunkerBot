@@ -1,4 +1,4 @@
-"""Итог шахматной партии картинками: гифка-повтор (ход за ходом) и итоговая позиция. Pillow, без ИИ.
+"""Повтор шахматной партии гифкой (ход за ходом; итоговую картинку владелец не захотел — только гифка). Pillow, без ИИ.
 
 Фигуры — те же, что значки кнопок (icons.piece_image), доска — тёплое дерево, последний ход подсвечен, король под
 шахом — красным. Гифка: каждый полуход — кадр, последний кадр держится дольше; длинные партии крутятся быстрее,
@@ -139,7 +139,7 @@ def _verdict(board, result: str) -> tuple[str, str]:
     return result, f"{moves} {word}"
 
 
-def replay_gif(moves: list[str], white: str, black: str, result: str) -> bytes:
+def replay_gif(moves: list[str], white: str, black: str, result: str, minutes: int | None = None) -> bytes:
     """Гифка всей партии: стартовая позиция, каждый полуход, в конце — итог."""
     import chess
 
@@ -156,6 +156,8 @@ def replay_gif(moves: list[str], white: str, black: str, result: str) -> bytes:
         frames.append(_frame(board, white, black, last=move, caption=text, sub=sub, progress=i / plies))
         durations.append(step)
     title, sub = _verdict(board, result)
+    if minutes:
+        sub += f" · {minutes} мин"
     frames.append(_frame(board, white, black, last=board.peek() if plies else None, caption=title, sub=sub,
                          progress=1.0, accent=True))
     durations.append(4000)
@@ -163,20 +165,4 @@ def replay_gif(moves: list[str], white: str, black: str, result: str) -> bytes:
     pal = [f.convert("RGB").quantize(colors=128, dither=0) for f in frames]
     pal[0].save(out, "GIF", save_all=True, append_images=pal[1:], duration=durations, loop=0, optimize=True,
                 disposal=1)
-    return out.getvalue()
-
-
-def final_png(moves: list[str], white: str, black: str, result: str, minutes: int | None = None) -> bytes:
-    """Картинка итоговой позиции: доска, кто победил, за сколько ходов."""
-    import chess
-
-    board = chess.Board()
-    for uci in moves:
-        board.push_uci(uci)
-    title, sub = _verdict(board, result)
-    if minutes:
-        sub += f" · {minutes} мин"
-    im = _frame(board, white, black, last=board.peek() if moves else None, caption=title, sub=sub, accent=True)
-    out = io.BytesIO()
-    im.convert("RGB").save(out, "PNG", optimize=True)
     return out.getvalue()

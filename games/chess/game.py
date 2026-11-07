@@ -24,8 +24,9 @@ from collections import deque
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command
-from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InlineQuery,
-                           InlineQueryResultArticle, InputTextMessageContent, Message, ReplyParameters)
+from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InlineQuery,
+                           InlineQueryResultArticle, InlineQueryResultCachedGif, InputTextMessageContent, Message,
+                           ReplyParameters)
 
 from config import Config
 from database import Database
@@ -73,6 +74,12 @@ _flood_until: dict[str, float] = {}
 _no_icons: set[str] = set()                 # партии, где Telegram значки не принял — играют символами
 # /chess_post: пост в канал, партия — в комментариях (это уже группа: там значки можно, в самом канале — нет)
 COMMENT_WAIT = 20   # сек ждём, пока пост канала появится в группе комментариев
+# Повтор партии гифкой (replay.py, просьба владельца — только гифка, без картинки): в /chess и /chess_post бот сам
+# присылает её под доской; в «@бот» бота в том чате нет — кнопка «🎞 Повтор» подставляет «@бот replay <id>», и гифка
+# (загруженная тихо в личку владельцу ради file_id и сразу удалённая) отправляется одним нажатием.
+DONE = "chess_done:"   # настройка: доигранная партия (ходы, игроки, итог, file_id гифки) — реванш её не стирает
+REPLAY = "replay "
+_bg: set[asyncio.Task] = set()
 _forwards: dict[tuple[int, int], int] = {}            # (канал, пост) → id копии поста в группе
 _forward_waits: dict[tuple[int, int], asyncio.Future] = {}
 
@@ -213,7 +220,10 @@ def render(st: dict, icons: dict[str, str] | None = None,
                                             callback_data="c:x" if st.get("over") else f"c:{sq}", **extra))
         rows.append(row)
     if st.get("over"):
-        rows.append([InlineKeyboardButton(text="🔁 Реванш", callback_data="cre")])
+        row = [InlineKeyboardButton(text="🔁 Реванш", callback_data="cre")]
+        if st.get("inline") and st.get("gid") and st.get("moves"):
+            row.append(InlineKeyboardButton(text="🎞 Повтор", switch_inline_query_current_chat=REPLAY + st["gid"]))
+        rows.append(row)
     else:
         rows.append([InlineKeyboardButton(text="🏳 Сдаться", callback_data="cr"),
                      InlineKeyboardButton(text="🤝 Ничья", callback_data="cd")])
@@ -222,8 +232,9 @@ def render(st: dict, icons: dict[str, str] | None = None,
 
 def _plain(kb: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
     """Та же доска без цвета кнопок — на случай, если Telegram цвет не принял."""
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=b.text, callback_data=b.callback_data)
-                                                  for b in row] for row in kb.inline_keyboard])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text=b.text, callback_data=b.callback_data, switch_inline_query_current_chat=b.switch_inline_query_current_chat)
+        for b in row] for row in kb.inline_keyboard])
 
 
 def _view(st: dict, icons: dict[str, str] | None = None,
@@ -341,8 +352,12 @@ def _slow_note(gid: str) -> str:
 
 
 @router.inline_query()
-async def inline_games(query: InlineQuery) -> None:
-    """«@бот» в любом чате — карточка «♟ Шахматы» (инлайн-режим включают в @BotFather: /setinline)."""
+async def inline_games(query: InlineQuery, bot: Bot, db: Database, config: Config) -> None:
+    """«@бот» в любом чате — карточка «♟ Шахматы» (инлайн-режим включают в @BotFather: /setinline);
+    «@бот replay <id>» (кнопка «🎞 Повтор» после партии) — гифка с повтором партии."""
+    if (query.query or "").startswith(REPLAY):
+        await _inline_replay(query, bot, db, config)
+        return
     name = _name(query.from_user)
     res = InlineQueryResultArticle(
         id="chess", title="♟ Шахматы", description="Партия на двоих: кто нажмёт «Играть» — твой соперник",
@@ -456,7 +471,8 @@ async def cb_join(call: CallbackQuery, bot: Bot, db: Database) -> None:
             return
         players = [[cid, cname], [call.from_user.id, _name(call.from_user)]]
         random.shuffle(players)
-        st = {"w": players[0], "b": players[1], "moves": [], "sel": None,
+        st = {"w": players[0], "b": players[1], "moves": [], "sel": None, "start": time.time(),
+              "inline": bool(call.inline_message_id), "gid": gid,
               # значки — только в сообщениях бота (/chess), не в «@бот»: так велит Telegram (см. icons.py)
               "icons": bool(call.message and not call.inline_message_id
                             and await db.get_setting(ICONS_ON, "0") == "1" and await icon_set.load(db))}
@@ -464,6 +480,73 @@ async def cb_join(call: CallbackQuery, bot: Bot, db: Database) -> None:
     await call.answer("Поехали! " + ("Ты белыми, твой ход." if st["w"][0] == call.from_user.id else "Ты чёрными."))
     _refresh(bot, db, call)
     logger.info("шахматы %s: %s (белые) против %s", gid, st["w"][1], st["b"][1])
+
+
+# ---------- повтор партии гифкой ----------
+
+
+async def _gif(st: dict) -> bytes:
+    from . import replay
+
+    minutes = round((time.time() - st["start"]) / 60) if st.get("start") else None
+    return await asyncio.to_thread(replay.replay_gif, st["moves"], st["w"][1], st["b"][1], st["over"], minutes)
+
+
+async def _finished(bot: Bot, db: Database, call: CallbackQuery, gid: str, st: dict) -> None:
+    """Партия кончилась: запомнить её (для «🎞 Повтор») и в сообщениях бота — прислать гифку под доской."""
+    if not st.get("moves"):
+        return
+    done = {k: st.get(k) for k in ("w", "b", "moves", "over", "start")}
+    await db.set_setting(DONE + gid, json.dumps(done, ensure_ascii=False))
+    if call.inline_message_id or not call.message:
+        return  # в чужом чате бот писать не может — там кнопка «🎞 Повтор»
+    chat_id, msg_id = call.message.chat.id, call.message.message_id
+
+    async def send() -> None:
+        try:
+            gif = await _gif(done)
+            await bot.send_animation(chat_id, BufferedInputFile(gif, "chess.gif"),
+                                     caption=f"🎞 Повтор партии: {html.escape(st['w'][1])} - {html.escape(st['b'][1])}",
+                                     reply_parameters=ReplyParameters(message_id=msg_id,
+                                                                      allow_sending_without_reply=True))
+        except Exception:  # noqa: BLE001 — повтор не главное, партия уже записана
+            logger.exception("chess: гифка повтора не ушла")
+
+    task = asyncio.create_task(send())
+    _bg.add(task)
+    task.add_done_callback(_bg.discard)
+
+
+async def _inline_replay(query: InlineQuery, bot: Bot, db: Database, config: Config) -> None:
+    gid = query.query[len(REPLAY):].strip()
+    raw = await db.get_setting(DONE + gid, "") if gid else ""
+    try:
+        done = json.loads(raw) if raw else None
+    except ValueError:
+        done = None
+    if not done:
+        await query.answer([], cache_time=1, is_personal=True)
+        return
+    fid = done.get("gif")
+    if not fid:  # гифки в Telegram ещё нет — загрузить тихо в личку владельцу ради file_id и сразу удалить
+        owner = config.admin_ids[0] if config.admin_ids else 0
+        try:
+            msg = await bot.send_animation(owner, BufferedInputFile(await _gif(done), "chess.gif"),
+                                           disable_notification=True)
+            fid = msg.animation.file_id if msg.animation else msg.document.file_id
+            try:
+                await bot.delete_message(owner, msg.message_id)
+            except TelegramBadRequest:
+                pass
+        except Exception:  # noqa: BLE001
+            logger.exception("chess: гифка для инлайн-повтора не загрузилась")
+            await query.answer([], cache_time=1, is_personal=True)
+            return
+        done["gif"] = fid
+        await db.set_setting(DONE + gid, json.dumps(done, ensure_ascii=False))
+    res = InlineQueryResultCachedGif(id="replay", gif_file_id=fid, title="🎞 Повтор партии",
+                                     caption=f"🎞 Повтор партии: {html.escape(done['w'][1])} - {html.escape(done['b'][1])}")
+    await query.answer([res], cache_time=1, is_personal=True)
 
 
 # ---------- ходы ----------
@@ -560,6 +643,8 @@ async def cb_square(call: CallbackQuery, bot: Bot, db: Database) -> None:
         await _save(db, gid, st)
     await call.answer(note or _slow_note(gid).strip())
     _refresh(bot, db, call)
+    if st.get("over"):
+        await _finished(bot, db, call, gid, st)
 
 
 @router.callback_query(F.data == "cr")
@@ -582,6 +667,7 @@ async def cb_resign(call: CallbackQuery, bot: Bot, db: Database) -> None:
         await _save(db, gid, st)
     await call.answer("Сдался.")
     _refresh(bot, db, call)
+    await _finished(bot, db, call, gid, st)
 
 
 @router.callback_query(F.data == "cd")
@@ -605,6 +691,8 @@ async def cb_draw(call: CallbackQuery, bot: Bot, db: Database) -> None:
         await _save(db, gid, st)
     await call.answer(note)
     _refresh(bot, db, call)
+    if st.get("over"):
+        await _finished(bot, db, call, gid, st)
 
 
 @router.callback_query(F.data == "cre")
