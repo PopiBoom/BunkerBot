@@ -1,8 +1,9 @@
 """Повтор шахматной партии гифкой (ход за ходом; итоговую картинку владелец не захотел — только гифка). Pillow, без ИИ.
 
-Фигуры — те же, что значки кнопок (icons.piece_image), доска — тёплое дерево, последний ход подсвечен, король под
-шахом — красным. Гифка: каждый полуход — кадр, последний кадр держится дольше; длинные партии крутятся быстрее,
-чтобы весь повтор шёл не дольше REPLAY_MAX сек.
+Фигуры — те же, что значки кнопок (icons.piece_image), доска — тёплое дерево, ход — СТРЕЛКОЙ (просьба владельца),
+король под шахом — красным. Ходы с пометкой (analyse, без движка — по материалу): «!» зелёным — выиграл фигуру,
+вилка, превращение; «??» красным — зевок (отдал фигуру даром); «#» — мат. Такие кадры держатся дольше.
+Темп — STEP мс на ход (владелец: «медленнее»), длинные партии сжимаются до REPLAY_MAX сек, но не быстрее STEP_MIN.
 """
 from __future__ import annotations
 
@@ -18,12 +19,17 @@ TEXT, MUTED, ACCENT = (240, 236, 228), (150, 144, 150), (232, 188, 84)
 LIGHT, DARK = (236, 220, 190), (170, 122, 84)
 LAST = (247, 214, 92, 120)             # подсветка последнего хода
 CHECK = (225, 45, 45)
+ARROW = {None: (255, 170, 0, 190), "good": (60, 190, 90, 200), "bad": (225, 50, 50, 200), "mate": (60, 140, 255, 210)}
+BADGE = {"good": ((60, 170, 80), "!"), "bad": ((210, 45, 45), "??"), "mate": ((50, 120, 230), "#")}
+VALUE = {1: 1, 2: 3, 3: 3, 4: 5, 5: 9, 6: 0}   # пешка, конь, слон, ладья, ферзь, король
+WHAT = {1: "пешку", 2: "коня", 3: "слона", 4: "ладью", 5: "ферзя", 6: "короля"}
+STEP, STEP_MIN, NOTE_STEP = 1400, 400, 2600     # мс: обычный ход, минимум для длинных партий, ход с пометкой
 SQ = 80                                # клетка, px
 PAD = 40
 TOP, BOTTOM = 112, 116                 # шапка с игроками и подвал с ходом
 W = PAD * 2 + SQ * 8
 H = TOP + SQ * 8 + BOTTOM
-REPLAY_MAX = 40.0                      # сек на весь повтор
+REPLAY_MAX = 75.0                      # сек на весь повтор (длинные партии ускоряются до STEP_MIN)
 NAMES = {"K": "король", "Q": "ферзь", "R": "ладья", "B": "слон", "N": "конь", "P": "пешка"}
 
 
@@ -57,7 +63,136 @@ def _player(d, x: int, y: int, name: str, white: bool, align_right: bool = False
     d.text((tx, y), name, font=font, fill=TEXT, anchor="lm")
 
 
-def _board_img(board, last=None):
+def _best_capture(board, square: bool = False):
+    """Сколько материала сторона, чей ход, выигрывает лучшим взятием прямо сейчас (грубо: взятая фигура минус
+    своя, если поле защищено). square=True — ещё и поле, где это взятие."""
+    best, where = 0, None
+    for m in board.legal_moves:
+        if not board.is_capture(m):
+            continue
+        victim = board.piece_at(m.to_square)
+        gain = VALUE[victim.piece_type] if victim else 1  # на проходе — пешка
+        attacker = board.piece_at(m.from_square)
+        board.push(m)
+        defended = board.is_attacked_by(board.turn, m.to_square)
+        board.pop()
+        if defended:
+            gain -= VALUE[attacker.piece_type]
+        if gain > best:
+            best, where = gain, m.to_square
+    return (best, where) if square else best
+
+
+def _mate_in_one(board) -> bool:
+    """Есть ли у стороны, чей ход, мат одним ходом."""
+    for m in board.legal_moves:
+        board.push(m)
+        mate = board.is_checkmate()
+        board.pop()
+        if mate:
+            return True
+    return False
+
+
+def analyse(moves: list[str]) -> list[tuple[str | None, str]]:
+    """Пометка к каждому полуходу: (вид, текст) — "good" «Выиграл ферзя!», "bad" «Зевок ладьи», "mate", или (None, "").
+
+    Без шахматного движка: по материалу на один ход вперёд — ловит явное (отдал фигуру даром, забрал даром, вилка),
+    тонкое не видит."""
+    import chess
+
+    def threat(board) -> int:  # что соперник забрал бы, если бы ходил сейчас он (ход «пропустить»)
+        if board.is_check():
+            return 0
+        board.push(chess.Move.null())
+        t = _best_capture(board)
+        board.pop()
+        return t
+
+    b = chess.Board()
+    out: list[tuple[str | None, str]] = []
+    prev_capture: tuple[int, int] | None = None   # (поле, сколько взяли) прошлым полуходом — чтобы отличать размен
+    for uci in moves:
+        m = chess.Move.from_uci(uci)
+        mover = b.piece_at(m.from_square)
+        victim = b.piece_at(m.to_square)
+        took = VALUE[victim.piece_type] if victim else (1 if b.is_en_passant(m) else 0)
+        before = threat(b)  # угроза, которая висела ещё до хода, — не его зевок
+        recapture = prev_capture is not None and prev_capture[0] == m.to_square
+        net_took = took - (prev_capture[1] if recapture else 0)  # размен: взял в ответ — не «выиграл фигуру»
+        prev_capture = (m.to_square, took) if took else None
+        b.push(m)
+        note: tuple[str | None, str] = (None, "")
+        if b.is_checkmate():
+            note = ("mate", "Мат!")
+        elif _mate_in_one(b):
+            note = ("bad", "Зевок: мат в один ход")
+        else:
+            loss, where = _best_capture(b, square=True)  # что соперник заберёт следующим ходом
+            # контратака — не зевок, но только если угрожает не та самая фигура, которую сейчас и съедят
+            counter = 0 if where == m.to_square else threat(b)
+            if took - loss <= -2 and loss >= 3 and loss > before and counter < loss:
+                # что именно отдал: самая дорогая фигура, которую можно взять
+                lost = max((b.piece_at(x.to_square) for x in b.legal_moves
+                            if b.is_capture(x) and b.piece_at(x.to_square)),
+                           key=lambda p: VALUE[p.piece_type], default=None)
+                note = ("bad", f"Зевок: отдал {WHAT[lost.piece_type]}" if lost else "Зевок")
+            elif net_took - loss >= 3 and victim:
+                note = ("good", f"Забрал {WHAT[victim.piece_type]}!")
+            elif m.promotion:
+                note = ("good", "Пешка стала ферзём!")
+            else:
+                targets = [b.piece_at(t) for t in b.attacks(m.to_square)
+                           if b.piece_at(t) and b.piece_at(t).color != mover.color]
+                big = [t for t in targets if t.piece_type == chess.KING or VALUE[t.piece_type] > VALUE[mover.piece_type]]
+                if len(big) >= 2 and loss < 3:
+                    order = sorted(big, key=lambda t: -(100 if t.piece_type == chess.KING else VALUE[t.piece_type]))
+                    names = " и ".join(WHAT[t.piece_type] for t in order[:2])
+                    note = ("good", f"Вилка: бьёт {names}!")
+        out.append(note)
+    return out
+
+
+def _arrow(im, move, kind: str | None):
+    """Стрелка хода поверх доски (полупрозрачная, как на lichess)."""
+    import math
+
+    import chess
+    from PIL import Image, ImageDraw
+
+    def center(sq):
+        return chess.square_file(sq) * SQ + SQ / 2, (7 - chess.square_rank(sq)) * SQ + SQ / 2
+
+    (x1, y1), (x2, y2) = center(move.from_square), center(move.to_square)
+    ang = math.atan2(y2 - y1, x2 - x1)
+    head, width = SQ * 0.42, SQ * 0.17
+    sx, sy = x1 + math.cos(ang) * SQ * 0.18, y1 + math.sin(ang) * SQ * 0.18   # от края фигуры
+    ex, ey = x2 - math.cos(ang) * head * 0.9, y2 - math.sin(ang) * head * 0.9  # до основания наконечника
+    over = Image.new("RGBA", im.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(over)
+    col = ARROW.get(kind, ARROW[None])
+    d.line((sx, sy, ex, ey), fill=col, width=int(width))
+    tip = (x2 - math.cos(ang) * SQ * 0.12, y2 - math.sin(ang) * SQ * 0.12)
+    left = (ex + math.cos(ang + math.pi / 2) * head * 0.55, ey + math.sin(ang + math.pi / 2) * head * 0.55)
+    right = (ex + math.cos(ang - math.pi / 2) * head * 0.55, ey + math.sin(ang - math.pi / 2) * head * 0.55)
+    d.polygon([tip, left, right], fill=col)
+    return Image.alpha_composite(im, over)
+
+
+def _badge(im, sq, kind: str):
+    """Кружок с «!», «??» или «#» в углу клетки, куда пошли."""
+    import chess
+    from PIL import ImageDraw
+
+    col, mark = BADGE[kind]
+    x, y = chess.square_file(sq) * SQ + SQ - 14, (7 - chess.square_rank(sq)) * SQ + 14
+    r = 17
+    d = ImageDraw.Draw(im)
+    d.ellipse((x - r, y - r, x + r, y + r), fill=col, outline=(255, 255, 255), width=3)
+    d.text((x, y + 1), mark, font=_font(True, 20 if len(mark) == 1 else 16), fill=(255, 255, 255), anchor="mm")
+
+
+def _board_img(board, last=None, kind: str | None = None):
     """Доска 640×640 с фигурами, координатами, последним ходом и шахом."""
     import chess
     from PIL import Image, ImageDraw, ImageFilter
@@ -84,6 +219,10 @@ def _board_img(board, last=None):
     for sq, piece in board.piece_map().items():
         x, y = chess.square_file(sq) * SQ + 3, (7 - chess.square_rank(sq)) * SQ + 3
         im.alpha_composite(_piece(piece.symbol()), (x, y))
+    if last:
+        im = _arrow(im, last, kind)
+        if kind in BADGE:
+            _badge(im, last.to_square, kind)
     d = ImageDraw.Draw(im)
     small = _font(True, 15)
     for i in range(8):  # координаты по краю, цветом соседней клетки (a1 — тёмная)
@@ -94,7 +233,7 @@ def _board_img(board, last=None):
 
 
 def _frame(board, white: str, black: str, last=None, caption: str = "", sub: str = "",
-           progress: float | None = None, accent: bool = False):
+           progress: float | None = None, accent: bool = False, kind: str | None = None):
     from PIL import Image, ImageDraw
 
     im = Image.new("RGBA", (W, H), BG + (255,))
@@ -102,13 +241,16 @@ def _frame(board, white: str, black: str, last=None, caption: str = "", sub: str
     _player(d, PAD, TOP // 2, white, True)
     _player(d, W - PAD, TOP // 2, black, False, align_right=True)
     d.text((W // 2, TOP // 2), "vs", font=_font(False, 22), fill=MUTED, anchor="mm")
-    im.alpha_composite(_board_img(board, last), (PAD, TOP))
+    im.alpha_composite(_board_img(board, last, kind), (PAD, TOP))
     y0 = TOP + SQ * 8
     if caption:
         d.text((W // 2, y0 + 44), caption, font=_fit(d, caption, True, 32, W - 2 * PAD),
                fill=ACCENT if accent else TEXT, anchor="mm")
     if sub:
-        d.text((W // 2, y0 + 84), sub, font=_fit(d, sub, False, 22, W - 2 * PAD), fill=MUTED, anchor="mm")
+        col = BADGE[kind][0] if kind in BADGE and not accent else MUTED
+        bold = kind in BADGE and not accent
+        d.text((W // 2, y0 + 84), sub, font=_fit(d, sub, bold, 24 if bold else 22, W - 2 * PAD), fill=col,
+               anchor="mm")
     if progress is not None:
         d.rectangle((0, H - 6, W, H), fill=(40, 36, 46))
         d.rectangle((0, H - 6, int(W * progress), H), fill=ACCENT)
@@ -145,21 +287,31 @@ def replay_gif(moves: list[str], white: str, black: str, result: str, minutes: i
 
     board = chess.Board()
     plies = len(moves)
-    step = max(250, min(800, int(REPLAY_MAX * 1000 / max(plies, 1))))
+    notes = analyse(moves)
+    marked = sum(1 for k, _t in notes if k)
+    step, note_step = STEP, NOTE_STEP
+    total = marked * note_step + (plies - marked) * step
+    if total > REPLAY_MAX * 1000:  # длинная партия — ускоряем всё поровну, но не быстрее читаемого
+        scale = REPLAY_MAX * 1000 / total
+        step, note_step = max(STEP_MIN, int(step * scale)), max(1300, int(note_step * scale))
     frames = [_frame(board, white, black, caption="Начало партии", progress=0.0)]
-    durations = [1200]
+    durations = [1500]
     for i, uci in enumerate(moves, 1):
         move = chess.Move.from_uci(uci)
         text = _move_text(board, move)
         board.push(move)
-        sub = "шах!" if board.is_check() and i < plies else ""
-        frames.append(_frame(board, white, black, last=move, caption=text, sub=sub, progress=i / plies))
-        durations.append(step)
+        kind, note = notes[i - 1]
+        sub = note or ("шах!" if board.is_check() and i < plies else "")
+        frames.append(_frame(board, white, black, last=move, caption=text, sub=sub, progress=i / plies, kind=kind))
+        durations.append(note_step if kind else step)
     title, sub = _verdict(board, result)
     if minutes:
         sub += f" · {minutes} мин"
+    blunders = [sum(1 for j, (k, _t) in enumerate(notes) if k == "bad" and j % 2 == side) for side in (0, 1)]
+    if any(blunders):
+        sub += f" · зевков: белые {blunders[0]}, чёрные {blunders[1]}"
     frames.append(_frame(board, white, black, last=board.peek() if plies else None, caption=title, sub=sub,
-                         progress=1.0, accent=True))
+                         progress=1.0, accent=True, kind=notes[-1][0] if notes else None))
     durations.append(4000)
     out = io.BytesIO()
     pal = [f.convert("RGB").quantize(colors=128, dither=0) for f in frames]
