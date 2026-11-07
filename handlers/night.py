@@ -6,9 +6,12 @@ Opus, тема из TOPICS, без шуток и без имён — в эфир
 звук — radio.py (полоса приёмника, эфир, ветер или дождь по погоде, позывной) → OGG/Opus.
 Публикует не сам: черновик — голосовым в личку админу с кнопками «В канал / Переписать / Выкинуть».
 /night — новый черновик (≈$0.02). Первый эфир бот прислал владельцу сам после обновления (night_first_sent).
-/horror — «страшная история» (просьба владельца: «очень жуткое про Волгоград, можно вымышленное»): «история, которую
-прислал слушатель» (ai.horror_story — от первого лица, правило, которое нельзя нарушать; война/мемориалы/теракты —
-нельзя), под голосом гул и далёкий стук (radio, horror=True), 2-4 мин. Голос — ai.narrate: ElevenLabs по ключу
+/horror — «страшная история» (просьба владельца: «очень жуткое про Волгоград, можно вымышленное»; потом: «сделай
+ещё страшнее… как ведущий на радио, который объявляет историю, присланную на почту»): ведущий — «на почту эфира
+пришло письмо, тема: «…», отправлено в три семнадцать ночи, читаю без изменений», дальше письмо слушателя
+(ai.horror_story: каждый раз новый приём из HORROR_ENGINES, эскалация в три ступени, удар по самому близкому, без
+клише и бытовой завязки; война/мемориалы/теракты — нельзя), приписка ведущего (что случилось, когда редакция
+ответила автору), в самых жутких местах — сбой эфира (radio glitches), под голосом гул и далёкий стук, 3-5 мин. Голос — ai.narrate: ElevenLabs по ключу
 (/setkey eleven …), без него — gpt-audio (mini звучал «по-ИИшному»).
 """
 from __future__ import annotations
@@ -194,6 +197,7 @@ async def make_episode(db: Database, horror: bool = False) -> dict:
     now = datetime.now(MSK)
     cond = _conditions(await _weather(), now)
     clock = f"{_clock(now).capitalize()}."
+    glitches: set[int] = set()
     if horror:
         try:
             used = json.loads(await db.get_setting(HORROR_KEY, "[]") or "[]")
@@ -202,12 +206,15 @@ async def make_episode(db: Database, horror: bool = False) -> dict:
         story = await ai.horror_story(used[-10:])
         if not story["paragraphs"]:
             raise RuntimeError("ИИ не написал историю")
-        topic = story["title"] or "без названия"
-        paragraphs = ([f"{clock} Это ночной эфир. Сегодня - история, которую нам прислал слушатель. Он просил не "
-                       "называть его имени."] + story["paragraphs"]
-                      + [f"Это был ночной эфир. {cond['end']} Не выключайте свет.".replace("  ", " ")])
-        await db.set_setting(HORROR_KEY, json.dumps((used + [f"{topic}: {story['premise']}"[:160]])[-30:],
-                                                    ensure_ascii=False))
+        topic = story["subject"] or story["title"] or "без темы"
+        sent = now.replace(hour=random.randint(2, 4), minute=random.randint(1, 59))
+        intro = (f"{clock} Это ночной эфир «Мементо мори». Доброй ночи тем, кто не спит. Сегодня на почту эфира "
+                 f"пришло письмо." + (f" Тема: «{story['subject']}»." if story["subject"] else "")
+                 + f" Отправлено в {_clock(sent)} ночи. Читаю без изменений.")
+        paragraphs = [intro] + story["paragraphs"] + ([story["outro"]] if story["outro"] else []) \
+            + [f"Это был ночной эфир. {cond['end']} Не выключайте свет.".replace("  ", " ")]
+        glitches = {g + 1 for g in story["glitches"]}  # +1: перед письмом — вступление ведущего
+        await db.set_setting(HORROR_KEY, json.dumps((used + [story["premise"][:160]])[-30:], ensure_ascii=False))
     else:
         try:
             used = json.loads(await db.get_setting(TOPICS_KEY, "[]") or "[]")
@@ -228,7 +235,8 @@ async def make_episode(db: Database, horror: bool = False) -> dict:
         if not pcm:
             return {"ogg": None, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic}
         voice.append(pcm)
-    mix = await asyncio.to_thread(radio.broadcast, voice, ai.SPEAK_RATE, cond["rain"], int(time.time()), horror)
+    mix = await asyncio.to_thread(radio.broadcast, voice, ai.SPEAK_RATE, cond["rain"], int(time.time()), horror,
+                                  glitches)
     ogg = await asyncio.to_thread(radio.to_ogg, mix)
     logger.info("ночной эфир №%s%s: «%s», %.0f сек, голос %s", n, " (страшная история)" if horror else "", topic,
                 len(mix) / radio.SR, "ElevenLabs" if ai.eleven_key() else "OpenRouter")

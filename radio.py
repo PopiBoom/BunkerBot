@@ -125,17 +125,31 @@ def _drone(n: int, rng: np.random.Generator) -> np.ndarray:
     return out / (np.abs(out).max() or 1)
 
 
+def _glitch(rng: np.random.Generator) -> np.ndarray:
+    """Сбой эфира в жутком месте: голос обрывается, рваный треск и плывущий свист, потом тишина."""
+    n = int(1.4 * SR)
+    t = np.arange(n) / SR
+    noise = rng.standard_normal(n)
+    gate = (rng.random(int(n / 600) + 1) > 0.45).repeat(600)[:n]  # заикание: эфир рвётся кусками
+    warble = np.sin(2 * np.pi * np.cumsum(1300 + 500 * np.sin(2 * np.pi * 9 * t)) / SR)
+    out = (0.7 * noise * gate + 0.35 * warble) * np.linspace(1, 0.2, n)
+    out[int(1.0 * SR):] *= 0.05  # провал — почти тишина
+    return (out / (np.abs(out).max() or 1) * 0.9).astype(np.float32)
+
+
 def broadcast(voice_chunks: list[bytes], rate: int = 24000, rain: bool = False, seed: int = 0,
-              horror: bool = False) -> np.ndarray:
-    """Весь эфир (float32, 48 кГц, моно, пик ≈ -1 дБ). horror — гул, далёкий стук и паузы длиннее."""
+              horror: bool = False, glitches: set[int] | None = None) -> np.ndarray:
+    """Весь эфир (float32, 48 кГц, моно, пик ≈ -1 дБ). horror — гул, далёкий стук и паузы длиннее; glitches —
+    после каких кусков голоса вместо паузы сбой эфира."""
     rng = np.random.default_rng(seed)
     pause = np.zeros(int((1.3 if horror else 0.85) * SR), dtype=np.float32)
+    glitches = glitches or set()
     parts = []
     for i, pcm in enumerate(voice_chunks):
         v = _resample(pcm, rate)
         if len(v):
             v = v / (np.abs(v).max() or 1)
-            parts += ([pause] if i else []) + [v]
+            parts += ([_glitch(rng) if i - 1 in glitches else pause] if i else []) + [v]
     voice = np.concatenate(parts) if parts else np.zeros(SR, dtype=np.float32)
     # «приёмник»: полоса, насыщение, лёгкое плавание громкости
     voice = _band(voice, 280, 3600)
