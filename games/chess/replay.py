@@ -1,13 +1,19 @@
 """Повтор шахматной партии гифкой (ход за ходом; итоговую картинку владелец не захотел — только гифка). Pillow, без ИИ.
 
 Фигуры — те же, что значки кнопок (icons.piece_image), доска — тёплое дерево, ход — СТРЕЛКОЙ (просьба владельца),
-король под шахом — красным. Ходы с пометкой (analyse, без движка — по материалу): «!» зелёным — выиграл фигуру,
-вилка, превращение; «??» красным — зевок (отдал фигуру даром); «#» — мат. Такие кадры держатся дольше.
+король под шахом — красным. Ходы с пометкой (analyse): со Stockfish (если стоит на сервере — ставит deploy/update.sh)
+— как на lichess по падению шанса на победу: «??» грубая ошибка, «?» ошибка (с подсказкой, как было лучше), «!»
+единственный сильный ход; без движка — грубо по материалу: «!» выиграл фигуру/вилка, «??» отдал фигуру даром. «#» —
+мат. Такие кадры держатся дольше.
 Темп — STEP мс на ход (владелец: «медленнее»), длинные партии сжимаются до REPLAY_MAX сек, но не быстрее STEP_MIN.
 """
 from __future__ import annotations
 
 import io
+import logging
+import math
+import os
+import shutil
 from functools import lru_cache
 from pathlib import Path
 
@@ -19,8 +25,13 @@ TEXT, MUTED, ACCENT = (240, 236, 228), (150, 144, 150), (232, 188, 84)
 LIGHT, DARK = (236, 220, 190), (170, 122, 84)
 LAST = (247, 214, 92, 120)             # подсветка последнего хода
 CHECK = (225, 45, 45)
-ARROW = {None: (255, 170, 0, 190), "good": (60, 190, 90, 200), "bad": (225, 50, 50, 200), "mate": (60, 140, 255, 210)}
-BADGE = {"good": ((60, 170, 80), "!"), "bad": ((210, 45, 45), "??"), "mate": ((50, 120, 230), "#")}
+ARROW = {None: (255, 170, 0, 190), "good": (60, 190, 90, 200), "bad": (225, 50, 50, 200), "mate": (60, 140, 255, 210),
+         "mistake": (240, 140, 30, 200)}
+BADGE = {"good": ((60, 170, 80), "!"), "bad": ((210, 45, 45), "??"), "mate": ((50, 120, 230), "#"),
+         "mistake": ((225, 120, 20), "?")}
+ENGINE_TIME = 0.12      # сек Stockfish на позицию (100 полуходов ≈ 12 сек, рисуется в потоке)
+ENGINE_MAX_PLIES = 200  # длиннее — без движка
+logger = logging.getLogger("chess")
 VALUE = {1: 1, 2: 3, 3: 3, 4: 5, 5: 9, 6: 0}   # пешка, конь, слон, ладья, ферзь, король
 WHAT = {1: "пешку", 2: "коня", 3: "слона", 4: "ладью", 5: "ферзя", 6: "короля"}
 STEP, STEP_MIN, NOTE_STEP = 1400, 400, 2600     # мс: обычный ход, минимум для длинных партий, ход с пометкой
@@ -94,7 +105,102 @@ def _mate_in_one(board) -> bool:
     return False
 
 
+def engine_path() -> str | None:
+    """Stockfish: STOCKFISH_PATH, в PATH или /usr/games (туда его ставит apt; в PATH службы /usr/games нет)."""
+    for c in (os.getenv("STOCKFISH_PATH"), shutil.which("stockfish"), "/usr/games/stockfish",
+              "/usr/local/bin/stockfish"):
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
 def analyse(moves: list[str]) -> list[tuple[str | None, str]]:
+    """Пометка к каждому полуходу: (вид, текст). Есть Stockfish — по нему, нет или упал — по материалу."""
+    rough = analyse_rough(moves)
+    path = engine_path()
+    if not path or not moves or len(moves) > ENGINE_MAX_PLIES:
+        return rough
+    try:
+        return _analyse_engine(moves, path, rough)
+    except Exception as e:  # движок не запустился или упал — хватит и грубых пометок
+        logger.warning("stockfish: %s — пометки без движка", e)
+        return rough
+
+
+def _win(cp: int) -> float:
+    """Шанс на победу (0–100) по оценке в сантипешках — формула lichess."""
+    return 50 + 50 * (2 / (1 + math.exp(-0.00368208 * cp)) - 1)
+
+
+def _short_move(board, move) -> str:
+    from .icons import GLYPH
+
+    import chess
+
+    p = board.piece_at(move.from_square)
+    sep = "×" if board.is_capture(move) else "-"
+    return f"{GLYPH[p.symbol().upper()]} {chess.square_name(move.from_square)}{sep}{chess.square_name(move.to_square)}"
+
+
+def _analyse_engine(moves: list[str], path: str, rough: list) -> list[tuple[str | None, str]]:
+    """Как lichess: падение шанса на победу ≥ 30 — «??», ≥ 15 — «?» (с подсказкой лучшего хода); сыгран лучший ход, а
+    второй по силе хуже на ≥ 20 — «!». Мат за доской — «#». Текст «!»/«??» — из грубого разбора, если он понял, что
+    случилось (вилка, отдал ферзя), иначе общий."""
+    import chess
+    import chess.engine
+
+    limit = chess.engine.Limit(time=ENGINE_TIME)
+    out: list[tuple[str | None, str]] = []
+    with chess.engine.SimpleEngine.popen_uci(path) as eng:
+        try:
+            eng.configure({"Threads": 1, "Hash": 32})
+        except chess.engine.EngineError:
+            pass
+        b = chess.Board()
+        info = eng.analyse(b, limit, multipv=2)
+        prev_cap = None  # поле, где соперник только что взял: взять в ответ — не «!», это просто размен
+        for i, uci in enumerate(moves):
+            m = chess.Move.from_uci(uci)
+            side = b.turn
+            recapture = prev_cap == m.to_square and b.is_capture(m)
+            prev_cap = m.to_square if b.is_capture(m) else None
+            best_move = info[0]["pv"][0] if info and info[0].get("pv") else None
+            best = info[0]["score"].pov(side)
+            second = info[1]["score"].pov(side) if len(info) > 1 else None
+            best_text = _short_move(b, best_move) if best_move and best_move != m else ""
+            b.push(m)
+            if b.is_checkmate():
+                out.append(("mate", "Мат!"))
+                break
+            if b.is_game_over():
+                out.append(rough[i])
+                break
+            info = eng.analyse(b, limit, multipv=2)
+            after = info[0]["score"].pov(side)
+            w_best, w_after = _win(best.score(mate_score=10000)), _win(after.score(mate_score=10000))
+            drop = w_best - w_after
+            rough_kind, rough_text = rough[i]
+            if after.is_mate() and after.mate() < 0 and not (best.is_mate() and best.mate() < 0):
+                out.append(("bad", f"Зевок: мат в {abs(after.mate())}" + (f", лучше {best_text}" if best_text else "")))
+            elif best.is_mate() and best.mate() > 0 and not (after.is_mate() and after.mate() > 0):
+                out.append(("bad", f"Упустил мат в {best.mate()}" + (f": {best_text}" if best_text else "")))
+            elif drop >= 30:
+                text = rough_text if rough_kind == "bad" else "Грубая ошибка"
+                out.append(("bad", text + (f", лучше {best_text}" if best_text else "")))
+            elif drop >= 15:
+                out.append(("mistake", "Ошибка" + (f", лучше {best_text}" if best_text else "")))
+            elif m == best_move and second is not None and 10 <= w_best <= 95 and not recapture and \
+                    w_best - _win(second.score(mate_score=10000)) >= 20:
+                out.append(("good", rough_text if rough_kind == "good" else "Единственный сильный ход!"))
+            elif rough_kind == "good" and drop < 5:
+                out.append(rough[i])  # вилка или взял даром — и движок не против
+            else:
+                out.append((None, ""))
+    out += [(None, "")] * (len(moves) - len(out))
+    return out
+
+
+def analyse_rough(moves: list[str]) -> list[tuple[str | None, str]]:
     """Пометка к каждому полуходу: (вид, текст) — "good" «Выиграл ферзя!», "bad" «Зевок ладьи», "mate", или (None, "").
 
     Без шахматного движка: по материалу на один ход вперёд — ловит явное (отдал фигуру даром, забрал даром, вилка),
@@ -307,9 +413,10 @@ def replay_gif(moves: list[str], white: str, black: str, result: str, minutes: i
     title, sub = _verdict(board, result)
     if minutes:
         sub += f" · {minutes} мин"
-    blunders = [sum(1 for j, (k, _t) in enumerate(notes) if k == "bad" and j % 2 == side) for side in (0, 1)]
+    blunders = [sum(1 for j, (k, _t) in enumerate(notes) if k in ("bad", "mistake") and j % 2 == side)
+                for side in (0, 1)]
     if any(blunders):
-        sub += f" · зевков: белые {blunders[0]}, чёрные {blunders[1]}"
+        sub += f" · ошибок: белые {blunders[0]}, чёрные {blunders[1]}"
     frames.append(_frame(board, white, black, last=board.peek() if plies else None, caption=title, sub=sub,
                          progress=1.0, accent=True, kind=notes[-1][0] if notes else None))
     durations.append(4000)

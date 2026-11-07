@@ -16,7 +16,7 @@ fi
 
 echo "==> Ставлю Python и git…"
 apt-get update -y -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 python3-venv python3-pip git >/dev/null
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 python3-venv python3-pip git stockfish >/dev/null
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
   || { echo "Нужен Python 3.10+. Возьми сервер с Ubuntu 22.04 или 24.04."; exit 1; }
 

@@ -7,6 +7,21 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)"
 G=(git -c safe.directory="$DIR" -C "$DIR")
 BRANCH="$("${G[@]}" rev-parse --abbrev-ref HEAD)"
 
+# Stockfish для разбора шахматных партий (games/chess/replay.py): нет — ставим один раз (повтор попытки — не чаще
+# раза в сутки, метка .stockfish_try). Без него разбор грубее, но всё работает.
+SF_TRY="$DIR/.stockfish_try"
+if ! command -v stockfish >/dev/null 2>&1 && [ ! -x /usr/games/stockfish ] && command -v apt-get >/dev/null 2>&1 \
+   && { [ ! -f "$SF_TRY" ] || [ $(( $(date +%s) - $(stat -c %Y "$SF_TRY") )) -gt 86400 ]; }; then
+  touch "$SF_TRY"
+  if DEBIAN_FRONTEND=noninteractive timeout 300 apt-get install -y -qq stockfish >/dev/null 2>&1 \
+     || { timeout 300 apt-get update -qq >/dev/null 2>&1 \
+          && DEBIAN_FRONTEND=noninteractive timeout 300 apt-get install -y -qq stockfish >/dev/null 2>&1; }; then
+    logger -t bunkerbot "Stockfish установлен"; echo "Stockfish установлен"
+  else
+    logger -t bunkerbot "Stockfish поставить не удалось — шахматы разбираются без движка"
+  fi
+fi
+
 "${G[@]}" fetch -q origin "$BRANCH"
 LOCAL="$("${G[@]}" rev-parse HEAD)"
 REMOTE="$("${G[@]}" rev-parse "origin/$BRANCH")"

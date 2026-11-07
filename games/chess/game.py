@@ -17,6 +17,7 @@ import asyncio
 import html
 import json
 import logging
+import os
 import random
 import time
 from collections import deque
@@ -80,6 +81,7 @@ COMMENT_WAIT = 20   # сек ждём, пока пост канала появи
 DONE = "chess_done:"   # настройка: доигранная партия (ходы, игроки, итог, file_id гифки) — реванш её не стирает
 REPLAY = "replay "
 _bg: set[asyncio.Task] = set()
+_gif_tasks: dict[str, asyncio.Task] = {}   # инлайн-партия → гифка, которая готовится с конца партии
 _forwards: dict[tuple[int, int], int] = {}            # (канал, пост) → id копии поста в группе
 _forward_waits: dict[tuple[int, int], asyncio.Future] = {}
 
@@ -493,13 +495,21 @@ async def _gif(st: dict) -> bytes:
 
 
 async def _finished(bot: Bot, db: Database, call: CallbackQuery, gid: str, st: dict) -> None:
-    """Партия кончилась: запомнить её (для «🎞 Повтор») и в сообщениях бота — прислать гифку под доской."""
+    """Партия кончилась: запомнить её (для «🎞 Повтор») и в сообщениях бота — прислать гифку под доской. В «@бот»
+    гифку готовим сразу в фоне (со Stockfish разбор идёт ~10 сек — инлайн-запрос столько ждать не может)."""
     if not st.get("moves"):
         return
     done = {k: st.get(k) for k in ("w", "b", "moves", "over", "start")}
     await db.set_setting(DONE + gid, json.dumps(done, ensure_ascii=False))
-    if call.inline_message_id or not call.message:
-        return  # в чужом чате бот писать не может — там кнопка «🎞 Повтор»
+    if call.inline_message_id or not call.message:  # в чужом чате бот писать не может — там кнопка «🎞 Повтор»
+        if len(_gif_tasks) > 200:
+            for k in [k for k, t in _gif_tasks.items() if t.done()]:
+                _gif_tasks.pop(k, None)
+        task = asyncio.create_task(_cache_gif(bot, db, gid, done))
+        _gif_tasks[gid] = task
+        _bg.add(task)
+        task.add_done_callback(_bg.discard)
+        return
     chat_id, msg_id = call.message.chat.id, call.message.message_id
 
     async def send() -> None:
@@ -517,6 +527,41 @@ async def _finished(bot: Bot, db: Database, call: CallbackQuery, gid: str, st: d
     task.add_done_callback(_bg.discard)
 
 
+def _owner_id() -> int:
+    raw = os.getenv("BOT_FATHER_ID", "") or os.getenv("ADMIN_IDS", "").replace(";", ",").split(",")[0]
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return 0
+
+
+async def _cache_gif(bot: Bot, db: Database, gid: str, done: dict) -> str | None:
+    """Гифка в Telegram ради file_id: тихо в личку владельцу и сразу удалить; file_id — в запись партии."""
+    owner = _owner_id()
+    if not owner:
+        return None
+    try:
+        msg = await bot.send_animation(owner, BufferedInputFile(await _gif(done), "chess.gif"),
+                                       disable_notification=True)
+        fid = msg.animation.file_id if msg.animation else msg.document.file_id
+        try:
+            await bot.delete_message(owner, msg.message_id)
+        except TelegramBadRequest:
+            pass
+    except Exception:  # noqa: BLE001
+        logger.exception("chess: гифка для инлайн-повтора не загрузилась")
+        return None
+    raw = await db.get_setting(DONE + gid, "")
+    try:
+        cur = json.loads(raw) if raw else {}
+    except ValueError:
+        cur = {}
+    if cur.get("moves") == done["moves"]:  # пока рисовали, там не доиграли новую партию (реванш)
+        cur["gif"] = fid
+        await db.set_setting(DONE + gid, json.dumps(cur, ensure_ascii=False))
+    return fid
+
+
 async def _inline_replay(query: InlineQuery, bot: Bot, db: Database, config: Config) -> None:
     gid = query.query[len(REPLAY):].strip()
     raw = await db.get_setting(DONE + gid, "") if gid else ""
@@ -528,22 +573,20 @@ async def _inline_replay(query: InlineQuery, bot: Bot, db: Database, config: Con
         await query.answer([], cache_time=1, is_personal=True)
         return
     fid = done.get("gif")
-    if not fid:  # гифки в Telegram ещё нет — загрузить тихо в личку владельцу ради file_id и сразу удалить
-        owner = config.admin_ids[0] if config.admin_ids else 0
+    if not fid:
+        task = _gif_tasks.get(gid)
         try:
-            msg = await bot.send_animation(owner, BufferedInputFile(await _gif(done), "chess.gif"),
-                                           disable_notification=True)
-            fid = msg.animation.file_id if msg.animation else msg.document.file_id
-            try:
-                await bot.delete_message(owner, msg.message_id)
-            except TelegramBadRequest:
-                pass
+            if task and not task.done():  # ещё рисуется с конца партии — подождём немного
+                fid = await asyncio.wait_for(asyncio.shield(task), 8)
+            elif task:
+                fid = task.result()
         except Exception:  # noqa: BLE001
-            logger.exception("chess: гифка для инлайн-повтора не загрузилась")
-            await query.answer([], cache_time=1, is_personal=True)
-            return
-        done["gif"] = fid
-        await db.set_setting(DONE + gid, json.dumps(done, ensure_ascii=False))
+            fid = None
+    if not fid:
+        fid = await _cache_gif(bot, db, gid, done)
+    if not fid:
+        await query.answer([], cache_time=1, is_personal=True)
+        return
     res = InlineQueryResultCachedGif(id="replay", gif_file_id=fid, title="🎞 Повтор партии",
                                      caption=f"🎞 Повтор партии: {html.escape(done['w'][1])} - {html.escape(done['b'][1])}")
     await query.answer([res], cache_time=1, is_personal=True)
