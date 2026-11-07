@@ -2347,7 +2347,7 @@ async def speak(text: str, system: str | None = None, voice: str | None = None, 
                      {"role": "user", "content": f"Произнеси дословно: {text}"}],
     }
     headers = {"Authorization": f"Bearer {key}", "X-Title": "BunkerBot"}
-    audio, said, usage = bytearray(), [], {}
+    audio, said, usage, pieces = bytearray(), [], {}, []
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), trust_env=True) as s:
             async with s.post(OPENROUTER_URL, json=body, headers=headers) as r:
@@ -2369,7 +2369,9 @@ async def speak(text: str, system: str | None = None, voice: str | None = None, 
                     for ch in chunk.get("choices") or []:
                         a = (ch.get("delta") or {}).get("audio") or {}
                         if a.get("data"):
-                            audio += base64.b64decode(a["data"])
+                            piece = base64.b64decode(a["data"])
+                            audio += piece
+                            pieces.append(piece)
                         if a.get("transcript"):
                             said.append(a["transcript"])
     except Exception as e:
@@ -2385,9 +2387,36 @@ async def speak(text: str, system: str | None = None, voice: str | None = None, 
     if spoken and _same_words(text, spoken) < 0.5:  # озвучка «ответила» своё вместо чтения — не пускаем в эфир
         logger.info("speak: модель сказала не то: %s", spoken[:200])
         return b""
-    if audio[:3] == b"ID3" or audio[:4] in (b"RIFF", b"OggS"):
-        logger.info("speak: %s вернул сжатый звук (%s) — декодирую", model or SPEAK_MODEL, bytes(audio[:4]))
-    return to_pcm24(bytes(audio))  # иногда это MP3/WAV, а не PCM: войс и эфир иначе хрипели помехами
+    return pieces_to_pcm(pieces, text, model or SPEAK_MODEL)
+
+
+def _secs(pcm: bytes) -> float:
+    return len(pcm) / 2 / SPEAK_RATE
+
+
+def expected_secs(text: str) -> float:
+    """Сколько примерно звучит текст вслух (≈ 2.5 слова в секунду)."""
+    return len(re.findall(r"\w+", text)) / 2.5
+
+
+def pieces_to_pcm(pieces: list[bytes], text: str, who: str) -> bytes:
+    """Звук, пришедший потоком кусками → PCM 24 кГц. Бывает «сырой» PCM, бывает сжатый файл, а бывает каждый кусок —
+    отдельный маленький файл: тогда целиком декодируется только первый, и голоса почти нет (владелец: «20 сек и нет
+    слов»). Пробуем целиком и по кускам, берём, что длиннее."""
+    if not pieces:
+        return b""
+    whole = b"".join(pieces)
+    head = whole[:4]
+    compressed = head[:3] == b"ID3" or head in (b"RIFF", b"OggS", b"fLaC") or (whole[0] == 0xFF and whole[1] & 0xE0 == 0xE0)
+    joined = to_pcm24(whole)
+    best = joined
+    if compressed and len(pieces) > 1:
+        each = b"".join(to_pcm24(p) for p in pieces)
+        if _secs(each) > _secs(joined):
+            best = each
+    logger.info("speak: %s — %d кусков, начало %s, %s, звук %.1f с (текст ≈ %.1f с)", who, len(pieces), head,
+                "сжатый" if compressed else "PCM", _secs(best), expected_secs(text))
+    return best
 
 
 # ---------- голос для эфиров: ElevenLabs (живой) или OpenRouter (запасной) ----------
@@ -2516,6 +2545,10 @@ async def narrate(text: str, horror: bool = False) -> bytes:
         if is_noise(pcm):
             logger.warning("narrate: %s вернул шум вместо речи (%d байт, начало %s) — пробую следующий",
                            name, len(pcm), pcm[:4])
+            continue
+        if _secs(pcm) < 0.35 * expected_secs(text):  # голоса почти нет — кусок потерялся
+            logger.warning("narrate: %s вернул %.1f с звука на текст ≈ %.1f с — пробую следующий",
+                           name, _secs(pcm), expected_secs(text))
             continue
         return pcm
     return b""
