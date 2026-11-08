@@ -8,10 +8,14 @@
 from __future__ import annotations
 
 import io
+import logging
+import os
+from functools import lru_cache
 
 import numpy as np
 
 SR = 48000
+log = logging.getLogger(__name__)
 
 
 def _gain(f: np.ndarray, lo: float, hi: float) -> np.ndarray:
@@ -347,6 +351,61 @@ def _jingle(up: bool = True) -> np.ndarray:
     sub = (np.sin(2 * np.pi * 55 * t) * np.exp(-t * 4)).astype(np.float32) * 0.6  # мягкий удар снизу
     out[:len(sub)] += sub
     return out / (np.abs(out).max() or 1)
+
+
+# Заставка «Писем Волгограда» — звук владельца (08.11: «чтобы вот это игралось в качестве начала»), ≈ 6 с. Нет
+# файла или не читается — прежний позывной-колокольчики (_jingle).
+INTRO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "radio", "intro.mp3")
+INTRO_DB = -3.0       # заставка на 3 дБ тише речи ведущего (в полосе телефона)
+INTRO_FADE = 1.0      # у файла нет своего затухания — уводим последнюю секунду
+INTRO_OVERLAP = 0.6   # ведущий вступает за столько секунд до конца заставки
+
+
+@lru_cache(maxsize=1)
+def _intro_raw() -> np.ndarray | None:
+    """Заставка из файла: моно, 48 кГц, float32 (один раз за запуск)."""
+    if not os.path.exists(INTRO_FILE):
+        return None
+    try:
+        import av
+
+        with av.open(INTRO_FILE) as c:
+            st = c.streams.audio[0]
+            rate = st.codec_context.sample_rate
+            chunks = []
+            for fr in c.decode(st):
+                a = fr.to_ndarray()
+                if a.dtype.kind == "i":
+                    a = a.astype(np.float32) / 32768
+                if fr.format.is_planar:
+                    a = a.reshape(len(fr.layout.channels), -1).mean(axis=0)
+                else:
+                    a = a.reshape(-1, len(fr.layout.channels)).mean(axis=1)
+                chunks.append(a.astype(np.float32))
+        x = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+        x = _resample((np.clip(x, -1, 1) * 32767).astype("<i2").tobytes(), rate)
+        if len(x) < SR // 2:
+            return None
+        x.flags.writeable = False
+        return x
+    except Exception as e:  # noqa: BLE001 — битый файл не должен ронять эфир
+        log.warning("radio: заставка %s не читается: %s", INTRO_FILE, e)
+        return None
+
+
+def _intro(level_db: float) -> np.ndarray | None:
+    """Заставка с громкостью level_db (RMS в полосе телефона), мягким входом и затуханием в конце."""
+    raw = _intro_raw()
+    if raw is None:
+        return None
+    x = raw.copy()
+    r = float(np.sqrt(np.mean(np.square(_band(x, *PHONE_BAND), dtype=np.float64))))
+    if r > 0:
+        x *= np.float32(_db(level_db) / r)
+    fi, fo = int(0.02 * SR), min(int(INTRO_FADE * SR), len(x) // 2)
+    x[:fi] *= np.linspace(0, 1, fi, dtype=np.float32)
+    x[-fo:] *= np.linspace(1, 0, fo, dtype=np.float32) ** 2
+    return x
 
 
 def _tension(ln: int, rng: np.random.Generator) -> np.ndarray:
@@ -792,21 +851,26 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
     voice = _peak1(np.concatenate(pieces).astype(np.float32)) if pieces else np.zeros(SR, dtype=np.float32)
     del pieces, parts
 
-    # 2) микс: позывной, голос, позывной в конце
-    head, tail = _jingle(True), _jingle(False)
-    start = len(head) - int(0.9 * SR) + int(0.25 * SR)       # голос вступает, пока позывной ещё звенит
+    # 2) микс: заставка владельца (или позывной), голос, позывной в конце
+    host = [(a0, b0) for a0, b0, st in spans if st == "host"]
+    ref_hp = (_speech_db(_band(np.concatenate([voice[a0:b0] for a0, b0 in host]), *PHONE_BAND))
+              if host else -20.0)                            # громкость ведущего в полосе телефона
+    head, tail = _intro(ref_hp + INTRO_DB), _jingle(False)
+    if head is not None:
+        start = len(head) - int(INTRO_OVERLAP * SR)          # ведущий вступает, пока заставка уходит
+    else:
+        head = _jingle(True) * np.float32(_db(-6))
+        start = len(head) - int(0.9 * SR) + int(0.25 * SR)   # голос вступает, пока позывной ещё звенит
     n = start + len(voice) + int(0.6 * SR) + len(tail)
     mix = np.zeros(n, dtype=np.float32)
-    mix[:len(head)] += head * _db(-6)
+    mix[:len(head)] += head
     mix[start:start + len(voice)] += voice
     end = start + len(voice) + int(0.6 * SR)
     mix[end:end + len(tail)] += tail * _db(-8)
     hiss_db = np.full(n // FADE_FRAME + 2, np.nan)          # уровень шипения эфира по кадрам 10 мс (дБ)
 
     # 3) подложка под ведущим
-    host = [(a0, b0) for a0, b0, st in spans if st == "host"]
     if host:
-        ref_hp = _speech_db(_band(np.concatenate([voice[a0:b0] for a0, b0 in host]), *PHONE_BAND))
         for a0, b0 in host:
             a, b = max(0, start + a0 - int(0.5 * SR)), min(n, start + b0 + int(1.0 * SR))
             bed = _talk_bed(b - a, rng)
@@ -818,8 +882,6 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
             _duck(bed, _slice(voice, a - start, b - start), -7.0)
             mix[a:b] += bed
             hiss_db[a // FADE_FRAME:b // FADE_FRAME + 1] = ref_hp + HISS_HOST_DB
-    else:
-        ref_hp = -20.0
 
     letters = [(a0, b0) for a0, b0, st in spans if st == "letter"]
     if letters:
