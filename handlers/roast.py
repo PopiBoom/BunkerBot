@@ -417,8 +417,43 @@ def _roll_voice(chat_id: int) -> bool:
     return random.random() < VOICE_SHARE
 
 
-async def _say_voice(bot: Bot, chat_id: int, text: str, reply_to: int | None = None) -> bool:
-    """Реплика голосовым (с пометками интонации). False — не озвучилось (тогда отвечать текстом)."""
+# Голосовой разговор (владелец 08.11: «если бот кинул голосовое и на него ответили тоже голосом — пусть и дальше
+# отвечает этому человеку голосовыми, а не текстом»): человек ответил голосом на голосовое бота — или, пока идёт
+# разговор (VOICE_TALK после голосового бота ему), обратился к боту голосом — ответ тоже голосом, без шанса VOICE_SHARE
+# и паузы VOICE_GAP. Перешёл на текст — бот снова отвечает как обычно.
+VOICE_TALK = 15 * 60
+_voice_talk: dict[tuple[int, int], float] = {}  # (чат, человек) → когда бот последний раз ответил ему голосом
+_voice_text: dict[tuple[int, int], str] = {}    # (чат, id голосового бота) → что в нём сказано
+
+
+def _voice_back(chat_id: int, message: Message, bot_id: int) -> bool:
+    """Отвечать ли голосом: человек сам говорит голосом — в ответ на голосовое бота или в голосовом разговоре."""
+    if (chat_id, message.message_id) not in _heard or not ai.eleven_key() or ai.eleven_geo_blocked():
+        return False
+    rt = message.reply_to_message
+    if rt and rt.from_user and rt.from_user.id == bot_id and rt.voice:
+        return True
+    who = message.from_user
+    return bool(who) and time.time() - _voice_talk.get((chat_id, who.id), 0) < VOICE_TALK
+
+
+async def _voice_said(db: Database, chat_id: int, msg_id: int) -> str:
+    """Что бот сказал в своём голосовом (у голосового нет текста — без этого ответ на него шёл бы невпопад)."""
+    said = _voice_text.get((chat_id, msg_id))
+    if said:
+        return said
+    try:  # после перезапуска — из памяти чата («[голосом] …»)
+        row = (await db.messages_by_id(chat_id, [msg_id])).get(msg_id)
+    except Exception as e:
+        logger.debug("voice said lookup failed: %s", e)
+        return ""
+    return re.sub(r"^\[голосом\]\s*", "", row[1] or "") if row else ""
+
+
+async def _say_voice(bot: Bot, chat_id: int, text: str, reply_to: int | None = None,
+                     to_user: int | None = None) -> bool:
+    """Реплика голосовым (с пометками интонации). False — не озвучилось (тогда отвечать текстом).
+    to_user — кому отвечали: с ним теперь «голосовой разговор» (_voice_back)."""
     import radio
 
     text = ai.scrub((text or "").strip())
@@ -441,6 +476,11 @@ async def _say_voice(bot: Bot, chat_id: int, text: str, reply_to: int | None = N
     sent = await bot.send_voice(chat_id, BufferedInputFile(ogg, "pizdyuk.ogg"),
                                 duration=max(1, round(len(pcm) / 2 / ai.SPEAK_RATE)), **kwargs)
     _last_bot_msg[chat_id] = _voice_last[chat_id] = time.time()
+    if len(_voice_text) > 500:
+        _voice_text.clear()
+    _voice_text[(chat_id, getattr(sent, "message_id", 0) or 0)] = text
+    if to_user:
+        _voice_talk[(chat_id, to_user)] = time.time()
     if _db_ref:
         try:
             mid = getattr(sent, "message_id", 0) or 0
@@ -453,10 +493,11 @@ async def _say_voice(bot: Bot, chat_id: int, text: str, reply_to: int | None = N
     return True
 
 
-async def _say_human(bot: Bot, chat_id: int, text: str, reply_to: int | None = None, voice: bool = False) -> None:
+async def _say_human(bot: Bot, chat_id: int, text: str, reply_to: int | None = None, voice: bool = False,
+                     to_user: int | None = None) -> None:
     """Ответ «как человек»: «печатает…» по длине текста, иногда двумя сообщениями подряд; voice — голосовым."""
     text = (text or "").strip()
-    if voice and await _say_voice(bot, chat_id, text, reply_to):
+    if voice and await _say_voice(bot, chat_id, text, reply_to, to_user):
         return
     parts = re.split(r"(?<=[.!?…])\s+", text)
     if len(parts) >= 2 and len(text) > 50 and random.random() < SPLIT_CHANCE:
@@ -772,7 +813,8 @@ async def cmd_golos(message: Message, command: CommandObject, bot: Bot, db: Data
     rt = message.reply_to_message
     if args:  # сказать свой текст (ответом — в ответ на то сообщение)
         _mark("/golos - свой текст", args)
-        if not await _say_voice(bot, chat_id, args, reply_to=rt.message_id if rt else None):
+        if not await _say_voice(bot, chat_id, args, reply_to=rt.message_id if rt else None,
+                                to_user=rt.from_user.id if rt and rt.from_user else None):
             await temp_reply(message, "Голос не записался - глянь /setkey eleven.")
         return
     if not rt or not rt.from_user:
@@ -807,7 +849,7 @@ async def cmd_golos(message: Message, command: CommandObject, bot: Bot, db: Data
         return
     if is_father:
         answer = ai.vary_father(answer)
-    await _say_human(bot, chat_id, answer, reply_to=rt.message_id, voice=True)
+    await _say_human(bot, chat_id, answer, reply_to=rt.message_id, voice=True, to_user=who.id)
 
 
 @router.message(Command("roast"))
@@ -1177,14 +1219,18 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
              for m, _ in items if m.from_user and who and m.from_user.id == who.id]
     text = "\n".join(texts) or (last_msg.text or "")
     rt = last_msg.reply_to_message
-    if rt and rt.from_user and rt.from_user.id == bot.id and rt.text:
+    voice_back = _voice_back(chat_id, last_msg, bot.id)  # говорит с ботом голосом — и бот ему голосом
+    said = rt.text if rt and rt.from_user and rt.from_user.id == bot.id else None
+    if not said and rt and rt.from_user and rt.from_user.id == bot.id and rt.voice:  # ответ на голосовое бота
+        said = await _voice_said(db, chat_id, rt.message_id)
+    if said:
         meaning = ""
         if len(text.split()) <= 3 and ai.available():  # «Я», «мне», «не я» — сначала понять точный смысл
             try:
-                meaning = await ai.short_answer_meaning(rt.text, text)
+                meaning = await ai.short_answer_meaning(said, text)
             except Exception as e:
                 logger.debug("short answer meaning failed: %s", e)
-        text = (f"(отвечает на твою реплику «{rt.text[:300]}»"
+        text = (f"(отвечает на твою реплику «{said[:300]}»"
                 + (f"; смысл ответа: {meaning}" if meaning else "") + f")\n{text}")
     rude = any(r for m, r in items if m.from_user and who and m.from_user.id == who.id)
     samples = await db.style_sample(chat_id)
@@ -1199,6 +1245,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
         n = _thread_load(chat_id, who.id)
         empty = bool(_EMPTY.match(last_msg.text or ""))
         chance = 1.0 if n < 2 else {2: 0.5, 3: 0.3}.get(n, 0.15)
+        if voice_back:  # голосом говорят дольше — разговор голосом бот поддерживает охотнее
+            chance = 1.0 if n < 3 else 0.5
         if empty and n >= 1:
             chance = min(chance, 0.3)
         if random.random() > chance:
@@ -1229,7 +1277,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
         if not _why.get():
             _mark("послали - зеркалка")
         await _say_human(bot, chat_id, ai.vary_father(answer) if is_father else answer,
-                         reply_to=last_msg.message_id, voice=_roll_voice(chat_id))
+                         reply_to=last_msg.message_id, voice=voice_back or _roll_voice(chat_id),
+                         to_user=who.id if who else None)
         if who:
             _thread.setdefault((chat_id, who.id), []).append(time.time())
         return
@@ -1256,7 +1305,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     if answer and is_father:
         answer = ai.vary_father(answer)
     if answer:
-        await _say_human(bot, chat_id, answer, reply_to=last_msg.message_id, voice=_roll_voice(chat_id))
+        await _say_human(bot, chat_id, answer, reply_to=last_msg.message_id,
+                         voice=voice_back or _roll_voice(chat_id), to_user=who.id if who else None)
         if who:
             _thread.setdefault((chat_id, who.id), []).append(time.time())
         if random.random() < STICKER_AFTER:
@@ -1991,7 +2041,8 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int) -> None:
         if chat_id in _pending or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
             return
         if text:
-            await _say_human(bot, chat_id, text, reply_to=reply_to, voice=_roll_voice(chat_id))
+            await _say_human(bot, chat_id, text, reply_to=reply_to, voice=_roll_voice(chat_id),
+                             to_user=target[1] if target[1] > 0 else None)
 
 
 DOSSIER_VERSION_KEY = "dossier_version"
