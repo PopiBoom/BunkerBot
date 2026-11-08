@@ -40,7 +40,8 @@ MSK = timezone(timedelta(hours=3))
 LAT, LON = 48.708, 44.513                     # Волгоград
 DRAFT_KEY = "night_draft"
 COUNT_KEY = "night_no"
-HORROR_COUNT_KEY = "horror_no"   # у рубрики страшных историй — свой счёт выпусков
+HORROR_COUNT_KEY = "horror_no2"  # у рубрики страшных историй — свой счёт выпусков (08.11 владелец: «обнули
+#                                   выпуски» — новый ключ, следующий выпуск — №1; старый horror_no не трогаем)
 FIRST_KEY = "night_first_sent"
 HORROR_FIRST_KEY = "horror_first_sent"
 HORROR_KEY = "horror_titles"
@@ -189,15 +190,21 @@ def _conditions(w: dict | None, now: datetime) -> dict:
 # ---------- эфир ----------
 
 
-def _caption(horror: bool, n: int, topic: str, now: datetime, weather: str) -> str:
-    """Подпись к голосовому (и в канале): рубрика, номер выпуска, тема письма, время и погода."""
+def _caption(horror: bool, n: int, topic: str, now: datetime, weather: str, bot_username: str = "") -> str:
+    """Подпись к голосовому (и в канале): рубрика, номер выпуска, тема письма, время и погода; у рубрики — как
+    прислать свою историю (ссылка открывает бота сразу на письме)."""
     when = f"{now:%H:%M}" + (f" · {html.escape(weather)}" if weather else "")
     if horror:
+        from handlers.letters import deep_link
+
         subject = (topic or "без темы").strip()
         subject = subject[:1].upper() + subject[1:]
+        link = deep_link(bot_username)
         return (f"🩸 <b>{ai.HORROR_RUBRIC.upper()}</b> · выпуск №{n}\n"
                 f"✉️ <i>«{html.escape(subject)}»</i>\n\n"
-                f"📻 Радио Волгограда · {when}")
+                f"📻 Радио Волгограда · {when}"
+                + (f"\n\n📨 Свою историю можно оставить в этом боте: <a href=\"{link}\">@{html.escape(bot_username)}</a>"
+                   if link else ""))
     return f"🎙 <b>НОЧНОЙ ЭФИР</b> · №{n}\n\n🕯 {when}"
 
 
@@ -205,10 +212,15 @@ async def _noop(_text: str) -> None:
     return None
 
 
-async def make_episode(db: Database, horror: bool = False, progress=_noop) -> dict:
+async def make_episode(db: Database, horror: bool = False, progress=_noop, letter: dict | None = None,
+                       bot_username: str = "") -> dict:
     """{"ogg": bytes | None, "paragraphs": [...], "caption": str, "n": int}. Без голоса — без звука (текстом).
-    progress(текст) — что сейчас делаем (правит сообщение «Пишу…», чтобы было видно, что бот жив)."""
+    progress(текст) — что сейчас делаем (правит сообщение «Пишу…», чтобы было видно, что бот жив). letter — письмо
+    подписчика (handlers/letters.py), из которого делаем выпуск."""
     import radio
+    from handlers import letters as inbox
+
+    music_task, sfx_tasks, story = None, [], {}
 
     await progress("🔎 Ищу городские легенды и пишу письмо…" if horror else "✍️ Пишу текст эфира…")
     now = datetime.now(MSK)
@@ -223,9 +235,13 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop) -> di
         facts = (f"сегодня {ai.date_words(now.date())}, {day}; сейчас {_clock(now)}; "
                  + (cond["line"] or "погода неизвестна")
                  + ("; на улице светло" if cond["end"].startswith("До заката") else "; на улице темно"))
-        story = await ai.horror_story(used[-10:], facts, now.date())
+        coms = await inbox.comments(db)
+        story = await ai.horror_story(used[-10:], facts, now.date(), listener=letter, comments=coms)
         if not story["paragraphs"]:
             raise RuntimeError("ИИ не написал историю")
+        if ai.eleven_key() and not ai.eleven_geo_blocked():  # музыка и звуки — пока озвучивается голос
+            music_task = asyncio.create_task(ai.eleven_ambient(story.get("music", "")))
+            sfx_tasks = [asyncio.create_task(ai.eleven_sfx(x["sound"], x["secs"])) for x in story.get("sfx") or []]
         topic = story["subject"] or story["title"] or "без темы"
         # ведущий «радио Волгограда» (владелец: «как будто разговариваешь со зрителем»); ИИ промолчал — запасной
         intro = story["intro"] or (f"Хей, всем привет, ребята! Это радио Волгограда. {cond['line']} И ваша любимая "
@@ -234,12 +250,21 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop) -> di
                                    f"проверьте, закрыта ли у вас дверь. Это были «{ai.HORROR_RUBRIC}». "
                                    f"{ai.HORROR_SIGNOFF}")
         intro, outro = " ".join(intro.split()), " ".join(outro.split())
-        paragraphs = [ai.strip_tags(p) for p in [intro] + story["paragraphs"] + [outro]]  # текст черновика — без пометок
-        # Озвучка тремя кусками: вступление, письмо ЦЕЛИКОМ, концовка. Владелец 08.11: «история прерывается
-        # посередине» — письмо шло двумя кусками со сбоем эфира между ними, и вторую половину голос начинал заново,
-        # другим тоном. Абзацы письма — переносами строк: на них голос сам делает паузу.
-        chunks = [intro, "\n\n".join(story["paragraphs"]), outro]
-        styles = ["host", "letter", "host"]
+        call = story.get("call")
+        paragraphs = [ai.strip_tags(p) for p in [intro] + story["paragraphs"]
+                      + ([f"📞 {call['host_in']}", f"- {call['text']}"] if call else []) + [outro]]  # без пометок
+        # Озвучка кусками: вступление, письмо ЦЕЛИКОМ, (звонок в студию: ведущий снимает трубку, звонящий), концовка.
+        # Владелец 08.11: «история прерывается посередине» — письмо шло двумя кусками со сбоем эфира между ними, и
+        # вторую половину голос начинал заново, другим тоном. Абзацы письма — переносами строк.
+        chunks = [intro, "\n\n".join(story["paragraphs"])]
+        styles, roles = ["host", "letter"], ["host", "letter"]
+        if call:
+            chunks += [call["host_in"], call["text"]]
+            styles += ["host_call", "call"]
+            roles += ["host", f"call_{call['gender']}"]
+        chunks.append(outro)
+        styles.append("host")
+        roles.append("host")
         await db.set_setting(HORROR_KEY, json.dumps((used + [story["premise"][:160]])[-30:], ensure_ascii=False))
     else:
         try:
@@ -252,27 +277,52 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop) -> di
             raise RuntimeError("ИИ не написал эфир")
         paragraphs = [f"{clock} {cond['line']}".strip()] + body + [f"Это был ночной эфир. {cond['end']}".strip()]
         chunks, styles = paragraphs, ["night"] * len(paragraphs)
+        roles = [False] * len(paragraphs)
         await db.set_setting(TOPICS_KEY, json.dumps((used + [topic])[-30:], ensure_ascii=False))
     n = int(await db.get_setting(HORROR_COUNT_KEY if horror else COUNT_KEY, "0") or 0) + 1
-    caption = _caption(horror, n, topic, now, cond["caption"])
+    caption = _caption(horror, n, topic, now, cond["caption"], bot_username)
     async def step(i: int, total: int, who: str) -> None:
         await progress(f"🎙 Озвучиваю: {i} из {total} · {who}")
 
     # весь выпуск — одним голосом (кусок не вышел — всё заново следующим сервисом, а не «письмо дочитал другой»)
-    voice = await ai.narrate_all(chunks, [s == "host" for s in styles], horror=horror, progress=step)
+    voice = await ai.narrate_all(chunks, roles, horror=horror, progress=step)
     who = ai.last_voice[0] + (f" (не вышло: {ai.voice_trouble[0]})" if ai.voice_trouble[0] else "")
     if not voice:
+        for t in [music_task] + sfx_tasks:
+            if t:
+                t.cancel()
         return {"ogg": None, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic,
                 "voice": ai.voice_trouble[0]}
     await progress("🎚 Свожу эфир…")
     if horror:  # страшная рубрика — как настоящий FM-эфир из студии
-        mix = await asyncio.to_thread(radio.studio, voice, styles, ai.SPEAK_RATE, int(time.time()))
+        events, music = [], None
+        letter_text = chunks[1]
+        letter_secs = len(voice[1]) / 2 / ai.SPEAK_RATE
+        for x, task in zip(story.get("sfx") or [], sfx_tasks, strict=False):
+            data = await task
+            snd = await asyncio.to_thread(radio.decode, data) if data else None
+            at = ai.sfx_time(x["after"], letter_text, letter_secs)
+            if snd is not None and at is not None:
+                events.append((at, snd[:int(5 * radio.SR)]))
+            else:
+                logger.info("horror: звук «%s» не встал (%s)", x["sound"][:40], "нет звука" if snd is None else
+                            f"фразы «{x['after'][:40]}» нет в письме")
+        if music_task:
+            data = await music_task
+            music = await asyncio.to_thread(radio.decode, data) if data else None
+        extras = (f"звуков {len(events)} из {len(story.get('sfx') or [])}, музыка {'ElevenLabs' if music is not None else 'своя'}"
+                  f", звонок {'есть' if story.get('call') else 'нет'}"
+                  + (", метки времени" if ai.letter_alignment[0] else ""))
+        logger.info("horror: %s", extras)
+        who = f"{who} · {extras}" if who else extras
+        mix = await asyncio.to_thread(radio.studio, voice, styles, ai.SPEAK_RATE, int(time.time()), events, music)
     else:       # ночной эфир — «сквозь приёмник», как было
         mix = await asyncio.to_thread(radio.broadcast, voice, ai.SPEAK_RATE, cond["rain"], int(time.time()))
     ogg = await asyncio.to_thread(radio.to_ogg, mix)
     logger.info("ночной эфир №%s%s: «%s», %.0f сек, голос %s", n, " (страшная история)" if horror else "", topic,
                 len(mix) / radio.SR, who or "?")
-    return {"ogg": ogg, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic, "voice": who}
+    return {"ogg": ogg, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic, "voice": who,
+            "letter": (letter or {}).get("id")}
 
 
 def _kb() -> InlineKeyboardMarkup:
@@ -288,13 +338,14 @@ PENDING_KEY = "night_pending"   # эфир собирается: {"chat", "horro
 
 
 async def send_draft(bot: Bot, db: Database, chat_id: int, horror: bool = False, progress=_noop,
-                     tries: int = 0) -> bool:
-    """Собрать эфир и прислать черновик в личку на одобрение."""
+                     tries: int = 0, letter_id: int | None = None) -> bool:
+    """Собрать эфир и прислать черновик в личку на одобрение. letter_id — письмо подписчика, из которого выпуск."""
     async with _lock:
         await db.set_setting(PENDING_KEY, json.dumps({"chat": chat_id, "horror": horror, "ts": time.time(),
-                                                      "tries": tries}))
+                                                      "tries": tries, "letter": letter_id}))
         try:
-            return await asyncio.wait_for(_send_draft(bot, db, chat_id, horror, progress), EPISODE_TIMEOUT)
+            return await asyncio.wait_for(_send_draft(bot, db, chat_id, horror, progress, letter_id),
+                                          EPISODE_TIMEOUT)
         except asyncio.TimeoutError:
             await bot.send_message(chat_id, f"⌛ Эфир не собрался за {EPISODE_TIMEOUT // 60} мин - озвучка тормозит. "
                                             "Попробуй ещё раз позже.")
@@ -303,12 +354,20 @@ async def send_draft(bot: Bot, db: Database, chat_id: int, horror: bool = False,
             await db.set_setting(PENDING_KEY, "")
 
 
-async def _send_draft(bot: Bot, db: Database, chat_id: int, horror: bool, progress) -> bool:
+async def _send_draft(bot: Bot, db: Database, chat_id: int, horror: bool, progress,
+                      letter_id: int | None = None) -> bool:
+    from handlers import letters
+
     try:
         await bot.send_chat_action(chat_id, "record_voice")
     except Exception:
         pass
-    ep = await make_episode(db, horror=horror, progress=progress)
+    letter = await letters.get(db, letter_id) if letter_id else None
+    try:
+        me = (await bot.get_me()).username or ""
+    except Exception:
+        me = ""
+    ep = await make_episode(db, horror=horror, progress=progress, letter=letter, bot_username=me)
     text = "\n\n".join(ep["paragraphs"])
     if not ep["ogg"]:
         why = f" ({html.escape(ep['voice'][:300])})" if ep.get("voice") else ""
@@ -322,34 +381,79 @@ async def _send_draft(bot: Bot, db: Database, chat_id: int, horror: bool, progre
                                        f"<blockquote expandable>{html.escape(text[:680])}</blockquote>")
     await db.set_setting(DRAFT_KEY, json.dumps({"file_id": msg.voice.file_id, "caption": ep["caption"],
                                                 "n": ep["n"], "msg": msg.message_id, "chat": chat_id,
-                                                "horror": horror}, ensure_ascii=False))
+                                                "horror": horror, "letter": ep.get("letter")}, ensure_ascii=False))
     return True
 
 
 @router.message(Command("horror"))
 async def cmd_horror(message: Message, bot: Bot, db: Database) -> None:
-    """/horror — страшная история про Волгоград черновиком в личку."""
-    await cmd_night(message, bot, db, horror=True)
+    """/horror — страшная история про Волгоград черновиком в личку. Есть взятые письма подписчиков — сначала выбор,
+    из какого письма делать выпуск (или «придумать самому»)."""
+    from handlers import letters
+
+    ready = await letters.approved(db)
+    if not ready:
+        await cmd_night(message, bot, db, horror=True)
+        return
+    rows = []
+    for x in ready[:8]:
+        who = x.get("sign") or "аноним"
+        rows.append([InlineKeyboardButton(text=f"✉️ № {x['id']} · {who}: {x['text'][:28]}…", callback_data=f"hr:{x['id']}")])
+    rows.append([InlineKeyboardButton(text="🎲 Без письма - придумать самому", callback_data="hr:0")])
+    try:
+        await bot.send_message(message.from_user.id, "🩸 Из какого письма делать выпуск «Писем Волгограда»?",
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    except Exception:
+        await message.answer("Напиши боту /start в личку - черновик эфира приходит туда.")
+
+
+@router.callback_query(F.data.startswith("hr:"))
+async def cb_horror_pick(call: CallbackQuery, bot: Bot, db: Database, config: Config) -> None:
+    if not config.is_admin(call.from_user.id):
+        await call.answer("Это для админа.", show_alert=True)
+        return
+    try:
+        lid = int((call.data or "")[3:]) or None
+    except ValueError:
+        lid = None
+    await call.answer()
+    if call.message:
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    await _start(bot, db, call.from_user.id, True, lid)
 
 
 @router.message(Command("night"))
 async def cmd_night(message: Message, bot: Bot, db: Database, horror: bool = False) -> None:
     """/night — новый ночной эфир черновиком в личку."""
+    if not await _start(bot, db, message.from_user.id, horror, None):
+        await message.answer("Напиши боту /start в личку - черновик эфира приходит туда.")
+
+
+async def _start(bot: Bot, db: Database, uid: int, horror: bool, letter_id: int | None) -> bool:
+    """Собрать черновик эфира и прислать uid в личку. False — в личку не написать."""
     if not ai.available():
-        await message.answer("ИИ недоступен - эфир не написать.")
-        return
-    uid = message.from_user.id
+        try:
+            await bot.send_message(uid, "ИИ недоступен - эфир не написать.")
+        except Exception:
+            return False
+        return True
     if _lock.locked():
-        await bot.send_message(uid, "⏳ Уже собираю эфир - пришлю, как будет готов.")
-        return
-    first = "🕯 Пишу страшную историю - минуты три…" if horror else "🎙 Собираю ночной эфир - минута-две…"
+        try:
+            await bot.send_message(uid, "⏳ Уже собираю эфир - пришлю, как будет готов.")
+        except Exception:
+            return False
+        return True
+    first = ("🕯 Пишу страшную историю" + (f" по письму № {letter_id}" if letter_id else "") + " - минуты три…"
+             if horror else "🎙 Собираю ночной эфир - минута-две…")
     try:
         status = await bot.send_message(uid, first)
     except Exception:
-        await message.answer("Напиши боту /start в личку - черновик эфира приходит туда.")
-        return
+        return False
     try:
-        await send_draft(bot, db, uid, horror=horror, progress=_progress(bot, status, first))
+        await send_draft(bot, db, uid, horror=horror, progress=_progress(bot, status, first), letter_id=letter_id)
         try:
             await status.delete()  # готово — строка «Пишу…» больше не нужна
         except Exception:
@@ -357,6 +461,7 @@ async def cmd_night(message: Message, bot: Bot, db: Database, horror: bool = Fal
     except Exception as e:
         logger.exception("night draft failed")
         await bot.send_message(uid, f"Эфир не собрался: {html.escape(str(e))[:200]}")
+    return True
 
 
 @router.callback_query(F.data.startswith("nr:"))
@@ -390,6 +495,18 @@ async def cb_night(call: CallbackQuery, bot: Bot, db: Database, config: Config) 
         sent = await bot.send_voice(channel, draft["file_id"], caption=draft["caption"])
         await mark_own(db, sent.message_id)
         await db.set_setting(HORROR_COUNT_KEY if draft.get("horror") else COUNT_KEY, str(draft["n"]))
+        if draft.get("horror"):
+            from handlers import letters
+
+            await letters.on_published(db, channel, sent.message_id, draft["n"])  # копим комментарии под ним
+            if draft.get("letter"):
+                try:
+                    ch = await bot.get_chat(channel)
+                    link = (f"https://t.me/{ch.username}/{sent.message_id}" if ch.username else
+                            f"https://t.me/c/{str(channel).removeprefix('-100')}/{sent.message_id}")
+                except Exception:
+                    link = ""
+                await letters.mark_used(bot, db, int(draft["letter"]), link)
         await db.set_setting(DRAFT_KEY, "")
         await call.answer("Опубликовано в канале.")
         await mark("✅ Опубликовано в канале.")
@@ -402,7 +519,8 @@ async def cb_night(call: CallbackQuery, bot: Bot, db: Database, config: Config) 
         await call.answer("Переписываю - минуты три." if draft.get("horror") else "Переписываю - минута-две.")
         await mark("🔄 Переписан - новый ниже.")
         try:
-            await send_draft(bot, db, call.message.chat.id, horror=bool(draft.get("horror")))
+            await send_draft(bot, db, call.message.chat.id, horror=bool(draft.get("horror")),
+                             letter_id=draft.get("letter"))
         except Exception as e:
             logger.exception("night redo failed")
             await bot.send_message(call.message.chat.id, f"Эфир не собрался: {html.escape(str(e))[:200]}")
@@ -439,7 +557,8 @@ async def resume_tick(bot: Bot, db: Database) -> None:
     first = "🔁 Бот перезапускался посреди сборки эфира - собираю заново…"
     try:
         status = await bot.send_message(chat, first)
-        await send_draft(bot, db, chat, horror=horror, progress=_progress(bot, status, first), tries=1)
+        await send_draft(bot, db, chat, horror=horror, progress=_progress(bot, status, first), tries=1,
+                         letter_id=job.get("letter"))
         try:
             await status.delete()
         except Exception:

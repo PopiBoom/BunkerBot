@@ -35,6 +35,8 @@ from handlers.collect import router as collect_router
 from handlers.court import observe as court_observe
 from handlers.court import router as court_router
 from handlers.diss import router as diss_router
+from handlers.letters import observe as letters_observe
+from handlers.letters import router as letters_router
 from handlers.news import router as news_router
 from handlers.night import router as night_router
 from handlers.protocol import router as protocol_router
@@ -117,6 +119,11 @@ class AdminOnlyCommands(BaseMiddleware):
                 await court_observe(event, data["bot"], data["db"])
         except Exception as e:
             logger.debug("court observe: %s", e)
+        try:  # «Письма Волгограда»: копия выпуска в группе комментариев и комментарии под ней
+            if data.get("db") is not None:
+                await letters_observe(event, data["db"])
+        except Exception as e:
+            logger.debug("letters observe: %s", e)
         cmd = command_name(event.text or event.caption or "")
         if cmd and cmd not in PUBLIC_COMMANDS:
             cfg = data.get("config")
@@ -224,6 +231,7 @@ async def main() -> None:
     dp.include_router(chess_router)  # шахматы: инлайн «@бот» в любом чате и /chess
     dp.include_router(blackjack_router)  # блэкджек: /bj — стол в канал
     dp.include_router(user_router)
+    dp.include_router(letters_router)   # письма подписчиков в «Письма Волгограда»
     dp.include_router(help_router)
     dp.include_router(menu_router)
     dp.include_router(quotes_router)

@@ -813,38 +813,148 @@ GHOST_DB = -20.0        # «чужой голос» в паузах
 TUNE_DB = -8.0          # настройка на волну перед письмом
 
 
-def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed: int = 0) -> np.ndarray:
+# ---------- звуки по сюжету, звонок в студию, музыка под письмом (владелец 08.11: «1, 2, 5») ----------
+SFX_DB = -4.0        # звук по сюжету — на 4 дБ тише речи письма (полоса телефона), в своей паузе
+MUSIC_DB = -16.0     # музыка ElevenLabs под письмом — в паузах на 16 дБ тише речи (под словами ещё на DUCK_DB)
+RING_DB = -5.0       # звонок студийного телефона — от громкости ведущего
+CALL_DB = 0.5        # звонящий — чуть громче письма, но тише ведущего
+
+
+def decode(data: bytes) -> np.ndarray | None:
+    """MP3/OGG/WAV → float32 моно 48 кГц (звуки и музыка ElevenLabs). None — не декодировалось."""
+    try:
+        import av
+
+        with av.open(io.BytesIO(data)) as c:
+            st = c.streams.audio[0]
+            rate = st.codec_context.sample_rate
+            chunks = []
+            for fr in c.decode(st):
+                a = fr.to_ndarray()
+                if a.dtype.kind == "i":
+                    a = a.astype(np.float32) / 32768
+                n_ch = len(fr.layout.channels)
+                a = a.reshape(n_ch, -1).mean(axis=0) if fr.format.is_planar else a.reshape(-1, n_ch).mean(axis=1)
+                chunks.append(a.astype(np.float32))
+        x = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+        x = _resample((np.clip(x, -1, 1) * 32767).astype("<i2").tobytes(), rate)
+        return x if len(x) > SR // 10 else None
+    except Exception as e:  # noqa: BLE001
+        log.warning("radio: звук не декодировался: %s", e)
+        return None
+
+
+def _insert_sfx(v: np.ndarray, events: list[tuple[float, np.ndarray]]) -> tuple[np.ndarray, list[tuple[int, np.ndarray]]]:
+    """Звуки по сюжету: для каждого (время в письме, звук) — ближайшая пауза после этого места; в неё вставляем
+    тишину длиной со звук (слова не перекрываем). Возвращает (голос, [(где звук в новом голосе, звук)])."""
+    frame = SR // 50
+    lv = _levels(v, frame)
+    loud = lv > -35
+    if not events or not loud.any():
+        return v, []
+    ref = 10 * np.log10(np.mean(10 ** (lv[loud] / 10)))
+    pauses = _quiet_runs(lv, ref - 30, int(0.2 * SR / frame))
+    out, placed, last, length = [], [], 0, 0
+    for t, snd in sorted(events, key=lambda e: e[0]):
+        target = int(t * SR / frame)
+        cand = [r for r in pauses if target - int(0.8 * SR / frame) <= r[0] <= target + int(3.0 * SR / frame)
+                and r[0] * frame > last]
+        if not cand:
+            continue
+        a, b = min(cand, key=lambda r: abs(r[0] - target))
+        cut = (a + min(b - a, int(0.15 * SR / frame))) * frame
+        out.append(v[last:cut])
+        length += cut - last
+        gap = len(snd) + int(0.45 * SR)
+        out.append(np.zeros(gap, dtype=np.float32))
+        placed.append((length + int(0.15 * SR), snd))
+        length += gap
+        last = cut
+    out.append(v[last:])
+    return np.concatenate(out).astype(np.float32), placed
+
+
+def _phone(v: np.ndarray) -> np.ndarray:
+    """Звонящий в студию: телефонная полоса 320-3300 Гц, плотная компрессия, лёгкий перегруз линии."""
+    v = _band(v, 320, 3300)
+    v = _peak1(_compress(_peak1(v), -24, 3.0))
+    return (np.tanh(v * 2.2) / np.tanh(2.2)).astype(np.float32)
+
+
+def _ring() -> np.ndarray:
+    """Звонок студийного телефона: две трели (440+480 Гц с дрожью 20 Гц) и щелчок снятой трубки."""
+    t = np.arange(int(0.9 * SR)) / SR
+    trill = (np.sin(2 * np.pi * 440 * t) + np.sin(2 * np.pi * 480 * t)) * (0.55 + 0.45 * np.sign(np.sin(2 * np.pi * 20 * t)))
+    env = np.minimum(1, t / 0.015) * np.minimum(1, (t[-1] - t) / 0.04)
+    burst = (_band(trill * env, 300, 4000) * 0.5).astype(np.float32)
+    click = np.zeros(int(0.03 * SR), dtype=np.float32)
+    click[:240] = np.random.default_rng(3).standard_normal(240).astype(np.float32) * np.exp(-np.arange(240) / 40)
+    gap = np.zeros(int(0.5 * SR), dtype=np.float32)
+    out = np.concatenate([burst, gap, burst * np.float32(0.95), np.zeros(int(0.45 * SR), dtype=np.float32), click])
+    return _peak1(out)
+
+
+def _loop(x: np.ndarray, n: int, xf: float = 3.0) -> np.ndarray:
+    """Музыка нужной длины: короче — повторяем с плавным переходом xf с."""
+    k = int(xf * SR)
+    if len(x) >= n or len(x) <= 2 * k:
+        return np.resize(x, n).astype(np.float32) if len(x) < n else x[:n].astype(np.float32)
+    out = x.astype(np.float32).copy()
+    ramp = np.linspace(0, 1, k, dtype=np.float32)
+    while len(out) < n:
+        head = out[:-k]
+        tail = out[-k:] * (1 - ramp) + x[:k] * ramp
+        out = np.concatenate([head, tail, x[k:]])
+    return out[:n]
+
+
+def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed: int = 0,
+           sfx: list[tuple[float, np.ndarray]] | None = None, music: np.ndarray | None = None) -> np.ndarray:
     """«Письма Волгограда» как настоящий эфир (float32, 48 кГц, пик ≈ -1 дБ). styles — "host" / "letter" для каждого
-    куска голоса. Ведущий — «эфирный» голос поверх музыкальной подложки; перед письмом — настройка на волну; над
+    куска голоса ("host_call" — ведущий после звонка телефона, "call" — звонящий в студию, телефонная полоса); sfx —
+    звуки по сюжету [(секунда в голосе письма, звук 48 кГц)] — каждый в свою паузу; music — музыка под письмом
+    (ElevenLabs; нет — синтезированный фон _pad). Ведущий — «эфирный» голос поверх музыкальной подложки; перед письмом — настройка на волну; над
     письмом — мрачный фон, напряжение и помехи эфира (замирания, шипение, треск, свист, провалы и «чужой голос» в
     паузах), слова не рвутся; перед последней фразой всё стихает — финал в тишине; потом обрыв сигнала и ведущий."""
     rng = np.random.default_rng(seed)
     # 1) голос: ведущий — обработка «как на FM», письмо — мягкая (тихое остаётся тихим); ведущий на 1.5 дБ громче
-    parts, ghost_at = [], -1
+    parts, ghost_at, sfx_at = [], -1, []
     for i, pcm in enumerate(voice_chunks):
         v = _resample(pcm, rate)
         if not len(v):
             continue
         st = styles[i] if i < len(styles) else "host"
         v = _band(v, 70, 11000)
-        if st == "host":
+        if st in ("host", "host_call"):
             parts.append((_on_air(v), st))
+        elif st == "call":
+            parts.append((_phone(v), st))
         else:
-            v, room = _make_room(_peak1(_compress(_peak1(v), -22, 2.5)))
+            v = _peak1(_compress(_peak1(v), -22, 2.5))
+            v, placed = _insert_sfx(v, sfx or [])
+            v, room = _make_room(v)
+            if room >= 0:  # вставка «чужого голоса» сдвигает звуки после неё
+                placed = [(p + (int(GHOST_ROOM * SR) if p >= room else 0), snd) for p, snd in placed]
             parts.append((v, st))
+            sfx_at = placed
             ghost_at = room  # где в письме вставлена пауза под «чужой голос» (-1 — не нашлось)
     letter_db = [_speech_db(v) for v, st in parts if st == "letter"]
     for v, st in parts:
-        if st == "host" and letter_db:
-            v *= np.float32(_db(letter_db[0] + 1.5 - _speech_db(v)))
-    pieces, spans, pos = [], [], 0          # spans: (начало, конец, стиль) кусков голоса внутри дорожки голоса
+        if st != "letter" and letter_db:
+            v *= np.float32(_db(letter_db[0] + (CALL_DB if st == "call" else 1.5) - _speech_db(v)))
+    pieces, spans, pos, ring_at = [], [], 0, []   # spans: (начало, конец, стиль) кусков внутри дорожки голоса
+    ring = _ring()
     for v, st in parts:
         if pieces:
             prev = spans[-1][2]
             sec = (LETTER_IN if st == "letter" and prev != "letter" else
-                   LETTER_OUT if prev == "letter" and st != "letter" else 0.7)
-            pieces.append(np.zeros(int(sec * SR), dtype=np.float32))
-            pos += len(pieces[-1])
+                   LETTER_OUT if prev == "letter" and st != "letter" else 0.45 if st == "call" else 0.7)
+            gap = int(sec * SR)
+            if st == "host_call":  # звонок в студию: телефон звонит в тишине, потом ведущий снимает трубку
+                ring_at.append(pos + gap)
+                gap += len(ring) + int(0.3 * SR)
+            pieces.append(np.zeros(gap, dtype=np.float32))
+            pos += gap
         pieces.append(v)
         spans.append((pos, pos + len(v), st))
         pos += len(v)
@@ -852,7 +962,7 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
     del pieces, parts
 
     # 2) микс: заставка владельца (или позывной), голос, позывной в конце
-    host = [(a0, b0) for a0, b0, st in spans if st == "host"]
+    host = [(a0, b0) for a0, b0, st in spans if st in ("host", "host_call")]
     ref_hp = (_speech_db(_band(np.concatenate([voice[a0:b0] for a0, b0 in host]), *PHONE_BAND))
               if host else -20.0)                            # громкость ведущего в полосе телефона
     head, tail = _intro(ref_hp + INTRO_DB), _jingle(False)
@@ -882,6 +992,11 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
             _duck(bed, _slice(voice, a - start, b - start), -7.0)
             mix[a:b] += bed
             hiss_db[a // FADE_FRAME:b // FADE_FRAME + 1] = ref_hp + HISS_HOST_DB
+    for a0, b0, st in spans:  # звонящий — без подложки, шипение как под ведущим
+        if st == "call":
+            hiss_db[(start + a0) // FADE_FRAME:(start + b0) // FADE_FRAME + 1] = ref_hp + HISS_HOST_DB
+    for at in ring_at:  # звонок студийного телефона — в тишине перед «Алло, вы в эфире»
+        mix[start + at:start + at + len(ring)] += ring * np.float32(_db(ref_hp + RING_DB) / 0.35)
 
     letters = [(a0, b0) for a0, b0, st in spans if st == "letter"]
     if letters:
@@ -908,7 +1023,10 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
             x *= np.float32(_db(to + rel) / r)
             return x
 
-        bed = level(_pad(ln, rng), PAD_DB, ref_phone, PHONE_BAND)
+        if music is not None and len(music) > 5 * SR:  # настоящая музыка (ElevenLabs) вместо синтезатора
+            bed = level(_band(_loop(music, ln), 40, 12000), MUSIC_DB, ref_phone, PHONE_BAND)
+        else:
+            bed = level(_pad(ln, rng), PAD_DB, ref_phone, PHONE_BAND)
         bed += level(_tension(ln, rng), RUMBLE_DB, ref, None)   # гул и сердце — 47 Гц-8.4 кГц, фильтр не нужен
         fi, fo = min(int(2.0 * SR), ln // 3), min(int(0.3 * SR), ln // 3)
         bed[:fi] *= np.linspace(0, 1, fi, dtype=np.float32)
@@ -916,6 +1034,21 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
         _duck(bed, voice[a:a + ln], DUCK_DB)
         mix[start + a:start + a + ln] += bed
         del bed
+
+        # звуки по сюжету — каждый в своей паузе (вставлена под него), громкость — от речи в полосе телефона
+        for p, snd in sfx_at:
+            x = snd.astype(np.float32).copy()
+            r = float(np.sqrt(np.mean(np.square(_band(x, *PHONE_BAND), dtype=np.float64)))) or 1.0
+            x *= np.float32(_db(ref_phone + SFX_DB) / r)
+            pk = float(np.abs(x).max()) or 1.0
+            if pk > 0.9:
+                x *= np.float32(0.9 / pk)
+            k = min(len(x), int(0.03 * SR))
+            if k:
+                x[:k] *= np.linspace(0, 1, k, dtype=np.float32)
+                x[-k:] *= np.linspace(1, 0, k, dtype=np.float32)
+            c = start + la + p
+            mix[c:c + len(x)] += x[:max(0, len(mix) - c)]
 
         # 5) эфир над письмом: замирания (голос и фон плавно уходят, шипение растёт, звук «закручивается»)
         s0, s1 = start + la, start + hush
@@ -941,9 +1074,14 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
         mix[t0:t0 + len(tune)] += tune * np.float32(_db(ref + TUNE_DB))
         hiss_db[t0 // FADE_FRAME:f0] = np.nan                # там свой шум
 
+        sfx_spans = [(p - int(0.2 * SR), p + len(snd) + int(0.4 * SR)) for p, snd in sfx_at]
+
+        def near_sfx(at: int, k: int) -> bool:  # треск и провалы не лезут на звуки по сюжету
+            return any(at < b and at + k > a for a, b in sfx_spans)
+
         def in_pause(at: int, k: int) -> bool:  # at, k — в сэмплах внутри письма
             i0, i1 = at // frame, (at + k) // frame + 1
-            return i1 <= len(lv) and bool(np.all(lv[i0:i1] < ref - 30))
+            return i1 <= len(lv) and bool(np.all(lv[i0:i1] < ref - 30)) and not near_sfx(at, k)
 
         # треск: мелкие щелчки всё время и разряды — громко в паузах, тихо поверх слов
         span_l = hush - la
@@ -958,11 +1096,13 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
             crash = _crash(rng)
             loud_at = in_pause(at, len(crash))
             c = s0 + at
-            mix[c:c + len(crash)] += crash * np.float32(_db(ref + (CRASH_PAUSE_DB if loud_at else CRASH_SPEECH_DB))
-                                                        * rng.uniform(0.6, 1))
+            if not near_sfx(at, len(crash)):
+                mix[c:c + len(crash)] += crash * np.float32(_db(ref + (CRASH_PAUSE_DB if loud_at else CRASH_SPEECH_DB))
+                                                            * rng.uniform(0.6, 1))
             at += int(rng.exponential(4.5 * (1 - 0.3 * at / span_l)) * SR) + len(crash) + int(0.8 * SR)
         for p0, p1 in pauses:  # и почти в каждой длинной паузе — разряд
-            if p1 - p0 >= int(0.45 * SR / frame) and p0 * frame < span_l - SR and rng.random() < 0.6:
+            if (p1 - p0 >= int(0.45 * SR / frame) and p0 * frame < span_l - SR and rng.random() < 0.6
+                    and not near_sfx(p0 * frame, (p1 - p0) * frame)):
                 crash = _crash(rng, min(0.35, (p1 - p0) * frame / SR - 0.12))
                 c = s0 + p0 * frame + int(0.06 * SR)
                 mix[c:c + len(crash)] += crash * np.float32(_db(ref + CRASH_PAUSE_DB) * rng.uniform(0.5, 1))
@@ -996,7 +1136,7 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
             room = (p1 - p0) * frame - int(0.2 * SR)
             at = p0 * frame + int(0.1 * SR)
             if (drops >= 2 or at < 0.25 * span_l or at + room > span_l - 2 * SR or room < int(0.3 * SR)
-                    or abs(at - last_drop) < 15 * SR):
+                    or abs(at - last_drop) < 15 * SR or near_sfx(at, room)):
                 continue
             drop(at, min(int(0.45 * SR), room))
             drops, last_drop = drops + 1, at
