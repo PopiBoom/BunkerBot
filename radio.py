@@ -31,15 +31,20 @@ OLA_FFT = 1 << 17      # размер БПФ блока
 def _band(x: np.ndarray, lo: float, hi: float, sr: int = SR) -> np.ndarray:
     """Полосовой фильтр с мягкими краями (без звона). Длинный сигнал — блочной свёрткой (overlap-add): раньше БПФ
     целиком по 8-минутной страшной истории съедал ~5 ГБ, и сервер убивал бота посреди сборки (07.11)."""
+    return _filter(x, lambda f: _gain(f, lo, hi), sr)
+
+
+def _filter(x: np.ndarray, curve, sr: int = SR) -> np.ndarray:
+    """Фильтр с любой АЧХ: curve(частоты) -> усиление. Короткое — БПФ целиком, длинное — блоками (overlap-add)."""
     n = len(x)
     if n == 0:
         return x
     if n <= DIRECT_MAX:
         f = np.fft.rfftfreq(n, 1 / sr)
-        return np.fft.irfft(np.fft.rfft(x) * _gain(f, lo, hi), n).astype(np.float32)
+        return np.fft.irfft(np.fft.rfft(x) * curve(f), n).astype(np.float32)
     k = FIR_TAPS
     half = k // 2
-    h = np.fft.irfft(_gain(np.fft.rfftfreq(OLA_FFT, 1 / sr), lo, hi), OLA_FFT)  # нулевая фаза
+    h = np.fft.irfft(curve(np.fft.rfftfreq(OLA_FFT, 1 / sr)), OLA_FFT)  # нулевая фаза
     h = np.roll(h, half)[:k] * np.hanning(k)
     spec_h = np.fft.rfft(h, OLA_FFT)
     step = OLA_FFT - k + 1
@@ -434,46 +439,303 @@ def _duck(bed: np.ndarray, voice: np.ndarray, depth_db: float) -> None:
         bed[a:b] *= np.interp(np.arange(a, b), centers, gain).astype(np.float32)
 
 
-def _crackle(mix: np.ndarray, at: int, n: int, level: float, rng: np.random.Generator) -> None:
-    """Короткий рваный треск эфира с щелчками."""
-    n = min(n, len(mix) - at)
-    if n < 64 or at < 0:
-        return
-    burst = _band(rng.standard_normal(n).astype(np.float32), 900, 6000)
-    burst /= max(float(np.abs(burst).max()), 1e-6)
-    gate = (rng.random(n // 240 + 1) > 0.35).repeat(240)[:n]  # эфир рвётся кусками
-    mix[at:at + n] += burst * gate * np.hanning(n).astype(np.float32) * np.float32(level)
-    for _ in range(rng.integers(2, 5)):
-        c = at + int(rng.integers(0, n))
-        k = min(90, len(mix) - c)
-        mix[c:c + k] += (np.exp(-np.arange(k) / 14) * rng.choice([-1, 1]) * level).astype(np.float32)
+def _slice(x: np.ndarray, a: int, b: int) -> np.ndarray:
+    """x[a:b] с нулями за краями."""
+    out = np.zeros(max(0, b - a), dtype=np.float32)
+    lo, hi = max(a, 0), min(b, len(x))
+    if hi > lo:
+        out[lo - a:hi - a] = x[lo:hi]
+    return out
 
 
-LETTER_IN = 1.3     # пауза перед письмом: фон входит раньше голоса — настроение меняется до первого слова
-LETTER_OUT = 1.9    # после письма: фон уже оборвался, тишина — потом ведущий
+def _peak1(x: np.ndarray) -> np.ndarray:
+    x /= max(float(x.max()), float(-x.min())) or 1
+    return x
+
+
+def _rms_to(x: np.ndarray, db: float) -> np.ndarray:
+    """Привести x к громкости db (RMS, дБ) — на месте."""
+    r = float(np.sqrt(np.mean(np.square(x, dtype=np.float64)))) if len(x) else 0.0
+    if r > 0:
+        x *= np.float32(_db(db) / r)
+    return x
+
+
+def _speech_db(v: np.ndarray) -> float:
+    """Громкость речи (дБ): средняя по кадрам 20 мс, где говорят (не тише пика на 30 дБ)."""
+    lv = _levels(v, SR // 50)
+    if not len(lv):
+        return -30.0
+    act = lv[lv > lv.max() - 30]
+    return float(10 * np.log10(np.mean(10 ** (act / 10))))
+
+
+# ---------- голос ведущего «как на FM» и подложка под ним ----------
+# Владелец 08.11: «найди, как разговаривают ведущие». У настоящих FM-ведущих голос обработан: эквалайзер (тепло у
+# микрофона, разборчивость 3-5 кГц, «воздух»), плотная компрессия 4:1 и лёгкое насыщение — ровный и «в лицо»; и
+# говорят они поверх музыкальной подложки (talk bed), а не в тишине.
+
+def _radio_eq(f: np.ndarray) -> np.ndarray:
+    lf = np.log2(np.maximum(f, 1.0))
+    db = (3.0 / (1 + np.exp((lf - np.log2(150)) * 5))           # тепло «у самого микрофона»
+          - 2.0 * np.exp(-((lf - np.log2(380)) / 0.6) ** 2)      # без «бубнежа»
+          + 3.5 * np.exp(-((lf - np.log2(3800)) / 0.75) ** 2)    # разборчивость
+          + 2.0 / (1 + np.exp(-(lf - np.log2(9500)) * 5)))       # воздух
+    return 10 ** (db / 20) * _gain(f, 60, 14000)
+
+
+def _on_air(v: np.ndarray) -> np.ndarray:
+    """Голос ведущего как у FM-ведущих: эквалайзер, компрессия 4:1, мягкое насыщение."""
+    v = _peak1(_filter(v, _radio_eq))
+    v = _peak1(_compress(v, -26, 4.0))
+    return (np.tanh(v * 1.6) / np.tanh(1.6)).astype(np.float32)
+
+
+BED_BPM = 84
+_CHORDS = [  # ля минор, как позывной: Am7 – Fmaj7 – Cmaj7 – G6, по такту; (бас, ноты аккорда), Гц
+    (110.0, (220.0, 261.63, 329.63, 392.0)),
+    (87.31, (174.61, 220.0, 261.63, 329.63)),
+    (130.81, (261.63, 329.63, 392.0, 493.88)),
+    (98.0, (196.0, 246.94, 293.66, 329.63)),
+]
+
+
+def _ep(f: float, ln: float) -> np.ndarray:
+    """Нота электропиано: мягкий тон, затухающие обертоны и звонкая атака «язычка»."""
+    t = np.arange(int(ln * SR)) / SR
+    tone = (np.sin(2 * np.pi * f * t) + 0.3 * np.sin(4 * np.pi * f * t) * np.exp(-t * 3)
+            + 0.08 * np.sin(6 * np.pi * f * t) * np.exp(-t * 5)
+            + 0.15 * np.sin(2 * np.pi * 7.03 * f * t) * np.exp(-t * 28))
+    return (tone * np.minimum(1, t / 0.004) * np.exp(-t * 1.1)).astype(np.float32)
+
+
+def _talk_bed(n: int, rng: np.random.Generator) -> np.ndarray:
+    """Подложка под ведущего: спокойный вечерний грув — электропиано по ля-минору, бас, мягкая бочка, щелчок и
+    тарелочка с лёгким свингом. float32, пик ≈ 1."""
+    beat = 60 / BED_BPM
+    bar = 4 * beat
+    out = np.zeros(n + int(3 * SR), dtype=np.float32)
+    tb = np.arange(int(0.3 * SR)) / SR
+    kick = (np.sin(2 * np.pi * np.cumsum(45 + 75 * np.exp(-tb * 30)) / SR) * np.exp(-tb * 14)).astype(np.float32)
+    ts = np.arange(int(0.12 * SR)) / SR
+    snap = _peak1(_band(rng.standard_normal(len(ts)).astype(np.float32), 1500, 5000))
+    snap = (snap * np.exp(-ts * 45) + 0.6 * np.sin(2 * np.pi * 190 * ts) * np.exp(-ts * 35)).astype(np.float32)
+    th = np.arange(int(0.05 * SR)) / SR
+    hat = (_peak1(_band(rng.standard_normal(len(th)).astype(np.float32), 7000, 14000)) * np.exp(-th * 70))
+    hat = hat.astype(np.float32)
+    notes_cache: dict[tuple[float, float], np.ndarray] = {}
+
+    def put(snd: np.ndarray, at: float, amp: float) -> None:
+        p = int(at * SR)
+        if p < len(out):
+            k = min(len(snd), len(out) - p)
+            out[p:p + k] += snd[:k] * np.float32(amp)
+
+    i = 0
+    while i * bar * SR < n:
+        t0 = i * bar
+        root, notes = _CHORDS[i % len(_CHORDS)]
+        for hit, ln, amp in ((0.0, 2.8, 0.2), (1.5 * beat, 1.8, 0.12), (3.0 * beat, 1.2, 0.08)):
+            for j, f in enumerate(notes):
+                key = (f, ln)
+                if key not in notes_cache:
+                    notes_cache[key] = _ep(f, ln)
+                put(notes_cache[key], t0 + hit + 0.011 * j, amp * (1 - 0.1 * j))   # аккорд «перебором»
+        for hit in (0.0, 2 * beat):
+            t = np.arange(int(1.9 * beat * SR)) / SR
+            bass = (np.sin(2 * np.pi * root * t) + 0.25 * np.sin(4 * np.pi * root * t)) * np.minimum(1, t / 0.01)
+            put((bass * np.exp(-t * 1.4)).astype(np.float32), t0 + hit, 0.3)
+            put(kick, t0 + hit, 0.45)
+        for hit in (beat, 3 * beat):
+            put(snap, t0 + hit, 0.1)
+        for k in range(8):
+            put(hat, t0 + k * beat / 2 + (0.012 if k % 2 else 0.0), 0.05 if k % 2 else 0.03)
+        i += 1
+    return _peak1(_band(out[:n], 35, 9000))
+
+
+# ---------- эфир: настоящие радиопомехи ----------
+# Владелец 08.11: «сделай именно помехи». Как звучит эфир (справочники по радиоприёму и звуковому дизайну): шипение
+# слабого сигнала; треск атмосферных разрядов — пачки щелчков; свист соседней станции и «вой» коротких волн, который
+# плывёт и не может устояться; замирания — уровень сигнала плавает, при селективном замирании звук «закручивается»,
+# при пульсирующем — почти вибрирует; провал — вместо голоса шипение; настройка — свист и обрывки чужих станций.
+# Слова при этом не рвём (прошлая жалоба — «прерывисто, неразборчиво»): над речью — только плавные замирания до -7 дБ,
+# шипение и негромкий треск; громкое (разряды, провалы, «чужой голос») — в паузах.
+
+def _hiss_curve(f: np.ndarray) -> np.ndarray:
+    return _gain(f, 300, 10000) * np.sqrt(np.clip(f, 300, 9000) / 3000)
+
+
+def _hiss(n: int, rng: np.random.Generator) -> np.ndarray:
+    """Шипение эфира (слабый сигнал): яркий шум 0.3-10 кГц, RMS ≈ 1."""
+    x = _filter(rng.standard_normal(n, dtype=np.float32), _hiss_curve)
+    r = float(np.sqrt(np.mean(np.square(x[:SR * 10], dtype=np.float64)))) or 1.0
+    return x / np.float32(r)
+
+
+def _crash(rng: np.random.Generator, sec: float | None = None) -> np.ndarray:
+    """Атмосферный разряд: пачка щелчков, затухающая за 0.1-0.4 с. Пик ≈ 1."""
+    n = int((sec or rng.uniform(0.1, 0.4)) * SR)
+    out = np.zeros(n, dtype=np.float32)
+    pos = 0
+    while pos < n:
+        k = int(rng.integers(20, 200))
+        m = min(k, n - pos)
+        click = rng.standard_normal(m) * np.exp(-np.arange(m) / (k / 4))
+        out[pos:pos + m] += (click * rng.uniform(0.3, 1.0) * np.exp(-pos / (n / 3))).astype(np.float32)
+        pos += k + int(rng.exponential(0.012 * SR))
+    return _peak1(_band(out, 250, 6000))
+
+
+def _whistle(sec: float, rng: np.random.Generator, f0: float, glide: float = 0.0) -> np.ndarray:
+    """Свист соседней станции / «вой» коротких волн: тон плывёт и дрожит, не может устояться; входит и уходит
+    плавно. RMS ≈ 0.6."""
+    n = int(sec * SR)
+    t = np.arange(n) / SR
+    walk = np.cumsum(rng.standard_normal(int(sec * 10) + 2)) * 25          # дрейф, Гц (шаг 0.1 с)
+    f = f0 + np.interp(t, np.arange(len(walk)) * 0.1, walk) + glide * t / sec + 4 * np.sin(2 * np.pi * 5.5 * t)
+    env = np.clip(np.minimum(t, sec - t) / 1.2, 0, 1) ** 2
+    return (np.sin(2 * np.pi * np.cumsum(f) / SR) * env).astype(np.float32)
+
+
+def _phase(x: np.ndarray, depth: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Селективное замирание: звук «закручивается» (гребенчатый фильтр, задержка 0.3-3 мс плывёт). depth 0..1."""
+    n = len(x)
+    t = np.arange(n) / SR
+    d = (0.3 + 2.7 * (0.5 + 0.5 * np.sin(2 * np.pi * 0.35 * t + rng.uniform(0, 6)))) * 1e-3 * SR
+    idx = np.arange(n) - d
+    base = np.floor(idx)
+    i0 = np.clip(base.astype(np.int64), 0, n - 1)
+    frac = (idx - base).astype(np.float32)
+    late = x[i0] * (1 - frac) + x[np.minimum(i0 + 1, n - 1)] * frac
+    g = (0.8 * depth).astype(np.float32)
+    return ((x + g * late) / (1 + 0.4 * g)).astype(np.float32)
+
+
+def _tune(sec: float, rng: np.random.Generator, voice: np.ndarray) -> np.ndarray:
+    """Настройка на волну: шипение, свист проносится сверху вниз, обрывки чужих станций, в конце «поймали» — шум
+    уходит. Пик ≈ 1."""
+    n = int(sec * SR)
+    t = np.arange(n) / SR
+    out = _hiss(n, rng) * np.float32(0.25)
+    f = 350 + 2600 * (1 - t / sec) ** 1.6 + 300 * np.sin(2 * np.pi * 1.3 * t)
+    out += (np.sin(2 * np.pi * np.cumsum(f) / SR) * 0.3).astype(np.float32)
+    if len(voice) > 2 * SR:
+        for at in rng.uniform(0.1, max(0.2, sec - 0.45), size=3):       # обрывки чужих станций
+            k = int(rng.uniform(0.07, 0.15) * SR)
+            src = int(rng.integers(0, len(voice) - k))
+            snip = _peak1(_band(voice[src:src + k].copy(), 400, 3000)) * np.hanning(k).astype(np.float32)
+            p = int(at * SR)
+            m = min(k, n - p)
+            out[p:p + m] += snip[:m] * np.float32(0.6)
+    out *= np.minimum(1, t / 0.15).astype(np.float32)                   # вход
+    out *= (np.clip((sec - t) / 0.25, 0, 1) ** 2).astype(np.float32)    # «поймали» — шум уходит
+    return _peak1(out)
+
+
+def _ghost(src: np.ndarray, k: int) -> np.ndarray:
+    """«Чужой голос» в помехах: обрывок речи задом наперёд, медленнее и ниже, глухо — как из соседнего эфира."""
+    m = max(2, int(k * 0.85))
+    seg = src[:m][::-1]
+    slow = np.interp(np.arange(k) * (m / k), np.arange(len(seg)), seg).astype(np.float32)   # 0.85× — ниже
+    return _peak1(_band(slow, 400, 2800)) * np.hanning(k).astype(np.float32)
+
+
+FADE_FRAME = SR // 100  # замирания считаем по кадрам 10 мс
+GHOST_ROOM = 0.7        # на сколько секунд удлиняем одну паузу письма — там в эфире прорезается «чужой голос»
+
+
+def _make_room(v: np.ndarray, extra: float = GHOST_ROOM) -> tuple[np.ndarray, int]:
+    """Одну паузу между фразами (55-80 % письма, не в последних 12 с) удлиняем на extra с: паузы у голоса короткие
+    (0.3-0.8 с), а сбою эфира с «чужим голосом» нужна секунда. Возвращает (голос, где начинается вставка или -1)."""
+    frame = SR // 50
+    lv = _levels(v, frame)
+    loud = lv > -35
+    if not loud.any():
+        return v, -1
+    ref = 10 * np.log10(np.mean(10 ** (lv[loud] / 10)))
+    last = len(lv) - int(12 * SR / frame)
+    cand = [r for r in _quiet_runs(lv, ref - 30, int(0.35 * SR / frame))
+            if 0.55 * len(lv) < r[0] < min(0.8 * len(lv), last)]
+    if not cand:
+        return v, -1
+    a, b = max(cand, key=lambda r: r[1] - r[0])
+    mid = (a + b) // 2 * frame
+    return np.concatenate([v[:mid], np.zeros(int(extra * SR), dtype=np.float32), v[mid:]]), mid
+
+
+def _fading(m: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+    """Замирания сигнала над письмом по кадрам 10 мс (m кадров): (дБ ≤ 0, глубина «закручивания» 0..1). Уровень
+    плавает ±1.2 дБ; раз в 8-15 с (к концу чаще) — замирание на 4-7 дБ: вниз 0.5 с, держится 0.3-1 с, вверх 0.8 с;
+    одно пульсирующее — сигнал «вибрирует» 1.2 с. Первые 4 с — чисто."""
+    t = np.arange(m) / 100
+    db = np.zeros(m)
+    for _ in range(3):
+        db += rng.uniform(0.3, 0.6) * np.sin(2 * np.pi * rng.uniform(0.07, 0.3) * t + rng.uniform(0, 6))
+    depth = np.zeros(m)
+    pos, deep = int(rng.uniform(4, 8) * 100), []
+    while pos < m - 250:
+        shape = np.concatenate([np.linspace(0, 1, 50) ** 2, np.ones(int(rng.uniform(30, 100))),
+                                np.linspace(1, 0, 80) ** 2])
+        k = min(len(shape), m - pos)
+        db[pos:pos + k] -= rng.uniform(4, 7) * shape[:k]
+        depth[pos:pos + k] = np.maximum(depth[pos:pos + k], shape[:k])
+        deep.append(pos)
+        pos += len(shape) + int(rng.uniform(8, 15) * (1 - 0.35 * pos / m) * 100)
+    if m > 1500:  # пульсирующее замирание — в последней трети
+        p = int(rng.uniform(0.66, 0.9) * m) - 120
+        tt = np.arange(120) / 100
+        db[p:p + 120] -= 2.0 * (0.5 + 0.5 * np.sin(2 * np.pi * 7 * tt)) * np.sin(np.pi * tt / 1.2)
+    db[:300] = np.minimum(db[:300], 0) * np.linspace(0, 1, min(300, m))[:len(db[:300])]
+    return np.minimum(db, 0.0), depth
+
+
+LETTER_IN = 1.7     # пауза перед письмом: настройка на волну (свист, обрывки чужих станций), фон входит
+LETTER_OUT = 1.9    # после письма: обрыв сигнала, тишина — потом ведущий
 # Уровни — от громкости речи. Фон меряем в полосе, которую играет динамик телефона (PHONE_BAND): по всей полосе
 # он выходил на 30-38 дБ тише голоса — в телефоне его просто не было слышно.
 PHONE_BAND = (250, 8000)
 PAD_DB = -15.0      # мрачный фон к концу письма, в паузах (под словами ещё на DUCK_DB тише)
 RUMBLE_DB = -19.0   # низкий гул и сердце (по всей полосе — их слышно в наушниках)
 DUCK_DB = -9.0
-CRACKLE_DB = -14.0  # пик треска эфира — только в паузах речи, не чаще раза в CRACKLE_GAP с
-CRACKLE_GAP = 8.0
+TALK_BED_DB = -19.0     # подложка под ведущим (полоса телефона, в паузах; под словами ещё на 7 дБ тише)
+HISS_HOST_DB = -34.0    # шипение эфира под ведущим — еле-еле, просто «радио»
+HISS_DB = -26.0         # шипение над письмом — слышно всё время; в замираниях растёт (HISS_RISE дБ на дБ)
+HISS_RISE = 1.3
+CRASH_PAUSE_DB = -8.0   # пик разряда в паузе (от громкости речи)
+CRASH_SPEECH_DB = -20.0  # поверх слов — тихо
+CLICK_DB = -30.0        # мелкий треск эфира, ≈ 2.5 щелчка в секунду
+WHISTLE_DB = -26.0      # свист соседней станции (полоса телефона)
+GHOST_DB = -20.0        # «чужой голос» в паузах
+TUNE_DB = -8.0          # настройка на волну перед письмом
 
 
 def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed: int = 0) -> np.ndarray:
-    """Страшная рубрика как настоящий эфир (float32, 48 кГц, пик ≈ -1 дБ). styles — "host" / "letter" для каждого
-    куска голоса. Владелец 08.11: «прерывистая, неразборчивая… история прерывается посередине» — помехи глушили сам
-    голос каждые 5-9 с, а письмо рвал сбой эфира посередине. Теперь слова не трогаем ничем: под письмом — мрачный
-    фон, гул и сердце, которые приседают под словами; треск эфира — только в паузах; перед последней фразой письма
-    фон обрывается, и она звучит в тишине; после письма — тишина, потом ведущий."""
+    """«Письма Волгограда» как настоящий эфир (float32, 48 кГц, пик ≈ -1 дБ). styles — "host" / "letter" для каждого
+    куска голоса. Ведущий — «эфирный» голос поверх музыкальной подложки; перед письмом — настройка на волну; над
+    письмом — мрачный фон, напряжение и помехи эфира (замирания, шипение, треск, свист, провалы и «чужой голос» в
+    паузах), слова не рвутся; перед последней фразой всё стихает — финал в тишине; потом обрыв сигнала и ведущий."""
     rng = np.random.default_rng(seed)
-    pieces, spans, pos = [], [], 0          # spans: (начало, конец, стиль) кусков голоса внутри дорожки голоса
+    # 1) голос: ведущий — обработка «как на FM», письмо — мягкая (тихое остаётся тихим); ведущий на 1.5 дБ громче
+    parts, ghost_at = [], -1
     for i, pcm in enumerate(voice_chunks):
         v = _resample(pcm, rate)
         if not len(v):
             continue
         st = styles[i] if i < len(styles) else "host"
+        v = _band(v, 70, 11000)
+        if st == "host":
+            parts.append((_on_air(v), st))
+        else:
+            v, room = _make_room(_peak1(_compress(_peak1(v), -22, 2.5)))
+            parts.append((v, st))
+            ghost_at = room  # где в письме вставлена пауза под «чужой голос» (-1 — не нашлось)
+    letter_db = [_speech_db(v) for v, st in parts if st == "letter"]
+    for v, st in parts:
+        if st == "host" and letter_db:
+            v *= np.float32(_db(letter_db[0] + 1.5 - _speech_db(v)))
+    pieces, spans, pos = [], [], 0          # spans: (начало, конец, стиль) кусков голоса внутри дорожки голоса
+    for v, st in parts:
         if pieces:
             prev = spans[-1][2]
             sec = (LETTER_IN if st == "letter" and prev != "letter" else
@@ -483,23 +745,39 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
         pieces.append(v)
         spans.append((pos, pos + len(v), st))
         pos += len(v)
-    voice = np.concatenate(pieces).astype(np.float32) if pieces else np.zeros(SR, dtype=np.float32)
-    del pieces
-    voice = _band(voice, 70, 11000)                         # полный голос, без «приёмника»
-    voice /= max(float(voice.max()), float(-voice.min())) or 1   # один уровень на весь голос: тихое — тихо
-    voice = _compress(voice, -22, 2.5)
-    voice /= max(float(voice.max()), float(-voice.min())) or 1
+    voice = _peak1(np.concatenate(pieces).astype(np.float32)) if pieces else np.zeros(SR, dtype=np.float32)
+    del pieces, parts
 
+    # 2) микс: позывной, голос, позывной в конце
     head, tail = _jingle(True), _jingle(False)
-    lead = int(0.25 * SR)
-    start = len(head) - int(0.9 * SR) + lead                 # голос вступает, пока джингл ещё звенит
+    start = len(head) - int(0.9 * SR) + int(0.25 * SR)       # голос вступает, пока позывной ещё звенит
     n = start + len(voice) + int(0.6 * SR) + len(tail)
     mix = np.zeros(n, dtype=np.float32)
     mix[:len(head)] += head * _db(-6)
     mix[start:start + len(voice)] += voice
     end = start + len(voice) + int(0.6 * SR)
     mix[end:end + len(tail)] += tail * _db(-8)
-    letters = [(a, b) for a, b, st in spans if st == "letter"]
+    hiss_db = np.full(n // FADE_FRAME + 2, np.nan)          # уровень шипения эфира по кадрам 10 мс (дБ)
+
+    # 3) подложка под ведущим
+    host = [(a0, b0) for a0, b0, st in spans if st == "host"]
+    if host:
+        ref_hp = _speech_db(_band(np.concatenate([voice[a0:b0] for a0, b0 in host]), *PHONE_BAND))
+        for a0, b0 in host:
+            a, b = max(0, start + a0 - int(0.5 * SR)), min(n, start + b0 + int(1.0 * SR))
+            bed = _talk_bed(b - a, rng)
+            r = float(np.sqrt(np.mean(np.square(_band(bed, *PHONE_BAND), dtype=np.float64))))  # слышно в телефоне
+            bed *= np.float32(_db(ref_hp + TALK_BED_DB) / r) if r > 0 else np.float32(0)
+            fi, fo = min(int(0.4 * SR), (b - a) // 3), min(int(1.2 * SR), (b - a) // 3)
+            bed[:fi] *= np.linspace(0, 1, fi, dtype=np.float32)
+            bed[-fo:] *= np.linspace(1, 0, fo, dtype=np.float32)
+            _duck(bed, _slice(voice, a - start, b - start), -7.0)
+            mix[a:b] += bed
+            hiss_db[a // FADE_FRAME:b // FADE_FRAME + 1] = ref_hp + HISS_HOST_DB
+    else:
+        ref_hp = -20.0
+
+    letters = [(a0, b0) for a0, b0, st in spans if st == "letter"]
     if letters:
         la, lb = letters[0][0], letters[-1][1]               # письмо внутри дорожки голоса
         frame = SR // 50
@@ -508,11 +786,13 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
         ref = 10 * np.log10(np.mean(10 ** (lv[loud] / 10))) if loud.any() else -18.0   # громкость речи, дБ
         lvp = _levels(_band(voice[la:lb], *PHONE_BAND), frame)
         ref_phone = 10 * np.log10(np.mean(10 ** (lvp[loud] / 10))) if loud.any() else ref
-        # последняя пауза перед финальной фразой (в последних 10 с): с неё фон гаснет, финал — в тишине
-        runs = [r for r in _quiet_runs(lv, ref - 30, int(0.3 * SR / frame))
-                if r[1] < len(lv) - int(0.8 * SR / frame) and r[0] * frame > (lb - la) - 10 * SR]
-        hush = la + (runs[-1][0] * frame if runs else max(0, lb - la - 3 * SR))
-        a = max(0, la - int(1.0 * SR))                      # фон входит в паузе перед письмом
+        pauses = _quiet_runs(lv, ref - 30, int(0.3 * SR / frame))
+        # последняя пауза перед финальной фразой (в последних 10 с): с неё всё стихает, финал — в тишине
+        last = [r for r in pauses if r[1] < len(lv) - int(0.8 * SR / frame) and r[0] * frame > (lb - la) - 10 * SR]
+        hush = la + (last[-1][0] * frame if last else max(0, lb - la - 3 * SR))
+
+        # 4) мрачный фон, гул и сердце под письмом (приседают под словами)
+        a = max(0, la - int(1.0 * SR))
         ln = hush + int(0.3 * SR) - a                        # гаснет за 0.3 с — внутри этой паузы
         pad = _pad(ln, rng)
         rumble = _band(_tension(ln, rng), 25, 12000)
@@ -530,24 +810,112 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
         _duck(bed, voice[a:a + ln], DUCK_DB)
         mix[start + a:start + a + ln] += bed
         del bed
-        # треск эфира — только в паузах речи (слова не трогаем), не в первые 3 с и не после финальной паузы
-        last = -1e9
-        for i, j in _quiet_runs(lv, ref - 30, int(0.4 * SR / frame)):
-            at = i * frame
-            if at < 3 * SR or at - last < CRACKLE_GAP * SR or la + at >= hush - int(0.5 * SR):
+
+        # 5) эфир над письмом: замирания (голос и фон плавно уходят, шипение растёт, звук «закручивается»)
+        s0, s1 = start + la, start + hush
+        m = (s1 - s0) // FADE_FRAME
+        fade_db, depth = _fading(m, rng)
+        centers = np.arange(m) * FADE_FRAME + FADE_FRAME / 2
+        for c0 in range(0, s1 - s0, 1 << 20):
+            c1 = min(c0 + (1 << 20), s1 - s0)
+            g = 10 ** (np.interp(np.arange(c0, c1), centers, fade_db) / 20)
+            mix[s0 + c0:s0 + c1] *= g.astype(np.float32)
+        on = np.flatnonzero(np.diff(np.concatenate([[0], (depth > 0.02).astype(int), [0]])))
+        for w0, w1 in zip(on[::2], on[1::2], strict=True):  # «закручивание» — только там, где замирает
+            p0, p1 = s0 + w0 * FADE_FRAME, min(s1, s0 + w1 * FADE_FRAME)
+            dd = np.interp(np.arange(p1 - p0), np.arange(w1 - w0) * FADE_FRAME, depth[w0:w1]).astype(np.float32)
+            mix[p0:p1] = _phase(mix[p0:p1].copy(), dd, rng)
+        f0 = s0 // FADE_FRAME
+        hiss_db[f0:f0 + m] = ref_phone + HISS_DB - HISS_RISE * fade_db
+        hiss_db[s1 // FADE_FRAME:(start + lb) // FADE_FRAME + 30] = -90.0   # перед финальной фразой эфир стихает
+
+        # настройка на волну — в паузе перед письмом
+        tune = _tune(LETTER_IN - 0.15, rng, voice[:max(1, la - int(LETTER_IN * SR))])
+        t0 = s0 - int(LETTER_IN * SR) + int(0.1 * SR)
+        mix[t0:t0 + len(tune)] += tune * np.float32(_db(ref + TUNE_DB))
+        hiss_db[t0 // FADE_FRAME:f0] = np.nan                # там свой шум
+
+        def in_pause(at: int, k: int) -> bool:  # at, k — в сэмплах внутри письма
+            i0, i1 = at // frame, (at + k) // frame + 1
+            return i1 <= len(lv) and bool(np.all(lv[i0:i1] < ref - 30))
+
+        # треск: мелкие щелчки всё время и разряды — громко в паузах, тихо поверх слов
+        span_l = hush - la
+        for at in np.sort(rng.uniform(0, span_l, size=int(span_l / SR * 2.5))):
+            c = s0 + int(at)
+            k = min(int(rng.integers(30, 150)), s1 - c)
+            if k > 0:
+                mix[c:c + k] += (rng.standard_normal(k) * np.exp(-np.arange(k) / (k / 5))
+                                 * _db(ref + CLICK_DB) * rng.uniform(0.4, 1)).astype(np.float32)
+        at = int(rng.uniform(1.5, 3.5) * SR)
+        while at < span_l - SR:
+            crash = _crash(rng)
+            loud_at = in_pause(at, len(crash))
+            c = s0 + at
+            mix[c:c + len(crash)] += crash * np.float32(_db(ref + (CRASH_PAUSE_DB if loud_at else CRASH_SPEECH_DB))
+                                                        * rng.uniform(0.6, 1))
+            at += int(rng.exponential(4.5 * (1 - 0.3 * at / span_l)) * SR) + len(crash) + int(0.8 * SR)
+        for p0, p1 in pauses:  # и почти в каждой длинной паузе — разряд
+            if p1 - p0 >= int(0.45 * SR / frame) and p0 * frame < span_l - SR and rng.random() < 0.6:
+                crash = _crash(rng, min(0.35, (p1 - p0) * frame / SR - 0.12))
+                c = s0 + p0 * frame + int(0.06 * SR)
+                mix[c:c + len(crash)] += crash * np.float32(_db(ref + CRASH_PAUSE_DB) * rng.uniform(0.5, 1))
+        # свист соседней станции — 2-3 раза, плывёт
+        for lo, hi in ((0.12, 0.42), (0.5, 0.8)) + (((0.82, 0.92),) if span_l > 70 * SR else ()):
+            sec = float(rng.uniform(4, 7))
+            c = s0 + int(rng.uniform(lo, hi) * span_l)
+            if c + int(sec * SR) < s1:
+                w = _whistle(sec, rng, float(rng.uniform(1100, 2600)), float(rng.uniform(-300, 300)))
+                mix[c:c + len(w)] += w * np.float32(_db(ref_phone + WHISTLE_DB) / 0.6)
+        # провал сигнала: шипение рвётся «забором» (как FM в движущейся машине)
+        def drop(at: int, k: int) -> None:
+            tt = np.arange(k) / SR
+            chop = (0.55 + 0.45 * np.sign(np.sin(2 * np.pi * 14 * tt))) * np.hanning(k)
+            mix[s0 + at:s0 + at + k] += _hiss(k, rng) * chop.astype(np.float32) * np.float32(_db(ref_phone - 12))
+
+        # в удлинённой паузе — сбой: провал, и сквозь шипение «чужой голос» (речь задом наперёд, ниже и глуше)
+        if 0 <= ghost_at < span_l - 3 * SR:
+            k0 = int(0.22 * SR)
+            drop(ghost_at + int(0.05 * SR), k0)
+            k = int((GHOST_ROOM + 0.1) * SR)
+            src = int(rng.integers(0, max(1, ghost_at - k)))
+            g = _ghost(voice[la + src:la + src + k], k)
+            mix[s0 + ghost_at + k0:s0 + ghost_at + k0 + k] += _rms_to(g, ref + GHOST_DB)
+            gf = (s0 + ghost_at) // FADE_FRAME
+            hiss_db[gf:gf + int((GHOST_ROOM + 0.4) * 100)] += 8.0      # сигнал слабеет — шипение громче
+        # ещё 1-2 провала — в паузах подлиннее, не чаще раза в 15 с
+        drops, last_drop = 0, ghost_at if ghost_at >= 0 else -10 ** 9
+        for p0, p1 in pauses:
+            room = (p1 - p0) * frame - int(0.2 * SR)
+            at = p0 * frame + int(0.1 * SR)
+            if (drops >= 2 or at < 0.25 * span_l or at + room > span_l - 2 * SR or room < int(0.3 * SR)
+                    or abs(at - last_drop) < 15 * SR):
                 continue
-            room = (j - i) * frame - int(0.16 * SR)
-            k = int(min(rng.uniform(0.12, 0.26) * SR, room))
-            if k < int(0.06 * SR):
-                continue
-            _crackle(mix, start + la + at + int(0.08 * SR) + int(rng.integers(0, room - k + 1)), k,
-                     _db(ref + CRACKLE_DB) * rng.uniform(0.7, 1), rng)
-            last = at
-        _crackle(mix, start + lb + int(0.35 * SR), int(0.18 * SR), _db(ref + CRACKLE_DB - 3), rng)  # конец письма
+            drop(at, min(int(0.45 * SR), room))
+            drops, last_drop = drops + 1, at
+        # обрыв сигнала после письма — потом тишина и ведущий
+        c = start + lb + int(0.35 * SR)
+        crash = _crash(rng, 0.3)
+        mix[c:c + len(crash)] += crash * np.float32(_db(ref - 10))
+        hiss_db[(start + lb) // FADE_FRAME + 30:(start + lb) // FADE_FRAME + 130] = -90.0
+
+    # 6) шипение эфира по всему выпуску: еле-еле под ведущим, слышно под письмом, растёт в замираниях
+    idx = np.arange(len(hiss_db))
+    ok = ~np.isnan(hiss_db)
+    if ok.any():
+        hiss_db = np.interp(idx, idx[ok], hiss_db[ok])
+        hiss_db = np.convolve(np.pad(hiss_db, (15, 15), mode="edge"), np.ones(31) / 31, mode="valid")  # без ступенек
+        hiss = _hiss(n, rng)
+        centers = idx * FADE_FRAME + FADE_FRAME / 2
+        for c0 in range(0, n, 1 << 20):
+            c1 = min(c0 + (1 << 20), n)
+            hiss[c0:c1] *= (10 ** (np.interp(np.arange(c0, c1), centers, hiss_db) / 20)).astype(np.float32)
+        mix += hiss
+        del hiss
     for i in range(0, n, BED_SEG):  # еле слышный «воздух» студии — чтобы не было цифровой тишины
         seg = mix[i:i + BED_SEG]
         seg += rng.standard_normal(len(seg), dtype=np.float32) * np.float32(_db(-66))
     mix = _band(mix, 30, 15000)
-    mix /= max(float(mix.max()), float(-mix.min())) or 1
+    mix = _peak1(mix)
     mix *= _db(-1)
     return mix

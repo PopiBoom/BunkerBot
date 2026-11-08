@@ -230,8 +230,8 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop) -> di
         intro = story["intro"] or (f"Хей, всем привет, ребята! Это радио Волгограда. {cond['line']} И ваша любимая "
                                    f"рубрика - «{ai.HORROR_RUBRIC}». Нам прислали кучу писем, и вот одно из них.")
         outro = story["outro"] or ("Вот такая вот история, друзья. Надеюсь, с автором всё в порядке. А вы - "
-                                   "проверьте, закрыта ли у вас дверь. Всем до новых встреч, с вами было радио "
-                                   "Волгограда!")
+                                   f"проверьте, закрыта ли у вас дверь. Это были «{ai.HORROR_RUBRIC}». "
+                                   f"{ai.HORROR_SIGNOFF}")
         intro, outro = " ".join(intro.split()), " ".join(outro.split())
         paragraphs = [ai.strip_tags(p) for p in [intro] + story["paragraphs"] + [outro]]  # текст черновика — без пометок
         # Озвучка тремя кусками: вступление, письмо ЦЕЛИКОМ, концовка. Владелец 08.11: «история прерывается

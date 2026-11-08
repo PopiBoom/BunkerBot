@@ -168,8 +168,9 @@ async def _complete(system: str, user: str, max_tokens: int = 4000, fast: bool =
 
 
 # Поиск в интернете (серверный инструмент Claude): страшным историям — настоящие детали мест и городские легенды
-# max_uses 1: два поиска раздували вход до 70 тыс. токенов ($0.39 за историю), три — до 83 тыс. ($0.47)
-WEB_SEARCH = {"type": "web_search_20260209", "name": "web_search", "max_uses": 1}
+# Ищет дешёвая модель (Haiku) — простой версией инструмента: новую (20260209, с фильтрацией через код) Haiku вызывает
+# неверно (invalid_tool_input). Opus с поиском тащил в запрос страницы целиком: до 80 тыс. токенов, $0.46 за историю.
+WEB_SEARCH = {"type": "web_search_20250305", "name": "web_search", "max_uses": 1}
 
 
 # ---------- генерация партии ----------
@@ -2452,9 +2453,12 @@ def eleven_geo_blocked() -> bool:
     return time.time() < _eleven_geo_until
 
 
-# Страшная рубрика — ElevenLabs v3: понимает пометки интонации в тексте ([whispers], [laughs], [excited]…) и звучит
-# живее всех (владелец 08.11 вернулся к ElevenLabs, когда сервер стал ходить через прокси). Не принята — v2 без пометок.
-ELEVEN_HORROR_MODEL = os.getenv("ELEVEN_HORROR_MODEL", "").strip() or "eleven_v3"
+# Страшная рубрика — ElevenLabs с пометками интонации в тексте ([whispers], [laughs], [excited]…): живее всех
+# (владелец 08.11 вернулся к ElevenLabs, когда сервер стал ходить через прокси). С 08.11 — v4: ElevenLabs сами пишут,
+# что она во всём лучше v3 и лучше слушается пометок; до 10 000 знаков за запрос. Не принята — v3, потом v2 без пометок.
+ELEVEN_HORROR_MODEL = os.getenv("ELEVEN_HORROR_MODEL", "").strip() or "eleven_v4"
+ELEVEN_TAG_MODELS = ("eleven_v4", "eleven_v3")  # понимают пометки интонации; остальным их вырезаем
+HOST_SPEED = 1.08  # ведущий рубрики говорит чуть быстрее обычного — как на FM (у v3/v4 скорость 0.7-1.2)
 ELEVEN_VOICES = {  # готовые голоса ElevenLabs (доступны любому ключу): ключ -> (voice_id, имя)
     "brian": ("nPczCjzI2devNBz1zQrb", "Brian - низкий, рассказчик"),
     "callum": ("N2lVS1w4EtoT3dr4eOWO", "Callum - хриплый, с хитрецой"),
@@ -2591,23 +2595,29 @@ def is_noise(pcm: bytes, rate: int = SPEAK_RATE) -> bool:
 
 
 async def eleven_speak(text: str, horror: bool = False, voice: str | None = None, key: str | None = None,
-                       model: str | None = None) -> bytes:
-    """ElevenLabs: PCM 16 бит, 24 кГц, моно. b"" — нет ключа или сбой. В страшной рубрике — модель v3 с пометками
-    интонации в тексте; v3 не принята (тариф, сбой) — тот же текст без пометок моделью v2."""
+                       model: str | None = None, speed: float | None = None) -> bytes:
+    """ElevenLabs: PCM 16 бит, 24 кГц, моно. b"" — нет ключа или сбой. В страшной рубрике — v4 с пометками
+    интонации в тексте; не принята — v3, потом тот же текст без пометок моделью v2. Кончились символы, ключ не
+    принят, регион закрыт — другие модели не пробуем (не помогут). speed — темп (1.0 — обычный)."""
     if horror and not model:
-        pcm = await _eleven_once(text, True, voice, key, ELEVEN_HORROR_MODEL)
-        if not pcm and not voice and eleven_voice() not in ELEVEN_VOICES and not eleven_geo_blocked():
-            logger.warning("eleven: свой голос %s не озвучил (тариф?) — беру Brian", eleven_voice())
-            voice = ELEVEN_VOICES["brian"][0]
-            pcm = await _eleven_once(text, True, voice, key, ELEVEN_HORROR_MODEL)
-        if pcm or eleven_geo_blocked():
-            return pcm
+        for m in [ELEVEN_HORROR_MODEL] + [t for t in ELEVEN_TAG_MODELS if t != ELEVEN_HORROR_MODEL]:
+            said = text if m in ELEVEN_TAG_MODELS else strip_tags(text)
+            pcm = await _eleven_once(said, True, voice, key, m, speed)
+            if (not pcm and not voice and eleven_voice() not in ELEVEN_VOICES and not eleven_geo_blocked()
+                    and _eleven_code[0] not in _ELEVEN_FINAL):
+                logger.warning("eleven: свой голос %s не озвучил (тариф?) — беру Brian", eleven_voice())
+                voice = ELEVEN_VOICES["brian"][0]
+                pcm = await _eleven_once(said, True, voice, key, m, speed)
+            if pcm or eleven_geo_blocked() or _eleven_code[0] in _ELEVEN_FINAL:
+                return pcm
         model = ELEVEN_MODEL
-    return await _eleven_once(text if (model or ELEVEN_MODEL) == ELEVEN_HORROR_MODEL else strip_tags(text), horror,
-                              voice, key, model or ELEVEN_MODEL)
+    return await _eleven_once(text if (model or ELEVEN_MODEL) in ELEVEN_TAG_MODELS else strip_tags(text), horror,
+                              voice, key, model or ELEVEN_MODEL, speed)
 
 
 eleven_error = [""]  # почему ElevenLabs не озвучил последний кусок — пишем владельцу в черновик эфира
+_eleven_code = [""]  # код ошибки ElevenLabs (quota_exceeded…) — после «финальных» другие модели не пробуем
+_ELEVEN_FINAL = {"quota_exceeded", "invalid_api_key", "missing_permissions", "detected_unusual_activity"}
 _ELEVEN_WHY = {"quota_exceeded": "кончились символы на тарифе", "paid_plan_required": "нужен платный тариф",
                "invalid_api_key": "ключ не принят", "missing_permissions": "у ключа нет прав на озвучку",
                "too_many_concurrent_requests": "занят другими запросами", "system_busy": "сервис перегружен",
@@ -2620,22 +2630,26 @@ def _eleven_reason(status: int, body: str) -> str:
     except (ValueError, AttributeError):
         detail = {}
     code = (detail.get("status") or detail.get("code") or "") if isinstance(detail, dict) else ""
+    _eleven_code[0] = code
     return _ELEVEN_WHY.get(code, f"ошибка {status}" + (f" {code}" if code else ""))
 
 
-async def _eleven_once(text: str, horror: bool, voice: str | None, key: str | None, model: str) -> bytes:
+async def _eleven_once(text: str, horror: bool, voice: str | None, key: str | None, model: str,
+                       speed: float | None = None) -> bytes:
     import aiohttp
 
     global _eleven_geo_until
-    eleven_error[0] = ""
+    eleven_error[0] = _eleven_code[0] = ""
     key = key or eleven_key()
     if not key or not strip_tags(text):
         return b""
-    if model == ELEVEN_HORROR_MODEL and model.startswith("eleven_v3"):
-        settings = {"stability": 0.5}  # у v3 живость — от пометок в тексте; 0.5 — «естественно», без срывов
+    if model in ELEVEN_TAG_MODELS:
+        settings = {"stability": 0.5}  # у v3/v4 живость — от пометок в тексте; 0.5 — «естественно», без срывов
     else:
         settings = {"stability": 0.35 if horror else 0.5, "similarity_boost": 0.8,
                     "style": 0.45 if horror else 0.2, "use_speaker_boost": True}
+    if speed:
+        settings["speed"] = max(0.7, min(1.2, speed))
     body = {"text": text, "model_id": model, "voice_settings": settings}
     vid = voice or (eleven_voice_id() if horror else ELEVEN_VOICE)
     url = f"{ELEVEN_URL}/text-to-speech/{vid}?output_format=pcm_24000"
@@ -2668,8 +2682,8 @@ async def _eleven_once(text: str, horror: bool, voice: str | None, key: str | No
                     eleven_error[0] = f"вместо звука страница: {gist[:60]}"
                     logger.warning("eleven: вместо звука %s (%d байт) с %s: %s", ctype, len(data), r.url.host, gist)
                     return b""
-                logger.info("eleven %s: %s, %d байт (≈%.1f с), начало %s", model, ctype, len(data), len(data) / 48000,
-                            data[:4])
+                logger.info("eleven %s: %s, %d байт (≈%.1f с), начало %s, списано %s", model, ctype, len(data),
+                            len(data) / 48000, data[:4], r.headers.get("character-cost", "?"))
                 return data if "pcm" in ctype else to_pcm24(data)  # сказали «pcm» — по первым байтам не гадаем
     except Exception as e:
         eleven_error[0] = f"сбой связи: {type(e).__name__}"
@@ -2800,8 +2814,8 @@ def _voices(horror: bool) -> list:
     ElevenLabs → Яндекс SpeechKit → gpt-audio → gpt-audio-mini."""
     voice = HORROR_VOICE if horror else (os.getenv("AI_NIGHT_VOICE", "").strip() or None)
 
-    async def eleven(text: str, host: bool) -> bytes:  # пометки интонации — только ElevenLabs v3
-        return await eleven_speak(text, horror=horror)
+    async def eleven(text: str, host: bool) -> bytes:  # пометки интонации — только ElevenLabs v3/v4
+        return await eleven_speak(text, horror=horror, speed=HOST_SPEED if horror and host else None)
 
     async def yandex(text: str, host: bool) -> bytes:
         return await yandex_speak(strip_tags(text), horror=horror, host=host)
@@ -2877,15 +2891,20 @@ voice_trouble = [""]  # какие голоса до него не справи�
 
 
 HORROR_RUBRIC = "Письма Волгограда"  # рубрика «радио Волгограда» (название дал владелец)
+HORROR_SIGNOFF = "До связи, Волгоград!"  # фирменное прощание рубрики — у настоящих шоу оно одно и то же
 # 08.11 владелец: «прерывистая, неразборчивая, как будто писал робот, нет никакой жути». Прошлый промпт просил
 # «короткие фразы, обрывы, многоточия» — выходили рубленые телеграммы («Тишина. Шаги. Ближе…»), а v3 на каждом
 # многоточии и пометке замирал. Теперь письмо пишет живой человек связной речью, а страх — от сюжета: мелочь →
 # объяснения кончаются → деталь из начала в конце оказывается страшнее, чем казалась.
 HORROR_SYSTEM = (
-    "Ты делаешь выпуск рубрики «" + HORROR_RUBRIC + "» на «радио Волгограда». Ведущий — свой парень из Волгограда: "
-    "бодро здоровается со слушателями, читает письмо, которое прислал «слушатель», и прощается; говорит по-свойски, "
-    "с юмором и лёгким матом. Письмо — совсем другое: страшная история от первого лица, без мата и без юмора. "
-    "Вымысел, который звучит как правда.\n"
+    "Ты делаешь выпуск рубрики «" + HORROR_RUBRIC + "» на «радио Волгограда». Ведущий — живой ведущий вечернего "
+    "FM-эфира, свой парень из Волгограда, и говорит как настоящие ведущие: первая фраза — крючок, а не «здравствуйте, "
+    "дорогие радиослушатели»; говорит с одним слушателем, как с другом, а не с «аудиторией»; короткие живые реплики "
+    "про то, что прямо сейчас (время, погода, город), вместо заготовок; бывает, отвечает слушателю, которого не "
+    "слышно («знаю, знаю, вы сейчас скажете…»), передаёт привет кому-то конкретному, кто сейчас слушает; называет "
+    "станцию; бодро, с улыбкой, с лёгким матом. Нельзя штампы: «оставайтесь с нами», «не переключайтесь», «дорогие "
+    "радиослушатели», «в эфире самая страшная рубрика». Он читает письмо слушателя и прощается. Письмо — совсем "
+    "другое: страшная история от первого лица, без мата и без юмора. Вымысел, который звучит как правда.\n"
     "Кто пишет. Обычный человек, а не писатель: своя жизнь (работа, смены, соседи, магазин у дома, маршрутка), "
     "пишет ночью, потому что страшно и больше некому рассказать. Пишет так, как рассказывал бы другу: связно, по "
     "порядку, нормальными предложениями разной длины; бывает, сомневается или поправляет себя («не знаю, как "
@@ -2975,7 +2994,11 @@ def tidy_outro(outro: str) -> str:
         logger.info("horror: ведущий досказывал сюжет — выкинул: %s",
                     " ".join(s for s in parts if s not in kept)[:200])
     out = " ".join(kept).strip()
-    return out if len(strip_tags(out).split()) >= 8 else ""
+    if len(strip_tags(out).split()) < 8:
+        return ""
+    if "до связи" not in out.lower():  # фирменное прощание — в конце всегда
+        out = f"{out} [cheerful] Это были «{HORROR_RUBRIC}». {HORROR_SIGNOFF}"
+    return out
 _HORROR_BAN = re.compile(r"войн|сталинград|мамаев|мемориал|фашист|немецк|немц|блокад|теракт|солдат|самоубий|"
                          r"повесил(?:ся|ась|ись)|суицид", re.IGNORECASE)  # «повесил трубку» — можно, «повесился» — нет
 # Где история — выбирает КОД, без повторов последних мест (владелец 08.11: «почему всегда какая-то балка Мечётка?» —
@@ -3055,6 +3078,30 @@ HORROR_MANIAC_SHARE = 0.45     # про убийцу
 HORROR_CREATURE_SHARE = 0.3    # про существо; остальное — мистика из HORROR_ENGINES
 
 
+async def _place_facts(place: str) -> str:
+    """Детали места для страшной истории — поиском в интернете дешёвой моделью: Opus с поиском тащил в запрос
+    страницы целиком (до 80 тыс. токенов входа, $0.46 за историю), Haiku то же самое — меньше цента. "" — не вышло."""
+    try:
+        out = await _complete(
+            "Ты помогаешь автору страшных историй про Волгоград: находишь в интернете правдоподобные детали места. "
+            "Отвечаешь коротко, списком, по-русски.",
+            f"Место: {place} (Волгоград). Найди в интернете (один запрос), как оно выглядит и что о нём рассказывают "
+            "местные: 4-6 конкретных деталей (дома, дворы, звуки, запахи, приметы, слухи, легенды). Без настоящих "
+            "преступлений, маньяков, жертв и имён. Только список, без ссылок, источников и вступлений. Если толкового "
+            "ничего не нашлось — ответь одним словом: НЕТ.",
+            max_tokens=4000, fast=True, tools=[WEB_SEARCH])
+    except AIUnavailable:
+        raise
+    except Exception as e:
+        logger.warning("horror: поиск деталей места не вышел (%s) — пишу без них", e)
+        return ""
+    out = re.sub(r"\s+", " ", out).strip()
+    logger.info("horror: детали места «%s»: %s", place[:40], out[:300])
+    if out.upper().startswith("НЕТ") or re.search(r"не сработал|вернул ошибку|не удалось (?:найти|выполнить)", out):
+        return ""
+    return out[:1200]
+
+
 async def horror_story(avoid: list[str], facts: str = "") -> dict:
     """Выпуск «Писем Волгограда»: {"title", "subject", "premise", "intro", "paragraphs", "outro"} (paragraphs —
     письмо, с пометками интонации для ElevenLabs v3). Запретное (война, теракты…) — одна переделка, потом пусто."""
@@ -3066,28 +3113,34 @@ async def horror_story(avoid: list[str], facts: str = "") -> dict:
     engine = _random.choice([e for e in pool if not any(e[:40] in a for a in avoid)] or pool)
     recent = avoid[-HORROR_PLACE_GAP:]
     place = _random.choice([p for p in HORROR_PLACES if not any(p[:30] in a for a in recent)] or HORROR_PLACES)
+    place_facts = await _place_facts(place)
     user = (
         f"Место истории: {place} (Волгоград) — тут живёт или бывает автор. Главный приём: {engine}. Впиши приём в это "
         "место естественно; других мест Волгограда не добавляй.\n"
         + (f"Уже были (не повторяй ни приём, ни сюжет): {'; '.join(avoid)}.\n" if avoid else "")
         + (f"Что сейчас в эфире (для ведущего; числа — словами): {facts}.\n" if facts else "")
-        + "Сначала поищи в интернете (один запрос), как выглядит это место и что о нём рассказывают местные (слухи, "
-        "легенды, приметы), и возьми 1-2 настоящие детали, чтобы звучало как правда. Настоящие преступления, маньяков, "
-        "жертв и их имена не бери; источники в эфире не упоминай.\n"
-        "Продумай: premise — одна фраза, что не так; escalation — три шага, каждый ближе к автору; payoff — последний "
+        + (f"Что известно об этом месте (нашли в интернете): {place_facts}\nВозьми 1-2 настоящие детали, чтобы "
+           "звучало как правда. Настоящие преступления, маньяков, жертв и их имена не бери; источники в эфире не "
+           "упоминай.\n" if place_facts else "")
+        + "Продумай: premise — одна фраза, что не так; escalation — три шага, каждый ближе к автору; payoff — последний "
         "удар (какая деталь из начала в нём возвращается).\n"
         "Напиши:\n"
         "subject — тема письма, как пишут в почте (2-5 слов, без кавычек и точки, например «не открывайте ему» или "
         "«это было в нашем доме»);\n"
-        "host_intro — ведущий перед письмом, 2-3 фразы, 25-40 слов: здоровается как с друзьями (в духе «хей, всем "
-        "привет, ребята»), это радио Волгограда, погода и время из фактов выше, одна живая шутка про город (без "
-        "политики), объявляет «вашу любимую рубрику — " + HORROR_RUBRIC + "» и «вот одно из писем»; каждый раз своими "
-        "словами;\n"
+        "host_intro — ведущий перед письмом, 3-5 коротких фраз, 35-55 слов, по порядку: бодрое приветствие (в духе "
+        "«хей, всем привет, ребята» или «привет, Волгоград», каждый раз по-своему) и сразу крючок — живая фраза про "
+        "вечер, город или это письмо; «это радио "
+        "Волгограда», время и погода из фактов выше с живой деталью про город прямо сейчас (пробки, ветер с Волги, "
+        "маршрутки — без политики); привет кому-то конкретному, кто сейчас слушает (кто едет домой, ночная смена, "
+        "общага); «ваша любимая рубрика — " + HORROR_RUBRIC + "» и тизер: одна деталь о письме без спойлера (во "
+        "сколько пришло, что автор просил прочитать именно сегодня), «читаю как есть»;\n"
         "letter — письмо: 4-5 абзацев, ВСЕГО 180-220 слов (весь эфир — две минуты); начинается со слова "
         "«Здравствуйте.», потом в одной-двух фразах — кто автор, и сразу первая странность; числа — словами;\n"
-        "host_outro — ведущий после письма, 2-3 фразы, 20-35 слов: «вот такая вот история, друзья», короткая живая "
-        "реакция именно на это письмо, совет слушателю по детали из этой истории («а вы — проверьте…») и бодрое "
-        "прощание. Без новых событий и продолжения истории: не «мы ответили автору», не «письмо вернулось»;\n"
+        "host_outro — ведущий после письма, 3-4 фразы, 25-40 слов: «вот такая вот история, друзья» и живая "
+        "человеческая реакция именно на это письмо (можно с нервным смешком), совет слушателю по детали из истории («а "
+        "вы — проверьте…»), позвать рассказать в комментариях, было ли у них похожее, и в самом конце ровно: «Это были "
+        "«" + HORROR_RUBRIC + "». " + HORROR_SIGNOFF + "» Без новых событий и продолжения истории: не «мы ответили "
+        "автору», не «письмо вернулось»;\n"
         "title — 2-4 слова.\n"
         "Пометки интонации для голоса — по-английски в квадратных скобках перед фразой (вслух их не читают), скупо: "
         "ведущему — 1-2 на реплику ([excited], [laughs], [chuckles], [mischievously], [cheerful]; совет слушателю — "
@@ -3097,19 +3150,8 @@ async def horror_story(avoid: list[str], facts: str = "") -> dict:
         '"host_intro": "", "letter": ["Здравствуйте. ...", "..."], "host_outro": "", "title": ""}'
     )
     asked_shorter = banned = False
-    web = True
     for attempt in range(3):  # не больше одной просьбы «короче» и одной переделки из-за запретной темы
-        try:  # с поиском в интернете; не вышло (поиск выключен в организации и т.п.) — пишем без него
-            out = await _complete(HORROR_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=16000, effort="high",
-                                  tools=[WEB_SEARCH] if web else None)
-        except AIUnavailable:
-            raise
-        except Exception as e:
-            if not web:
-                raise
-            logger.warning("horror: поиск в интернете не вышел (%s) — пишу без него", e)
-            web = False
-            out = await _complete(HORROR_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=16000, effort="high")
+        out = await _complete(HORROR_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=16000, effort="high")
         try:
             data = _extract_json(out)
         except ValueError:

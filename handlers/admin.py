@@ -311,7 +311,7 @@ ELEVEN_SAMPLE = ("[excited] Хей, всем привет, ребята! Это 
 
 
 async def _eleven_samples(message: Message) -> None:
-    """Образцы голосов ElevenLabs v3 (≈150 знаков каждый) с кнопкой «Выбрать» — голос страшной рубрики."""
+    """Образцы голосов ElevenLabs (модель рубрики, v4; ≈150 знаков каждый) с кнопкой «Выбрать» — голос рубрики."""
     import radio
 
     import ai
