@@ -3182,12 +3182,17 @@ def sfx_time(after: str, letter: str, secs: float) -> float | None:
 # Igor Goff (русский, энергичный — из библиотеки владельца), Liam (готовый, молодой).
 ROAST_VOICES = ["PeIIkQSrhxvbJ573y888", "TX3LPaxmHKxFdv7VOQHJ"]
 _roast_voice = [""]
+# Интонация — по смыслу текста, а не «дерзко всегда» (владелец 08.11 озвучивал через /golos утешение «Не грусти, малая…»
+# — с [sarcastic] оно звучало бы издёвкой).
 ROAST_TAGS_SYSTEM = (
-    "Ты расставляешь пометки интонации для озвучки (ElevenLabs) в реплике дерзкого пацана из чата. Пометки — "
-    "по-английски в квадратных скобках перед фразой: [laughs], [chuckles], [mischievously], [sarcastic], [excited], "
-    "[sighs], [scoffs], [shouts], [deadpan], [whispers] (шёпот — только для «по секрету»). 1-3 пометки на реплику, "
-    "к месту, по смыслу. Слова реплики НЕ меняй: ни одного слова не добавляй, не убирай, не исправляй и не "
-    "смягчай, мат оставь как есть. Верни только реплику с пометками, без кавычек и пояснений."
+    "Ты расставляешь пометки интонации для озвучки (ElevenLabs) в реплике Пиздюка — пацана из чата. Пометки — "
+    "по-английски в квадратных скобках перед фразой. Интонацию выбирай по смыслу и настроению самих слов, а не по "
+    "тому, кто говорит: подкол, стёб, наезд — [sarcastic], [scoffs], [mischievously], [laughs], [chuckles], "
+    "[deadpan]; радость, азарт — [excited], [cheerful]; тепло, поддержка, утешение, комплимент — [warmly], "
+    "[softly], [gently], [reassuring] — искренне, без сарказма и смешков (мат там тоже ласковый); грусть, "
+    "сочувствие — [sighs], [sadly]; злость — [angry], [shouts]; [whispers] — только для «по секрету». 1-3 "
+    "пометки на реплику, к месту. Слова реплики НЕ меняй: ни одного слова не добавляй, не убирай, не исправляй и "
+    "не смягчай, мат оставь как есть. Верни только реплику с пометками, без кавычек и пояснений."
 )
 
 
@@ -3242,11 +3247,14 @@ def voice_quotes(text: str) -> str:
     return re.sub(r"[ \t]{2,}", " ", re.sub(r"[ \t]+([,.!?…»])", r"\1", out)).strip()
 
 
-async def roast_speech(text: str) -> bytes:
-    """Реплика Пиздюка голосом: PCM 16 бит 24 кГц или b"" (нет ключа ElevenLabs, регион, сбой)."""
+async def roast_speech(text: str, mock_quotes: bool = True) -> bytes:
+    """Реплика Пиздюка голосом: PCM 16 бит 24 кГц или b"" (нет ключа ElevenLabs, регион, сбой).
+    mock_quotes=False — цитаты не передразнивать (текст владельца из /golos: сказать как написано)."""
     if not eleven_key() or eleven_geo_blocked() or not text.strip():
         return b""
-    tagged = voice_quotes(text if _TAG.search(text) else await voice_tags(text))  # пометки уже есть — не трогаем
+    tagged = text if _TAG.search(text) else await voice_tags(text)  # пометки уже есть — не трогаем
+    if mock_quotes:
+        tagged = voice_quotes(tagged)
     for vid in roast_voices():
         pcm = await eleven_speak(tagged, horror=True, voice=vid, speed=1.05)
         if pcm:

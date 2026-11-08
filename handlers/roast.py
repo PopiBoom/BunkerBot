@@ -534,12 +534,25 @@ async def _voice_said(db: Database, chat_id: int, msg_id: int) -> str:
     return re.sub(r"^\[голосом\]\s*", "", row[1] or "") if row else ""
 
 
-async def _say_voice(bot: Bot, chat_id: int, text: str, reply_to: int | None = None,
-                     to_user: int | None = None) -> bool:
-    """Реплика голосовым (с пометками интонации). False — не озвучилось (тогда отвечать текстом).
-    to_user — кому отвечали: с ним теперь «голосовой разговор» (_voice_back)."""
+async def voice_note(text: str, mock_quotes: bool = True) -> tuple[bytes, int] | None:
+    """Реплика Пиздюка голосовым сообщением: (OGG/Opus, секунд) или None — нет ElevenLabs / не озвучилось.
+    Голос — тот, что в /golos; интонацию расставляет ai.roast_speech. mock_quotes=False — цитаты не передразнивать
+    (текст написал сам владелец через /golos: как написано, так и сказать)."""
     import radio
 
+    pcm = await ai.roast_speech(text, mock_quotes=mock_quotes)
+    if not pcm:
+        return None
+    x = radio._resample(pcm, ai.SPEAK_RATE)
+    x *= 0.9 / (float(abs(x).max()) or 1.0)
+    ogg = await asyncio.to_thread(radio.to_ogg, x)
+    return ogg, max(1, round(len(pcm) / 2 / ai.SPEAK_RATE))
+
+
+async def _say_voice(bot: Bot, chat_id: int, text: str, reply_to: int | None = None,
+                     to_user: int | None = None, mock_quotes: bool = True) -> bool:
+    """Реплика голосовым (с пометками интонации). False — не озвучилось (тогда отвечать текстом).
+    to_user — кому отвечали: с ним теперь «голосовой разговор» (_voice_back)."""
     text = ai.scrub((text or "").strip())
     if not text:
         return False
@@ -547,18 +560,15 @@ async def _say_voice(bot: Bot, chat_id: int, text: str, reply_to: int | None = N
         await bot.send_chat_action(chat_id, "record_voice")
     except Exception:
         pass
-    pcm = await ai.roast_speech(text)
-    if not pcm:
+    note = await voice_note(text, mock_quotes=mock_quotes)
+    if not note:
         return False
-    x = radio._resample(pcm, ai.SPEAK_RATE)
-    x *= 0.9 / (float(abs(x).max()) or 1.0)
-    ogg = await asyncio.to_thread(radio.to_ogg, x)
+    ogg, secs = note
     kwargs = {}
     if reply_to:
         kwargs["reply_parameters"] = ReplyParameters(message_id=reply_to, allow_sending_without_reply=True)
         _answered.setdefault(chat_id, set()).add(reply_to)
-    sent = await bot.send_voice(chat_id, BufferedInputFile(ogg, "pizdyuk.ogg"),
-                                duration=max(1, round(len(pcm) / 2 / ai.SPEAK_RATE)), **kwargs)
+    sent = await bot.send_voice(chat_id, BufferedInputFile(ogg, "pizdyuk.ogg"), duration=secs, **kwargs)
     _last_bot_msg[chat_id] = _voice_last[chat_id] = time.time()
     if len(_voice_text) > 500:
         _voice_text.clear()
@@ -808,7 +818,6 @@ async def _channel_voice_reply(bot: Bot, db: Database, message: Message, text: s
     """Ответ на пост бати голосовым прямо в канале — ответом на этот пост (владелец 08.11: «после каждого сообщения
     в канале пусть Пиздюк записывает глс, как бы отвечая на него»; выбрал «в канал», текст в обсуждении — не дублируем).
     Голос — тот, что в /golos. False — не вышло (тогда — текстом в комментарии, как раньше)."""
-    import radio
     from handlers import channel_posts
 
     post_id = _channel_post_id(message)
@@ -817,15 +826,12 @@ async def _channel_voice_reply(bot: Bot, db: Database, message: Message, text: s
     text = ai.scrub((text or "").strip())
     if not post_id or not chan or not text:
         return False
-    pcm = await ai.roast_speech(text)
-    if not pcm:
+    note = await voice_note(text)
+    if not note:
         return False
-    x = radio._resample(pcm, ai.SPEAK_RATE)
-    x *= 0.9 / (float(abs(x).max()) or 1.0)
-    ogg = await asyncio.to_thread(radio.to_ogg, x)
+    ogg, secs = note
     try:
-        sent = await bot.send_voice(chan, BufferedInputFile(ogg, "pizdyuk.ogg"),
-                                    duration=max(1, round(len(pcm) / 2 / ai.SPEAK_RATE)),
+        sent = await bot.send_voice(chan, BufferedInputFile(ogg, "pizdyuk.ogg"), duration=secs,
                                     reply_parameters=ReplyParameters(message_id=post_id, allow_sending_without_reply=True))
     except Exception as e:
         logger.warning("голос в канал ответом на пост не ушёл: %s", e)
@@ -921,33 +927,46 @@ async def cmd_remember_me(message: Message, command: CommandObject, db: Database
         await message.reply(f"😈 {html.escape(name)} снова под наблюдением.")
 
 
+def voice_change_arg(args: str) -> bool:
+    """«/golos голос <ссылка>» — сменить голос; «/golos голос у тебя…» — это текст, его надо сказать."""
+    low = (args or "").strip().lower()
+    return low.startswith("голос") and (len(low.split()) == 1 or bool(ai.voice_id_from(args)))
+
+
+async def change_voice(message: Message, args: str, db: Database, reply=None) -> None:
+    """/golos голос <ссылка elevenlabs.io/voices/…> — сменить голос Пиздюка (в чате и в личке)."""
+    reply = reply or (lambda text: temp_reply(message, text))
+    vid = ai.voice_id_from(args)
+    if not vid:
+        await reply("Пришли ссылку на голос: /golos голос https://elevenlabs.io/app/voice-library?voiceId=…")
+        return
+    ok, why = await ai.eleven_try_voice(vid)
+    if not ok:
+        await reply(f"Голос не подошёл: {why}")
+        return
+    await db.set_setting("roast_voice", vid)
+    ai.set_roast_voice(vid)
+    await reply("🎙 Голос Пиздюка сменил.")
+
+
 @router.message(Command("golos"))
 async def cmd_golos(message: Message, command: CommandObject, bot: Bot, db: Database, config=None) -> None:
     """/golos ответом на сообщение — Пиздюк отвечает на него голосом (стёб, интонация); /golos текст — говорит этот
-    текст (ответом — в ответ на то сообщение); /golos голос <ссылка elevenlabs.io/voices/…> — сменить его голос."""
+    текст (ответом — в ответ на то сообщение); /golos голос <ссылка elevenlabs.io/voices/…> — сменить его голос.
+    В личке боту — handlers/admin.cmd_golos_dm (озвучить текст и прислать голосовое)."""
     chat_id = message.chat.id
     args = (command.args or "").strip()
-    if args.lower().startswith("голос"):
-        vid = ai.voice_id_from(args)
-        if not vid:
-            await temp_reply(message, "Пришли ссылку на голос: /golos голос https://elevenlabs.io/app/voice-library?voiceId=…")
-            return
-        ok, why = await ai.eleven_try_voice(vid)
-        if not ok:
-            await temp_reply(message, f"Голос не подошёл: {why}")
-            return
-        await db.set_setting("roast_voice", vid)
-        ai.set_roast_voice(vid)
-        await temp_reply(message, "🎙 Голос Пиздюка сменил.")
+    if voice_change_arg(args):
+        await change_voice(message, args, db)
         return
     if not ai.eleven_key() or ai.eleven_geo_blocked():
         await temp_reply(message, "Для голоса нужен ElevenLabs: /setkey eleven ключ (в личку боту).")
         return
     rt = message.reply_to_message
-    if args:  # сказать свой текст (ответом — в ответ на то сообщение)
+    if args:  # сказать свой текст (ответом — в ответ на то сообщение): как написано, интонация — по смыслу
         _mark("/golos - свой текст", args)
         if not await _say_voice(bot, chat_id, args, reply_to=rt.message_id if rt else None,
-                                to_user=rt.from_user.id if rt and rt.from_user else None):
+                                to_user=rt.from_user.id if rt and rt.from_user else None, mock_quotes=False):
             await temp_reply(message, "Голос не записался - глянь /setkey eleven.")
         return
     if not rt or not rt.from_user:

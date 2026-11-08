@@ -59,8 +59,8 @@ def _load(raw: str) -> list:
 async def post(bot: Bot, db: Database, kind: str | None = None) -> str:
     """Записать и выложить голосовое в канал. kind — rant / story / cta (None — по кругу CYCLE).
     "" — вышло, иначе — почему нет (для админа и лога)."""
-    import radio
     from handlers import channel_posts
+    from handlers.roast import voice_note
 
     if not ai.available():
         return "ИИ сейчас недоступен"
@@ -79,13 +79,10 @@ async def post(bot: Bot, db: Database, kind: str | None = None) -> str:
         text = await ai.channel_rant(texts, topic, cta=kind == "cta", story=kind == "story")
         if not ai.strip_tags(text):
             return "ИИ ничего не придумал"
-        pcm = await ai.roast_speech(text)
-        if not pcm:
+        note = await voice_note(text)
+        if not note:
             return f"не озвучилось ({ai.eleven_error[0] or 'ElevenLabs молчит'})"
-        x = radio._resample(pcm, ai.SPEAK_RATE)
-        x *= 0.9 / (float(abs(x).max()) or 1.0)
-        ogg = await asyncio.to_thread(radio.to_ogg, x)
-        secs = max(1, round(len(pcm) / 2 / ai.SPEAK_RATE))
+        ogg, secs = note
         try:
             msg = await bot.send_voice(chan, BufferedInputFile(ogg, "pizdyuk.ogg"), duration=secs)
         except Exception as e:

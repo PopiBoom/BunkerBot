@@ -307,6 +307,48 @@ async def cmd_ip(message: Message, config: Config) -> None:
         f"Claude, голоса и остальное: {'через прокси' if via_all else 'напрямую'}")
 
 
+GOLOS_HELP = (
+    "🎙 <b>/golos текст</b> - скажу этот текст голосом Пиздюка и пришлю голосовое: его можно переслать куда угодно. "
+    "Ответь /golos на сообщение с текстом (можно пересланное) - озвучу его.\n\n"
+    "Интонацию ставлю сам по смыслу. Свою можно в скобках по-английски перед фразой: [laughs], [whispers], "
+    "[warmly], [sarcastic]…\n"
+    "/golos голос &lt;ссылка ElevenLabs&gt; - сменить голос.")
+
+
+@router.message(Command("golos"))
+async def cmd_golos_dm(message: Message, command: CommandObject, bot: Bot, db: Database, config: Config) -> None:
+    """/golos текст в личке боту — Пиздюк говорит этот текст и присылает голосовое (переслать куда угодно). Владелец
+    08.11: «если я так присылаю в бота, пусть озвучивает» — в личке команда молчала: стёб-бот (handlers/roast.py,
+    там /golos для чата) слушает только группы. Ответом на сообщение с текстом — озвучит его; /golos голос <ссылка> —
+    сменить голос, как в чате. Текст — как написан (цитаты не передразнивает), интонация — по смыслу (ai.roast_speech)."""
+    import ai
+    from handlers import roast
+
+    if message.from_user is None or not _is_admin(message.from_user.id, config):
+        await message.answer(texts.ADMIN_ONLY)
+        return
+    args = (command.args or "").strip()
+    if roast.voice_change_arg(args):
+        await roast.change_voice(message, args, db, reply=message.answer)
+        return
+    rt = message.reply_to_message
+    text = (args or ((rt.text or rt.caption or "") if rt else "")).strip()
+    if not text:
+        await message.answer(GOLOS_HELP)
+        return
+    if not ai.eleven_key() or ai.eleven_geo_blocked():
+        await message.answer("Для голоса нужен ElevenLabs: /setkey eleven ключ.")
+        return
+    async with roast._typing_on(bot, message.chat.id, "record_voice"):
+        note = await roast.voice_note(ai.scrub(text), mock_quotes=False)
+    if not note:
+        await message.answer(f"Голос не записался: {html.escape(ai.eleven_error[0] or 'ElevenLabs молчит')}.")
+        return
+    ogg, secs = note
+    await bot.send_voice(message.chat.id, BufferedInputFile(ogg, "pizdyuk.ogg"), duration=secs)
+    logger.info("/golos в личке: %d знаков → %d с", len(text), secs)
+
+
 ELEVEN_SAMPLE = ("[excited] Хей, всем привет, ребята! Это радио Волгограда! [laughs] [whispers] А теперь... письмо. "
                  "[nervous] Здравствуйте. Вчера в моей квартире появилась дверь.")
 
