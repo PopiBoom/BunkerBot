@@ -193,6 +193,17 @@ async def _maybe_defend(message: Message, bot: Bot, db: Database, config) -> boo
 # Имя бота в чате: на него откликается всегда
 _BOT_NAME = re.compile(r"(?<!\w)пиздю(к|ч|ш)\w*", re.IGNORECASE)
 _BOT_WORD = re.compile(r"\bбот(ик|яра|ина)?\b", re.IGNORECASE)
+# Просто поздоровались — ответ на само приветствие, без досье и старых цитат (владелец 08.11: на «Привет» бот выдал
+# «Без капса и тренить? В ДДХ доползла? Или в мафию никто не пошёл?» — три отсылки из памяти, непонятно никому).
+_GREETING = re.compile(r"^(?:всем\s+|ну\s+)?(?:привет\w*|прив\w*|ку+|хай|хелл?оу?\w*|здаров\w*|здорово|здрасьт\w*|"
+                       r"здравствуй\w*|салам\w*|добр\w+(?:\s+(?:утр\w*|д[ео]н\w*|вечер\w*|ноч\w*))?|утречк\w*|"
+                       r"йо+у?|q+|hi|hello|hey)(?:\s+(?:всем|ребят\w*|народ|пиздюк\w*|бот\w*))*$", re.IGNORECASE)
+
+
+def _just_greeting(text: str) -> bool:
+    t = _BOT_NAME.sub(" ", text or "")
+    t = " ".join(re.sub(r"@\w+|[^\w\s]", " ", t).split()).lower()
+    return bool(t) and bool(_GREETING.match(t))
 
 _last_auto: dict[int, float] = {}
 _link_notes: dict[tuple[int, int], str] = {}  # (чат, сообщение) -> «[ссылка: что там]»
@@ -1254,7 +1265,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
                 await _react(bot, chat_id, last_msg.message_id,
                              "🖕" if rude else random.choice(COOL_REACTIONS), force=True)
             return
-    dossier = await db.get_dossier(chat_id, who.id) if who else ""
+    greeting = _just_greeting("\n".join(texts) or (last_msg.text or ""))
+    dossier = await db.get_dossier(chat_id, who.id) if who and not greeting else ""
 
     if rude and _SEND_OFF.search(text):
         # Посылают — отвечаем зеркально, в лоб, а ИИ добавляет короткий подкол
@@ -1290,7 +1302,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
                 answer = await ai.comeback(name, text, dossier=dossier, samples=samples, is_father=is_father)
             else:
                 ctx = await db.recent_messages(chat_id, limit=25)
-                quote = await _old_quote(db, chat_id, who.id) if who and random.random() < QUOTE_RECALL else ""
+                quote = (await _old_quote(db, chat_id, who.id)
+                         if who and not greeting and random.random() < QUOTE_RECALL else "")
                 answer = await ai.banter(name, text, _as_dicts(ctx), dossier=dossier, samples=samples,
                                          is_father=is_father, quote=quote)
             _mark(("ответка на грубость" if rude else "ответ на обращение") + (" бате" if is_father else ""), answer)
