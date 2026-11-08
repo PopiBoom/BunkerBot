@@ -2471,13 +2471,63 @@ def strip_tags(text: str) -> str:
     return "\n".join(re.sub(r"[ \t]{2,}", " ", line).strip() for line in out.split("\n")).strip()
 
 
+_VOICE_ID = re.compile(r"\b([A-Za-z0-9]{20})\b")
+
+
+def voice_id_from(text: str) -> str:
+    """voice_id из ссылки elevenlabs.io/voices/<id> или из самого id."""
+    m = _VOICE_ID.search(text or "")
+    return m.group(1) if m else ""
+
+
 def set_eleven_voice(key: str) -> None:
-    _eleven_voice[0] = key if key in ELEVEN_VOICES else ""
+    """Готовый голос (ключ из ELEVEN_VOICES) или свой из библиотеки ElevenLabs (voice_id)."""
+    _eleven_voice[0] = key if key in ELEVEN_VOICES or _VOICE_ID.fullmatch(key or "") else ""
 
 
 def eleven_voice() -> str:
-    """Ключ выбранного голоса (/setkey eleven голоса), по умолчанию Brian."""
+    """Выбранный голос рубрики: ключ готового (по умолчанию brian) или voice_id своего."""
     return _eleven_voice[0] or "brian"
+
+
+def eleven_voice_id(key: str | None = None) -> str:
+    key = key or eleven_voice()
+    return ELEVEN_VOICES[key][0] if key in ELEVEN_VOICES else key
+
+
+def eleven_voice_name(key: str | None = None) -> str:
+    key = key or eleven_voice()
+    return ELEVEN_VOICES[key][1] if key in ELEVEN_VOICES else f"свой из библиотеки ({key})"
+
+
+async def eleven_try_voice(voice_id: str, key: str | None = None) -> tuple[bool, str]:
+    """Проба голоса коротким словом: (получилось, причина отказа). Голоса из библиотеки ElevenLabs через API —
+    только на платном тарифе (бесплатный ключ: 402 paid_plan_required)."""
+    import aiohttp
+
+    key = key or eleven_key()
+    if not key:
+        return False, "нет ключа ElevenLabs (/setkey eleven ключ)"
+    body = {"text": "Проверка.", "model_id": ELEVEN_HORROR_MODEL}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60), trust_env=True) as s:
+            async with s.post(f"{ELEVEN_URL}/text-to-speech/{voice_id}?output_format=pcm_24000", json=body,
+                              headers={"xi-api-key": key}, allow_redirects=False) as r:
+                if r.status == 200:
+                    return True, ""
+                try:
+                    detail = (await r.json(content_type=None)).get("detail") or {}
+                except Exception:
+                    detail = {}
+                code = detail.get("code", "") if isinstance(detail, dict) else ""
+                if code == "paid_plan_required":
+                    return False, "голоса из библиотеки ElevenLabs через API - только на платном тарифе (от $5 в месяц)"
+                if r.status == 404 or code in ("voice_not_found", "not_found"):
+                    return False, "такого голоса нет - проверь ссылку"
+                msg = detail.get("message", "") if isinstance(detail, dict) else str(detail)
+                return False, f"ElevenLabs ответил {r.status}: {msg[:150]}"
+    except Exception as e:
+        return False, f"не достучался до ElevenLabs: {e}"
 
 
 def set_eleven_key(key: str) -> None:
@@ -2545,6 +2595,10 @@ async def eleven_speak(text: str, horror: bool = False, voice: str | None = None
     интонации в тексте; v3 не принята (тариф, сбой) — тот же текст без пометок моделью v2."""
     if horror and not model:
         pcm = await _eleven_once(text, True, voice, key, ELEVEN_HORROR_MODEL)
+        if not pcm and not voice and eleven_voice() not in ELEVEN_VOICES and not eleven_geo_blocked():
+            logger.warning("eleven: свой голос %s не озвучил (тариф?) — беру Brian", eleven_voice())
+            voice = ELEVEN_VOICES["brian"][0]
+            pcm = await _eleven_once(text, True, voice, key, ELEVEN_HORROR_MODEL)
         if pcm or eleven_geo_blocked():
             return pcm
         model = ELEVEN_MODEL
@@ -2565,7 +2619,7 @@ async def _eleven_once(text: str, horror: bool, voice: str | None, key: str | No
         settings = {"stability": 0.35 if horror else 0.5, "similarity_boost": 0.8,
                     "style": 0.45 if horror else 0.2, "use_speaker_boost": True}
     body = {"text": text, "model_id": model, "voice_settings": settings}
-    vid = voice or (ELEVEN_VOICES[eleven_voice()][0] if horror else ELEVEN_VOICE)
+    vid = voice or (eleven_voice_id() if horror else ELEVEN_VOICE)
     url = f"{ELEVEN_URL}/text-to-speech/{vid}?output_format=pcm_24000"
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120), trust_env=True) as s:

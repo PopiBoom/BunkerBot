@@ -147,10 +147,28 @@ async def _set_eleven(message: Message, key: str, db: Database) -> None:
                              "<code>/setkey eleven ключ</code> - сохранить, <code>/setkey eleven off</code> - убрать, "
                              "<code>/setkey eleven голоса</code> - прослушать и выбрать голос рубрики.\n"
                              f"Сейчас: {'есть ✅' if ai.eleven_key() else 'нет (голос запасной)'}"
-                             f", голос рубрики - {ai.ELEVEN_VOICES[ai.eleven_voice()][1]}.")
+                             f", голос рубрики - {ai.eleven_voice_name()}.\n"
+                             "<code>/setkey eleven голос ссылка</code> - свой голос из библиотеки ElevenLabs "
+                             "(через API - только на платном тарифе).")
         return
     if key.lower() in ("голоса", "голос", "voices"):
         await _eleven_samples(message)
+        return
+    words = key.split(maxsplit=1)
+    if words[0].lower() in ("голос", "voice") and len(words) > 1 or "elevenlabs.io/" in key:
+        vid = ai.voice_id_from(key)
+        if not vid:
+            await message.answer("Не вижу id голоса. Пришли так: <code>/setkey eleven голос https://elevenlabs.io/"
+                                 "voices/…</code>")
+            return
+        ok, why = await ai.eleven_try_voice(vid)
+        if not ok:
+            await message.answer(f"❌ Голос <code>{vid}</code> не поставил: {why}.\nОставил прежний - "
+                                 f"{ai.eleven_voice_name()}.")
+            return
+        await db.set_setting("eleven_voice", vid)
+        ai.set_eleven_voice(vid)
+        await message.answer(f"✅ Голос «Писем Волгограда» - твой из библиотеки (<code>{vid}</code>). Проверь: /horror")
         return
     if key.lower() in ("off", "удалить", "-"):
         await db.set_setting("eleven_key", "")
