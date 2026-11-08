@@ -33,6 +33,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     builder.row(InlineKeyboardButton(text="😈 Как часто ставит реакции", callback_data="admin:react"))
     builder.row(InlineKeyboardButton(text="🤔 Вопрос дня в тишину: вкл/выкл", callback_data="admin:quiet_kick"))
     builder.row(InlineKeyboardButton(text="📢 Посты в канал (тест): вкл/выкл", callback_data="admin:chan_posts"))
+    builder.row(InlineKeyboardButton(text="🎙 Голосовые в канал: вкл/выкл", callback_data="admin:rant"))
     builder.row(
         InlineKeyboardButton(text="🃏 Карточки: вкл/выкл", callback_data="admin:cards"),
         InlineKeyboardButton(text="📰 Новости: вкл/выкл", callback_data="admin:news"),

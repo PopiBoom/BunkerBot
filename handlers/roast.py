@@ -2138,6 +2138,13 @@ async def background(bot: Bot, db: Database) -> None:
                     await channel_posts.tick(bot, db)
                 except Exception as e:
                     logger.warning("channel posts tick failed: %s", e)
+                # Голосовое Пиздюка в канал — раз в день в случайное время (минута записи — фон не ждёт)
+                try:
+                    from handlers import rant
+                    if not rant._lock.locked():
+                        _spawn(rant.tick(bot, db))
+                except Exception as e:
+                    logger.warning("rant tick failed: %s", e)
                 # Первый ночной эфир — владельцу в личку сам, один раз
                 try:
                     from handlers import night

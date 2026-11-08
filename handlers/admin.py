@@ -584,6 +584,26 @@ async def admin_toggle_fun(call: CallbackQuery, db: Database, config: Config) ->
         await call.message.answer(f"{what} {state}\n\n{about}")
 
 
+@router.callback_query(F.data == "admin:rant")
+async def admin_rant(call: CallbackQuery, db: Database, config: Config) -> None:
+    """Голосовые Пиздюка в канал (наезд на подписоту, раз в день) — вкл/выкл."""
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    from handlers import rant
+
+    on = (await db.get_setting(rant.ON_KEY, "1")) == "1"
+    await db.set_setting(rant.ON_KEY, "0" if on else "1")
+    state = "выключены ⛔" if on else "включены ✅"
+    await call.answer(f"Голосовые в канал {state}", show_alert=True)
+    if call.message:
+        await call.message.answer(
+            f"🎙 Голосовые в канал {state}\n\nРаз в день в случайное время ({rant.FROM_HOUR}-{rant.TO_HOUR} МСК) "
+            "Пиздюк голосом (тот, что в /golos) наезжает на подписоту канала, каждое третье — с требованием "
+            "реакций. /podpisota — прямо сейчас (/podpisota реакции — с реакциями). ≈$0.02 + ≈150 символов "
+            "ElevenLabs за голосовое.")
+
+
 @router.callback_query(F.data == "admin:roast_freq")
 async def admin_roast_freq(call: CallbackQuery, db: Database, config: Config) -> None:
     if not _is_admin(call.from_user.id, config):
