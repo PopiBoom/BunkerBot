@@ -783,13 +783,62 @@ async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
         await bot.send_chat_action(chat_id, "typing")
         await _remember_lines(db, chat_id)
         ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)  # пост бати: иногда и нагрубить
+        spoken = _channel_post_id(message) is not None and bool(ai.eleven_key()) and not ai.eleven_geo_blocked()
         answer = await ai.channel_comment(channel, text, media, image, await db.style_sample(chat_id),
-                                          repost_from=repost_from, speech=speech)
+                                          repost_from=repost_from, speech=speech, spoken=spoken)
     except Exception as e:
         logger.warning("channel comment failed: %s", e)
         return
     if answer:
-        await _say_human(bot, chat_id, ai.vary_father(answer), reply_to=message.message_id)
+        answer = ai.vary_father(answer)
+        if spoken and await _channel_voice_reply(bot, db, message, answer):
+            return
+        await _say_human(bot, chat_id, answer, reply_to=message.message_id)  # голос не вышел — текстом в комментарии
+
+
+def _channel_post_id(message: Message) -> int | None:
+    """id поста в самом канале (у автоматической пересылки в обсуждение); None — это не пост канала."""
+    fo = message.forward_origin
+    if not message.is_automatic_forward or fo is None or getattr(fo, "type", "") != "channel":
+        return None
+    return getattr(fo, "message_id", None)
+
+
+async def _channel_voice_reply(bot: Bot, db: Database, message: Message, text: str) -> bool:
+    """Ответ на пост бати голосовым прямо в канале — ответом на этот пост (владелец 08.11: «после каждого сообщения
+    в канале пусть Пиздюк записывает глс, как бы отвечая на него»; выбрал «в канал», текст в обсуждении — не дублируем).
+    Голос — тот, что в /golos. False — не вышло (тогда — текстом в комментарии, как раньше)."""
+    import radio
+    from handlers import channel_posts
+
+    post_id = _channel_post_id(message)
+    fo = message.forward_origin
+    chan = getattr(getattr(fo, "chat", None), "id", None) or (message.sender_chat.id if message.sender_chat else None)
+    text = ai.scrub((text or "").strip())
+    if not post_id or not chan or not text:
+        return False
+    pcm = await ai.roast_speech(text)
+    if not pcm:
+        return False
+    x = radio._resample(pcm, ai.SPEAK_RATE)
+    x *= 0.9 / (float(abs(x).max()) or 1.0)
+    ogg = await asyncio.to_thread(radio.to_ogg, x)
+    try:
+        sent = await bot.send_voice(chan, BufferedInputFile(ogg, "pizdyuk.ogg"),
+                                    duration=max(1, round(len(pcm) / 2 / ai.SPEAK_RATE)),
+                                    reply_parameters=ReplyParameters(message_id=post_id, allow_sending_without_reply=True))
+    except Exception as e:
+        logger.warning("голос в канал ответом на пост не ушёл: %s", e)
+        return False
+    await channel_posts.mark_own(db, sent.message_id)  # его пересылку в обсуждение бот не комментирует
+    _last_bot_msg[message.chat.id] = time.time()
+    try:
+        await db.add_chat_message(message.chat.id, message.message_id * -1, 0, BOT_SELF, None,
+                                  f"[голосом в канале, ответ на пост] {text}"[:1000])
+    except Exception as e:
+        logger.debug("save channel voice failed: %s", e)
+    logger.info("голос в канал ответом на пост %s: %s", post_id, text[:160])
+    return True
 
 
 # ---------- реакции на шутки бота: чему чат ставит 🔥, а чему 👎 ----------

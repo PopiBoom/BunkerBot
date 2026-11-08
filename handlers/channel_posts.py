@@ -53,15 +53,19 @@ async def channel_id(bot: Bot, db: Database) -> int | None:
     return None
 
 
+_own_mem: set[int] = set()  # свои посты — сразу в память: пересылка в обсуждение может прийти раньше записи в базу
+
+
 async def own_posts(db: Database) -> set[int]:
     try:
-        return set(json.loads(await db.get_setting(OWN_KEY, "[]")))
+        return set(json.loads(await db.get_setting(OWN_KEY, "[]"))) | _own_mem
     except ValueError:
-        return set()
+        return set(_own_mem)
 
 
 async def mark_own(db: Database, msg_id: int) -> None:
     """Пост бота в канале — стёб-бот его в комментариях не обсуждает (и /chess_post тоже)."""
+    _own_mem.add(msg_id)  # до первого await — иначе пересылка успевала стать «постом бати»
     ids = sorted(await own_posts(db) | {msg_id})[-100:]
     await db.set_setting(OWN_KEY, json.dumps(ids))
 

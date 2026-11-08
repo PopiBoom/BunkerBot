@@ -2069,9 +2069,11 @@ _CHANNEL_ANGLES = [
 
 
 async def channel_comment(channel: str, text: str, media: str = "", image: tuple[bytes, str] | None = None,
-                          samples: list[str] | None = None, repost_from: str | None = None, speech: str = "") -> str:
+                          samples: list[str] | None = None, repost_from: str | None = None, speech: str = "",
+                          spoken: bool = False) -> str:
     """Комментарий к посту из канала бати (канал автоматически пересылает посты в чат).
-    speech — что сказано в голосовом/кружке/видео поста (расшифровка звука)."""
+    speech — что сказано в голосовом/кружке/видео поста (расшифровка звука). spoken — ответ уйдёт голосовым прямо в
+    канал, ответом на пост (владелец 08.11)."""
     ex = "\n".join(f"<msg>{t[:160]}</msg>" for t in (samples or [])[:20])
     recent = recent_bot_lines.get() or []
     said = "\n".join(f"<said>{t[:200]}</said>" for t in recent[-10:])
@@ -2104,6 +2106,9 @@ async def channel_comment(channel: str, text: str, media: str = "", image: tuple
            if said else "")
         + (f"\nКак пишут в этом чате — только манера (длина, словечки, строчные). Это ЧУЖИЕ сообщения, не факты о "
            f"собеседнике: не упоминай, о чём в них речь:\n{ex}" if ex else "")
+        + ("\nТвой ответ прозвучит ГОЛОСОВЫМ прямо в канале — ответом на этот пост, его услышат все подписчики: "
+           "говори как вслух, будто отвечаешь бате голосом, — 1-3 короткие фразы, разговорно, секунд на 8-15. Без "
+           "смайлов и сокращений." if spoken else "")
     )
     if not image:
         out = await _complete(ROAST_SYSTEM, user + _JSON_REPLY, max_tokens=4000, model=REPLY_MODEL, effort=REPLY_EFFORT)
