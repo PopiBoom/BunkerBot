@@ -3065,6 +3065,65 @@ def sfx_time(after: str, letter: str, secs: float) -> float | None:
     return secs * (i + len(tail)) / max(1, len(plain))
 
 
+# ---------- Пиздюк голосом в чате (владелец 08.11: «иногда отвечай голосом, когда стебёшь; команда — голосом на
+# сообщение; пусть расставляет интонацию») ----------
+# Текст ответа пишет обычный путь (тот же стёб и мат), Haiku только расставляет пометки интонации ElevenLabs, слов не
+# меняя (проверка кодом), озвучка — ElevenLabs v4. Голос — `roast_voice` (/golos голос <ссылка>), иначе по очереди:
+# Igor Goff (русский, энергичный — из библиотеки владельца), Liam (готовый, молодой).
+ROAST_VOICES = ["PeIIkQSrhxvbJ573y888", "TX3LPaxmHKxFdv7VOQHJ"]
+_roast_voice = [""]
+ROAST_TAGS_SYSTEM = (
+    "Ты расставляешь пометки интонации для озвучки (ElevenLabs) в реплике дерзкого пацана из чата. Пометки — "
+    "по-английски в квадратных скобках перед фразой: [laughs], [chuckles], [mischievously], [sarcastic], [excited], "
+    "[sighs], [scoffs], [shouts], [deadpan], [whispers] (шёпот — только для «по секрету»). 1-3 пометки на реплику, "
+    "к месту, по смыслу. Слова реплики НЕ меняй: ни одного слова не добавляй, не убирай, не исправляй и не "
+    "смягчай, мат оставь как есть. Верни только реплику с пометками, без кавычек и пояснений."
+)
+
+
+def set_roast_voice(vid: str) -> None:
+    _roast_voice[0] = vid if _VOICE_ID.fullmatch(vid or "") else ""
+
+
+def roast_voices() -> list[str]:
+    return ([_roast_voice[0]] if _roast_voice[0] else []) + [v for v in ROAST_VOICES if v != _roast_voice[0]]
+
+
+def _words_kept(a: str, b: str) -> bool:
+    """Те же слова в том же порядке (пометки интонации не в счёт)."""
+    w = lambda t: re.findall(r"\w+", strip_tags(t).lower().replace("ё", "е"))  # noqa: E731
+    return w(a) == w(b)
+
+
+async def voice_tags(text: str) -> str:
+    """Реплика с пометками интонации; Haiku поменял слова или не ответил — та же реплика без пометок."""
+    try:
+        out = (await _complete(ROAST_TAGS_SYSTEM, text, max_tokens=600, fast=True)).strip().strip("«»\"")
+    except AIUnavailable:
+        raise
+    except Exception as e:
+        logger.debug("voice tags failed: %s", e)
+        return text
+    if out and _words_kept(out, text) and _TAG.search(out):
+        return out
+    logger.info("voice tags: Haiku поменял слова — озвучиваю без пометок")
+    return text
+
+
+async def roast_speech(text: str) -> bytes:
+    """Реплика Пиздюка голосом: PCM 16 бит 24 кГц или b"" (нет ключа ElevenLabs, регион, сбой)."""
+    if not eleven_key() or eleven_geo_blocked() or not text.strip():
+        return b""
+    tagged = await voice_tags(text)
+    for vid in roast_voices():
+        pcm = await eleven_speak(tagged, horror=True, voice=vid, speed=1.05)
+        if pcm:
+            return pcm
+        if _eleven_code[0] in _ELEVEN_FINAL or eleven_geo_blocked():
+            break
+    return b""
+
+
 # Яндекс SpeechKit (API v1): живые русские голоса, пускает сервер, где ElevenLabs закрыт по региону (07.11, выбор
 # владельца). Ключ — API-ключ сервисного аккаунта с ролью ai.speechkit-tts.user (/setkey yandex …), folderId не нужен.
 YANDEX_TTS_URL = "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize"

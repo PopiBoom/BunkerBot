@@ -403,9 +403,61 @@ async def _typing_on(bot: Bot, chat_id: int, action: str = "typing"):
         _typed_since.reset(token)
 
 
-async def _say_human(bot: Bot, chat_id: int, text: str, reply_to: int | None = None) -> None:
-    """Ответ «как человек»: «печатает…» по длине текста, иногда двумя сообщениями подряд."""
+# Иногда — голосом (владелец 08.11: «иногда отвечай голосом в чате, когда стебёшь; пусть расставляет интонацию»):
+# ответ на обращение, ответка, сам встрял — с шансом VOICE_SHARE, не чаще раза в VOICE_GAP в чате; озвучка —
+# ai.roast_speech (Haiku ставит пометки интонации, ElevenLabs v4). Не вышло — текстом, как обычно.
+VOICE_SHARE = 0.15
+VOICE_GAP = 5 * 60
+_voice_last: dict[int, float] = {}
+
+
+def _roll_voice(chat_id: int) -> bool:
+    if not ai.eleven_key() or ai.eleven_geo_blocked() or time.time() - _voice_last.get(chat_id, 0) < VOICE_GAP:
+        return False
+    return random.random() < VOICE_SHARE
+
+
+async def _say_voice(bot: Bot, chat_id: int, text: str, reply_to: int | None = None) -> bool:
+    """Реплика голосовым (с пометками интонации). False — не озвучилось (тогда отвечать текстом)."""
+    import radio
+
+    text = ai.scrub((text or "").strip())
+    if not text:
+        return False
+    try:
+        await bot.send_chat_action(chat_id, "record_voice")
+    except Exception:
+        pass
+    pcm = await ai.roast_speech(text)
+    if not pcm:
+        return False
+    x = radio._resample(pcm, ai.SPEAK_RATE)
+    x *= 0.9 / (float(abs(x).max()) or 1.0)
+    ogg = await asyncio.to_thread(radio.to_ogg, x)
+    kwargs = {}
+    if reply_to:
+        kwargs["reply_parameters"] = ReplyParameters(message_id=reply_to, allow_sending_without_reply=True)
+        _answered.setdefault(chat_id, set()).add(reply_to)
+    sent = await bot.send_voice(chat_id, BufferedInputFile(ogg, "pizdyuk.ogg"),
+                                duration=max(1, round(len(pcm) / 2 / ai.SPEAK_RATE)), **kwargs)
+    _last_bot_msg[chat_id] = _voice_last[chat_id] = time.time()
+    if _db_ref:
+        try:
+            mid = getattr(sent, "message_id", 0) or 0
+            await _db_ref[0].add_chat_message(chat_id, mid, 0, BOT_SELF, None, f"[голосом] {text}"[:1000])
+            why = _why.get() or {}
+            await _db_ref[0].add_bot_log(chat_id, mid, (why.get("kind") or "другое") + " (голосом)", reply_to,
+                                         why.get("draft"))
+        except Exception as e:
+            logger.debug("save own voice failed: %s", e)
+    return True
+
+
+async def _say_human(bot: Bot, chat_id: int, text: str, reply_to: int | None = None, voice: bool = False) -> None:
+    """Ответ «как человек»: «печатает…» по длине текста, иногда двумя сообщениями подряд; voice — голосовым."""
     text = (text or "").strip()
+    if voice and await _say_voice(bot, chat_id, text, reply_to):
+        return
     parts = re.split(r"(?<=[.!?…])\s+", text)
     if len(parts) >= 2 and len(text) > 50 and random.random() < SPLIT_CHANCE:
         half = len(text) / 2
@@ -693,6 +745,69 @@ async def cmd_remember_me(message: Message, command: CommandObject, db: Database
         await message.reply("😈 С возвращением. Снова слежу за каждым твоим словом.")
     else:
         await message.reply(f"😈 {html.escape(name)} снова под наблюдением.")
+
+
+@router.message(Command("golos"))
+async def cmd_golos(message: Message, command: CommandObject, bot: Bot, db: Database, config=None) -> None:
+    """/golos ответом на сообщение — Пиздюк отвечает на него голосом (стёб, интонация); /golos текст — говорит этот
+    текст (ответом — в ответ на то сообщение); /golos голос <ссылка elevenlabs.io/voices/…> — сменить его голос."""
+    chat_id = message.chat.id
+    args = (command.args or "").strip()
+    if args.lower().startswith("голос"):
+        vid = ai.voice_id_from(args)
+        if not vid:
+            await temp_reply(message, "Пришли ссылку на голос: /golos голос https://elevenlabs.io/app/voice-library?voiceId=…")
+            return
+        ok, why = await ai.eleven_try_voice(vid)
+        if not ok:
+            await temp_reply(message, f"Голос не подошёл: {why}")
+            return
+        await db.set_setting("roast_voice", vid)
+        ai.set_roast_voice(vid)
+        await temp_reply(message, "🎙 Голос Пиздюка сменил.")
+        return
+    if not ai.eleven_key() or ai.eleven_geo_blocked():
+        await temp_reply(message, "Для голоса нужен ElevenLabs: /setkey eleven ключ (в личку боту).")
+        return
+    rt = message.reply_to_message
+    if args:  # сказать свой текст (ответом — в ответ на то сообщение)
+        _mark("/golos - свой текст", args)
+        if not await _say_voice(bot, chat_id, args, reply_to=rt.message_id if rt else None):
+            await temp_reply(message, "Голос не записался - глянь /setkey eleven.")
+        return
+    if not rt or not rt.from_user:
+        await temp_reply(message, "/golos ответом на сообщение - отвечу на него голосом; /golos текст - скажу текст.")
+        return
+    if not ai.available():
+        await temp_reply(message, "ИИ сейчас недоступен - придумать нечего.")
+        return
+    who = rt.from_user
+    text = rt.text or rt.caption or ""
+    if not text:
+        row = next((r for r in await db.recent_messages(chat_id, limit=60) if r[0] == rt.message_id), None)
+        text = row[3] if row else "[без текста]"
+    name = _name(rt)
+    await _remember_lines(db, chat_id)
+    is_father = who.id == _father_id(config)
+    if is_father:
+        ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)
+    try:
+        await bot.send_chat_action(chat_id, "record_voice")
+        ctx = await db.recent_messages(chat_id, limit=25)
+        answer = await ai.banter(name, text, _as_dicts(ctx), dossier=await db.get_dossier(chat_id, who.id),
+                                 samples=await db.style_sample(chat_id), is_father=is_father)
+        _mark("/golos - ответ голосом", answer)
+        answer = await ai.polish(answer, text, _as_dicts(await db.recent_messages(chat_id, limit=20)),
+                                 author=ai.FATHER_NAME if is_father else name)
+    except Exception as e:
+        logger.warning("golos failed: %s", e)
+        answer = ""
+    if not answer:
+        await temp_reply(message, "Не придумалось - попробуй ещё раз.")
+        return
+    if is_father:
+        answer = ai.vary_father(answer)
+    await _say_human(bot, chat_id, answer, reply_to=rt.message_id, voice=True)
 
 
 @router.message(Command("roast"))
@@ -1114,7 +1229,7 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
         if not _why.get():
             _mark("послали - зеркалка")
         await _say_human(bot, chat_id, ai.vary_father(answer) if is_father else answer,
-                         reply_to=last_msg.message_id)
+                         reply_to=last_msg.message_id, voice=_roll_voice(chat_id))
         if who:
             _thread.setdefault((chat_id, who.id), []).append(time.time())
         return
@@ -1141,7 +1256,7 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     if answer and is_father:
         answer = ai.vary_father(answer)
     if answer:
-        await _say_human(bot, chat_id, answer, reply_to=last_msg.message_id)
+        await _say_human(bot, chat_id, answer, reply_to=last_msg.message_id, voice=_roll_voice(chat_id))
         if who:
             _thread.setdefault((chat_id, who.id), []).append(time.time())
         if random.random() < STICKER_AFTER:
@@ -1876,7 +1991,7 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int) -> None:
         if chat_id in _pending or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
             return
         if text:
-            await _say_human(bot, chat_id, text, reply_to=reply_to)
+            await _say_human(bot, chat_id, text, reply_to=reply_to, voice=_roll_voice(chat_id))
 
 
 DOSSIER_VERSION_KEY = "dossier_version"

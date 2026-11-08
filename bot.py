@@ -214,6 +214,7 @@ async def main() -> None:
     ai.set_openrouter_key(await db.get_setting("openrouter_key", ""))  # ключ, присланный боту через /setkey
     ai.set_eleven_key(await db.get_setting("eleven_key", ""))  # голос ночного эфира (/setkey eleven …)
     ai.set_eleven_voice(await db.get_setting("eleven_voice", ""))  # голос рубрики (/setkey eleven голоса)
+    ai.set_roast_voice(await db.get_setting("roast_voice", ""))  # голос Пиздюка в чате (/golos голос …)
     ai.set_yandex(await db.get_setting("yandex_key", ""), await db.get_setting("yandex_voice", ""))  # /setkey yandex
 
     dp = Dispatcher(storage=MemoryStorage())
