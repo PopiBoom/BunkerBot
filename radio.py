@@ -57,11 +57,25 @@ def _filter(x: np.ndarray, curve, sr: int = SR) -> np.ndarray:
 
 
 def _resample(pcm: bytes, rate: int) -> np.ndarray:
+    """PCM 16 бит → float32 48 кГц, линейная интерполяция кусками. Раньше np.interp по всему письму держал массивы
+    float64 на весь голос: 4 минуты — 0.4 ГБ памяти."""
     x = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768
-    if rate == SR or len(x) == 0:
+    if rate == SR or len(x) < 2:
         return x
-    t_new = np.arange(int(len(x) * SR / rate)) * rate / SR
-    return np.interp(t_new, np.arange(len(x)), x).astype(np.float32)
+    if SR == 2 * rate:  # 24 → 48 кГц (все наши голоса): между соседними сэмплами — среднее
+        out = np.empty(2 * len(x), dtype=np.float32)
+        out[0::2] = x
+        out[1:-1:2] = (x[:-1] + x[1:]) * np.float32(0.5)
+        out[-1] = x[-1]
+        return out
+    n_out = int(len(x) * SR / rate)
+    out = np.empty(n_out, dtype=np.float32)
+    for i in range(0, n_out, 1 << 20):
+        t = np.arange(i, min(i + (1 << 20), n_out)) * (rate / SR)
+        k = np.minimum(t.astype(np.int64), len(x) - 2)
+        frac = (t - k).astype(np.float32)
+        out[i:i + len(t)] = x[k] * (1 - frac) + x[k + 1] * frac
+    return out
 
 
 def _fade(x: np.ndarray, fin: float, fout: float) -> np.ndarray:
@@ -167,6 +181,7 @@ def _glitch(rng: np.random.Generator) -> np.ndarray:
     return (out / (np.abs(out).max() or 1) * 0.9).astype(np.float32)
 
 
+GEN_SEG = 10 * SR   # синтез фона (гул, мрачный аккорд) — кусками по 10 с: временные массивы float64 небольшие
 BED_SEG = 30 * SR   # фон эфира собираем кусками по 30 с…
 BED_XF = SR // 2    # …с перекрытием 0.5 с (плавные стыки) — память не растёт с длиной эфира
 
@@ -340,8 +355,8 @@ def _tension(ln: int, rng: np.random.Generator) -> np.ndarray:
     110-220 Гц — иначе в динамике телефона его не слышно). float32."""
     out = np.zeros(ln, dtype=np.float32)
     span = max(ln / SR, 1.0)
-    for p0 in range(0, ln, BED_SEG):  # кусками — без массивов на весь эфир
-        n = min(BED_SEG, ln - p0)
+    for p0 in range(0, ln, GEN_SEG):  # кусками по 10 с — без массивов на весь эфир
+        n = min(GEN_SEG, ln - p0)
         t = (np.arange(n, dtype=np.float64) + p0) / SR
         prog = t / span
         ph = 2 * np.pi * (52 * t + 22 * span * prog ** 2.5 / 2.5)            # 52 → 74 Гц, фаза непрерывна
@@ -380,8 +395,8 @@ def _pad(ln: int, rng: np.random.Generator) -> np.ndarray:
     lfo = [(rng.uniform(1 / 13, 1 / 6), rng.uniform(0, 2 * np.pi)) for _ in voices]
     span = max(ln / SR, 1.0)
     out = np.zeros(ln, dtype=np.float32)
-    for p0 in range(0, ln, BED_SEG):
-        n = min(BED_SEG, ln - p0)
+    for p0 in range(0, ln, GEN_SEG):
+        n = min(GEN_SEG, ln - p0)
         t = (np.arange(n, dtype=np.float64) + p0) / SR
         seg = np.zeros(n)
         for (f, amp), (lf, lph) in zip(voices, lfo, strict=True):
@@ -391,16 +406,26 @@ def _pad(ln: int, rng: np.random.Generator) -> np.ndarray:
                     seg += swell * np.sin(2 * np.pi * f * det * k * t + k) / k
         seg *= 0.5 + 0.5 * np.clip(t / span, 0, 1) ** 1.2
         out[p0:p0 + n] = seg.astype(np.float32)
-    return out / (float(np.abs(out).max()) or 1)
+    return _peak1(out)  # на месте — без копий на весь фон
 
 
 def _levels(x: np.ndarray, frame: int) -> np.ndarray:
-    """Уровень (дБ) по кадрам длиной frame."""
+    """Уровень (дБ) по кадрам длиной frame. Кусками по ~1 млн сэмплов — без копии всего сигнала во float64."""
     m = len(x) // frame
-    if m == 0:
-        return np.zeros(0)
-    blk = x[:m * frame].reshape(m, frame)
-    return 10 * np.log10(np.mean(np.square(blk, dtype=np.float64), axis=1) + 1e-12)
+    out = np.empty(m)
+    step = max(1, (1 << 20) // frame)
+    for i in range(0, m, step):
+        k = min(step, m - i)
+        blk = x[i * frame:(i + k) * frame].reshape(k, frame)
+        out[i:i + k] = 10 * np.log10(np.mean(np.square(blk, dtype=np.float64), axis=1) + 1e-12)
+    return out
+
+
+def _band_levels(x: np.ndarray, lo: float, hi: float, frame: int) -> np.ndarray:
+    """Уровни (дБ) по кадрам в полосе lo-hi — фильтр по кускам 30 с, без копии всего сигнала."""
+    seg = BED_SEG // frame * frame
+    return np.concatenate([_levels(_band(x[i:i + seg], lo, hi), frame) for i in range(0, len(x), seg)] or
+                          [np.zeros(0)])
 
 
 def _quiet_runs(lv: np.ndarray, below: float, min_frames: int) -> list[tuple[int, int]]:
@@ -567,10 +592,29 @@ def _hiss_curve(f: np.ndarray) -> np.ndarray:
 
 
 def _hiss(n: int, rng: np.random.Generator) -> np.ndarray:
-    """Шипение эфира (слабый сигнал): яркий шум 0.3-10 кГц, RMS ≈ 1."""
+    """Шипение эфира (слабый сигнал): яркий шум 0.3-10 кГц, RMS ≈ 1. Для коротких вставок (до ~30 с)."""
     x = _filter(rng.standard_normal(n, dtype=np.float32), _hiss_curve)
     r = float(np.sqrt(np.mean(np.square(x[:SR * 10], dtype=np.float64)))) or 1.0
     return x / np.float32(r)
+
+
+def _hiss_into(mix: np.ndarray, level_db: np.ndarray, rng: np.random.Generator) -> None:
+    """Шипение по всему выпуску прямо в микс: кусками по 30 с с плавными стыками (без массива на весь выпуск —
+    5 минут иначе съедали лишние сотни МБ). level_db — громкость по кадрам 10 мс."""
+    n = len(mix)
+    centers = np.arange(len(level_db)) * FADE_FRAME + FADE_FRAME / 2
+    xf = BED_XF
+    up = np.sqrt(np.linspace(0, 1, xf, dtype=np.float32))
+    down = np.sqrt(np.linspace(1, 0, xf, dtype=np.float32))
+    for pos in range(0, n, BED_SEG):
+        ln = min(BED_SEG + xf, n - pos)                    # кусок + нахлёст на следующий
+        seg = _hiss(ln, rng)
+        if pos:
+            seg[:xf] *= up[:ln]
+        if pos + ln < n:
+            seg[-xf:] *= down
+        seg *= (10 ** (np.interp(np.arange(pos, pos + ln), centers, level_db) / 20)).astype(np.float32)
+        mix[pos:pos + ln] += seg
 
 
 def _crash(rng: np.random.Generator, sec: float | None = None) -> np.ndarray:
@@ -784,7 +828,7 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
         lv = _levels(voice[la:lb], frame)
         loud = lv > -35
         ref = 10 * np.log10(np.mean(10 ** (lv[loud] / 10))) if loud.any() else -18.0   # громкость речи, дБ
-        lvp = _levels(_band(voice[la:lb], *PHONE_BAND), frame)
+        lvp = _band_levels(voice[la:lb], *PHONE_BAND, frame)
         ref_phone = 10 * np.log10(np.mean(10 ** (lvp[loud] / 10))) if loud.any() else ref
         pauses = _quiet_runs(lv, ref - 30, int(0.3 * SR / frame))
         # последняя пауза перед финальной фразой (в последних 10 с): с неё всё стихает, финал — в тишине
@@ -794,16 +838,16 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
         # 4) мрачный фон, гул и сердце под письмом (приседают под словами)
         a = max(0, la - int(1.0 * SR))
         ln = hush + int(0.3 * SR) - a                        # гаснет за 0.3 с — внутри этой паузы
-        pad = _pad(ln, rng)
-        rumble = _band(_tension(ln, rng), 25, 12000)
         tail_n = max(1, ln // 4)                             # уровень — по самой громкой (последней) четверти
-        for x, rel, to, band in ((pad, PAD_DB, ref_phone, PHONE_BAND), (rumble, RUMBLE_DB, ref, None)):
+
+        def level(x: np.ndarray, rel: float, to: float, band: tuple | None) -> np.ndarray:
             part = _band(x[-tail_n:], *band) if band else x[-tail_n:]
             r = float(np.sqrt(np.mean(np.square(part, dtype=np.float64)))) or 1.0
             x *= np.float32(_db(to + rel) / r)
-        bed = pad
-        bed += rumble
-        del pad, rumble
+            return x
+
+        bed = level(_pad(ln, rng), PAD_DB, ref_phone, PHONE_BAND)
+        bed += level(_tension(ln, rng), RUMBLE_DB, ref, None)   # гул и сердце — 47 Гц-8.4 кГц, фильтр не нужен
         fi, fo = min(int(2.0 * SR), ln // 3), min(int(0.3 * SR), ln // 3)
         bed[:fi] *= np.linspace(0, 1, fi, dtype=np.float32)
         bed[-fo:] *= np.linspace(1, 0, fo, dtype=np.float32)
@@ -860,8 +904,9 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
                 crash = _crash(rng, min(0.35, (p1 - p0) * frame / SR - 0.12))
                 c = s0 + p0 * frame + int(0.06 * SR)
                 mix[c:c + len(crash)] += crash * np.float32(_db(ref + CRASH_PAUSE_DB) * rng.uniform(0.5, 1))
-        # свист соседней станции — 2-3 раза, плывёт
-        for lo, hi in ((0.12, 0.42), (0.5, 0.8)) + (((0.82, 0.92),) if span_l > 70 * SR else ()):
+        # свист соседней станции — примерно раз в 38 с письма (не меньше двух), плывёт
+        k_wh = max(2, int(round(span_l / SR / 38)))
+        for lo, hi in ((0.08 + 0.84 * j / k_wh, 0.08 + 0.84 * (j + 0.8) / k_wh) for j in range(k_wh)):
             sec = float(rng.uniform(4, 7))
             c = s0 + int(rng.uniform(lo, hi) * span_l)
             if c + int(sec * SR) < s1:
@@ -905,13 +950,8 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
     if ok.any():
         hiss_db = np.interp(idx, idx[ok], hiss_db[ok])
         hiss_db = np.convolve(np.pad(hiss_db, (15, 15), mode="edge"), np.ones(31) / 31, mode="valid")  # без ступенек
-        hiss = _hiss(n, rng)
-        centers = idx * FADE_FRAME + FADE_FRAME / 2
-        for c0 in range(0, n, 1 << 20):
-            c1 = min(c0 + (1 << 20), n)
-            hiss[c0:c1] *= (10 ** (np.interp(np.arange(c0, c1), centers, hiss_db) / 20)).astype(np.float32)
-        mix += hiss
-        del hiss
+        _hiss_into(mix, hiss_db, rng)
+    del voice
     for i in range(0, n, BED_SEG):  # еле слышный «воздух» студии — чтобы не было цифровой тишины
         seg = mix[i:i + BED_SEG]
         seg += rng.standard_normal(len(seg), dtype=np.float32) * np.float32(_db(-66))
