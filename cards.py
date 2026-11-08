@@ -631,7 +631,7 @@ def render_diss_cover(name: str, title: str, genre: str, photo: bytes | None, se
 
 def render_news(date: str, issue: int, headline: str, ticker: list[str]) -> bytes:
     """Заставка «Новостей чата»: экран эфира — плашка «НОВОСТИ ЧАТА», «ЭФИР 21:00», главный заголовок крупно,
-    внизу бегущая строка с остальными сюжетами."""
+    внизу бегущая строка с остальными сюжетами. Плашки — по ширине текста (первая версия: «21:00» вылезало)."""
     w, h = 1000, 600
     img = Image.new("RGB", (w, h), (10, 18, 40))
     d = ImageDraw.Draw(img)
@@ -642,24 +642,40 @@ def render_news(date: str, issue: int, headline: str, ticker: list[str]) -> byte
         d.line((x, 0, x + h, h), fill=(30, 48, 92), width=2)
     img = _noise(img, issue)
     d = ImageDraw.Draw(img)
-    d.rectangle((PAD - 10, 50, PAD + 430, 116), fill=CLOWN_RED)
-    d.text((PAD + 6, 83), "НОВОСТИ ЧАТА", font=_bold(44), fill=(255, 255, 255), anchor="lm")
-    d.rectangle((PAD + 430, 50, PAD + 666, 116), fill=(245, 240, 235))
-    d.ellipse((PAD + 450, 74, PAD + 468, 92), fill=CLOWN_RED)
-    d.text((PAD + 480, 83), "ЭФИР 21:00", font=_bold(30), fill=(14, 22, 44), anchor="lm")
-    d.text((PAD - 10, 146), f"{date} · ВЫПУСК № {issue}", font=_mono(26), fill=(200, 210, 235), anchor="lm")
-    y = 196
+    dark, light = (14, 22, 44), (245, 240, 235)
+    # шапка: [НОВОСТИ ЧАТА][● ЭФИР 21:00]
+    x, y0, y1 = PAD, 50, 116
+    t1 = "НОВОСТИ ЧАТА"
+    w1 = int(d.textlength(t1, font=_bold(44))) + 44
+    d.rectangle((x, y0, x + w1, y1), fill=CLOWN_RED)
+    d.text((x + 22, (y0 + y1) / 2), t1, font=_bold(44), fill=(255, 255, 255), anchor="lm")
+    x += w1
+    t2 = "ЭФИР 21:00"
+    w2 = int(d.textlength(t2, font=_bold(30))) + 22 + 18 + 14 + 24
+    d.rectangle((x, y0, x + w2, y1), fill=light)
+    d.ellipse((x + 22, 74, x + 40, 92), fill=CLOWN_RED)
+    d.text((x + 54, (y0 + y1) / 2), t2, font=_bold(30), fill=dark, anchor="lm")
+    d.text((PAD, 150), f"{date} · ВЫПУСК № {issue}", font=_mono(26), fill=(200, 210, 235), anchor="lm")
+    # главный заголовок — по центру свободного места между шапкой и бегущей строкой
+    tick_top = h - 96
     size = 64
     t = _plain(headline).upper()
     while size > 38 and len(_wrap(d, t, _bold(size), w - 2 * PAD, 4)) > 3:
         size -= 4
-    for line in _wrap(d, t, _bold(size), w - 2 * PAD, 3):
+    lines = _wrap(d, t, _bold(size), w - 2 * PAD, 3)
+    block = len(lines) * int(size * 1.18) + 30
+    y = max(190, 180 + (tick_top - 180 - block) // 2)
+    for line in lines:
         d.text((PAD, y), line, font=_bold(size), fill=(255, 255, 255))
         y += int(size * 1.18)
     d.rectangle((PAD, y + 14, PAD + 120, y + 22), fill=CLOWN_RED)
-    d.rectangle((0, h - 92, w, h - 30), fill=(245, 240, 235))
-    d.rectangle((0, h - 92, 150, h - 30), fill=CLOWN_RED)
-    d.text((75, h - 61), "СРОЧНО", font=_bold(30), fill=(255, 255, 255), anchor="mm")
+    # бегущая строка: [СРОЧНО] заголовок • заголовок • …
+    d.rectangle((0, tick_top, w, tick_top + 62), fill=light)
+    t3 = "СРОЧНО"
+    w3 = int(d.textlength(t3, font=_bold(28))) + 2 * PAD
+    d.rectangle((0, tick_top, w3, tick_top + 62), fill=CLOWN_RED)
+    d.text((w3 / 2, tick_top + 31), t3, font=_bold(28), fill=(255, 255, 255), anchor="mm")
     run = "  •  ".join(_plain(x) for x in ticker) or "в чате всё спокойно, подозрительно спокойно"
-    d.text((172, h - 61), _wrap(d, run, _bold(28), w - 190, 1)[0], font=_bold(28), fill=(14, 22, 44), anchor="lm")
+    d.text((w3 + 20, tick_top + 31), _wrap(d, run, _bold(26), w - w3 - 40, 1)[0], font=_bold(26), fill=dark,
+           anchor="lm")
     return _png(img)
