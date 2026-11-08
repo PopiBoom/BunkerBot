@@ -142,10 +142,55 @@ class AdminOnlyCommands(BaseMiddleware):
         return await handler(event, data)
 
 
+async def _pick_proxy(config, db):
+    """Прокси из .env или /setproxy: сначала проверка (страна + Telegram через него). Не отвечает — напрямую,
+    иначе умерший прокси отрезал бы бота от Telegram, и даже /setproxy off было бы некому прислать."""
+    import dataclasses
+
+    import netproxy
+    from config import proxy_all, route_all_via
+
+    from_env = bool(config.proxy)
+    proxy = config.proxy or (await db.get_setting(netproxy.SETTING, "")).strip()
+    if not proxy:
+        return config, ""
+    ok, info = await netproxy.check(proxy, config.token)
+    if not ok:
+        logger.warning("прокси %s не отвечает (%s) — работаю напрямую", netproxy.mask(proxy), info)
+        return dataclasses.replace(config, proxy=None), f"{netproxy.mask(proxy)}: {info}"
+    if not from_env or proxy_all():  # /setproxy — всегда весь бот; из .env — если BOT_PROXY_ALL=1
+        try:
+            route_all_via(proxy)
+        except RuntimeError as e:
+            logger.warning("%s", e)
+    logger.info("прокси %s работает: %s", netproxy.mask(proxy), info)
+    return dataclasses.replace(config, proxy=proxy), ""
+
+
+async def _proxy_notice(bot, db, config, problem: str) -> None:
+    """Админу в ЛС: прокси умер (работаю напрямую) или после /setproxy — откуда бот теперь ходит в интернет."""
+    import netproxy
+
+    try:
+        if problem:
+            await bot.send_message(config.admin_ids[0], f"⚠️ Прокси не отвечает - работаю напрямую.\n<code>"
+                                                        f"{problem}</code>\n\n/setproxy - поменять или выключить.")
+        elif await db.get_setting(netproxy.ANNOUNCE, "") == "1":
+            await db.set_setting(netproxy.ANNOUNCE, "")
+            _ok, info = await netproxy.check(config.proxy, config.token) if config.proxy else (True, "напрямую")
+            await bot.send_message(config.admin_ids[0], f"🌍 Перезапустился. Выхожу в интернет: <b>{info}</b>"
+                                                        + (" - весь бот через прокси." if config.proxy else "."))
+    except Exception as e:
+        logger.info("proxy notice failed: %s", e)
+
+
 async def main() -> None:
     config = load_config()
+    db = Database(config.db_path)
+    await db.init()
+    config, proxy_problem = await _pick_proxy(config, db)
 
-    # Прокси нужен только в особых окружениях; по умолчанию BOT_PROXY пуст.
+    # Прокси — из .env (BOT_PROXY) или из /setproxy (база); проверен в _pick_proxy, мёртвый — работаем напрямую
     session = AiohttpSession(proxy=config.proxy) if config.proxy else None
     bot = Bot(
         token=config.token,
@@ -155,8 +200,6 @@ async def main() -> None:
     )
     bot.session.middleware(NoLongDashes())  # «-» вместо «—» во всём, что бот отправляет
     bot.session.middleware(TempReplies())   # служебные ответы в чате удаляются через минуту
-    db = Database(config.db_path)
-    await db.init()
     import ai
     ai.set_usage_sink(db.add_ai_usage)  # учёт токенов и стоимости запросов к ИИ
     ai.set_openrouter_key(await db.get_setting("openrouter_key", ""))  # ключ, присланный боту через /setkey
@@ -192,6 +235,7 @@ async def main() -> None:
     dp.include_router(roast_router)
 
     await set_commands(bot, config, db)
+    await _proxy_notice(bot, db, config, proxy_problem)
 
     me = await bot.get_me()
     logger.info("Бот @%s запущен. Требуемые чаты: %s", me.username, config.required_chats)

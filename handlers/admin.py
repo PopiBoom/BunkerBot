@@ -171,6 +171,90 @@ async def _set_eleven(message: Message, key: str, db: Database) -> None:
                          "Страшная история - примерно 3 000 символов. Проверь: /horror")
 
 
+@router.message(Command("setproxy"))
+async def cmd_setproxy(message: Message, command: CommandObject, db: Database, config: Config) -> None:
+    """/setproxy http://логин:пароль@адрес:порт — весь бот через прокси (проверка → сохранить → перезапуск);
+    /setproxy off — напрямую; /setproxy — что сейчас. Прокси хранится в базе бота, не в репозитории."""
+    import os
+
+    import netproxy
+
+    if message.from_user is None or not _is_admin(message.from_user.id, config):
+        await message.answer(texts.ADMIN_ONLY)
+        return
+    arg = (command.args or "").strip()
+    if not arg:
+        saved = await db.get_setting(netproxy.SETTING, "")
+        await message.answer(
+            "🌍 <b>Прокси для всего бота</b>\n\n"
+            f"Сейчас: {'через ' + netproxy.mask(config.proxy) if config.proxy else 'напрямую'}"
+            + (f" (сохранён {netproxy.mask(saved)}, но не отвечал при запуске)" if saved and not config.proxy else "")
+            + "\n\n<code>/setproxy http://логин:пароль@адрес:порт</code> - включить (проверю, сообщение с паролем "
+            "удалю, перезапущусь)\n<code>/setproxy off</code> - напрямую\n/ip - откуда бот выходит сейчас")
+        return
+    try:
+        await message.delete()  # в сообщении пароль прокси
+    except Exception:
+        pass
+    if arg.lower() in ("off", "выкл", "-", "нет"):
+        await db.set_setting(netproxy.SETTING, "")
+        if os.getenv("BOT_PROXY", "").strip():
+            await message.answer("🌍 Убрал прокси из базы, но он ещё задан в .env (BOT_PROXY) - он и останется.")
+            return
+        await message.answer("🌍 Прокси выключен. Перезапускаюсь - через 10 секунд буду работать напрямую.")
+        await db.set_setting(netproxy.ANNOUNCE, "1")
+        _restart_when_free()
+        return
+    if not netproxy.valid(arg):
+        await message.answer("Не похоже на HTTP-прокси. Нужно так: <code>http://логин:пароль@адрес:порт</code> "
+                             "(socks5 для всего бота не подходит).")
+        return
+    status = await message.answer(f"🌍 Проверяю {netproxy.mask(arg)}…")
+    ok, info = await netproxy.check(arg, config.token)
+    if not ok:
+        await status.edit_text(f"❌ Прокси не работает: <code>{info}</code>\nНичего не менял.")
+        return
+    await db.set_setting(netproxy.SETTING, arg)
+    await db.set_setting(netproxy.ANNOUNCE, "1")
+    busy = _busy()
+    await status.edit_text(f"✅ Прокси работает: <b>{info}</b>\n"
+                           + ("Сейчас идёт игра или эфир - перезапущусь, как закончится, и весь бот пойдёт через прокси."
+                              if busy else "Перезапускаюсь - через 10 секунд весь бот пойдёт через прокси."))
+    _restart_when_free()
+
+
+def _busy() -> bool:
+    try:
+        from games import _flag_needed
+
+        return _flag_needed()
+    except Exception:
+        return False
+
+
+_restart_task: list = []
+
+
+def _restart_when_free() -> None:
+    """Перезапуск бота (systemd поднимет его через 5 сек), но не посреди игры, суда или эфира — ждём до 3 ч."""
+    import asyncio
+    import os
+
+    if _restart_task:
+        return
+
+    async def run() -> None:
+        await asyncio.sleep(2)  # дать уйти ответу
+        for _ in range(360):
+            if not _busy():
+                break
+            await asyncio.sleep(30)
+        logger.info("перезапуск по /setproxy")
+        os._exit(0)
+
+    _restart_task.append(asyncio.create_task(run()))
+
+
 @router.message(Command("ip"))
 async def cmd_ip(message: Message, config: Config) -> None:
     """Через какую страну бот выходит в интернет (проверка прокси: BOT_PROXY и BOT_PROXY_ALL)."""
@@ -194,6 +278,7 @@ async def cmd_ip(message: Message, config: Config) -> None:
         f"IP: <code>{info.get('ip', '?')}</code>\n"
         f"Страна: <b>{info.get('country', '?')}</b>, {info.get('city', '?')}\n"
         f"Провайдер: {info.get('org', '?')}\n\n"
+        f"Прокси: {__import__('netproxy').mask(config.proxy) if config.proxy else 'нет'}\n"
         f"Telegram: {'через прокси' if config.proxy else 'напрямую'}\n"
         f"Claude, голоса и остальное: {'через прокси' if via_all else 'напрямую'}")
 

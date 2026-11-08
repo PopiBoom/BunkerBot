@@ -62,9 +62,7 @@ def load_config() -> Config:
         )
 
     db_path = os.getenv("DB_PATH", "bot.db").strip() or "bot.db"
-    proxy = os.getenv("BOT_PROXY", "").strip() or None
-    if proxy and proxy_all():
-        route_all_via(proxy)
+    proxy = os.getenv("BOT_PROXY", "").strip() or None  # на весь бот (BOT_PROXY_ALL) — включает bot.main после проверки
 
     return Config(
         token=token,
