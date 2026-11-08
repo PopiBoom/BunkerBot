@@ -274,6 +274,24 @@ def broadcast(voice_chunks: list[bytes], rate: int = 24000, rain: bool = False, 
     return mix
 
 
+def ogg_secs(data: bytes) -> int:
+    """Длительность OGG/Opus в секундах — для send_voice(duration=…): без неё Telegram показывает у голосового
+    00:00 (владелец 08.11: «почему в канале у голосового 00:00»), и при пересылке по file_id так и остаётся."""
+    try:
+        import av
+
+        with av.open(io.BytesIO(data)) as c:
+            st = c.streams.audio[0]
+            end = 0.0
+            for pkt in c.demux(st):
+                if pkt.pts is not None and pkt.duration is not None:
+                    end = max(end, float((pkt.pts + pkt.duration) * pkt.time_base))
+            return max(1, int(round(end)))
+    except Exception as e:  # noqa: BLE001
+        log.warning("radio: длительность OGG не посчиталась: %s", e)
+        return 0
+
+
 def to_ogg(x: np.ndarray, bitrate: int = 48000) -> bytes:
     """float32 48 кГц моно → OGG/Opus (голосовое Telegram)."""
     import av

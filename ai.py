@@ -3192,6 +3192,38 @@ CALLER_VOICES = {
     "yandex": {"f": ["alena", "jane"], "m": ["zahar", "filipp"]},
     "gpt": {"f": ["shimmer", "coral"], "m": ["echo", "verse"]},
 }
+# Формат «диктофон» (владелец 08.11: «диктофон — голос автора»): запись говорит сам автор — свой голос по полу и
+# возрасту (роль "author_<m|f>_<young|mid|old>"); письма и дневники читает ведущий, как раньше. ElevenLabs: сначала
+# русские голоса из библиотеки владельца (Nikolay, Igor), не пустило — готовые.
+AUTHOR_VOICES = {
+    "eleven": {("m", "young"): ["TX3LPaxmHKxFdv7VOQHJ", "IKne3meq5aSn9XLyUdCD", "bIHbv24MWmeRgasZH58o"],
+               ("m", "mid"): ["3EuKHIEZbSzrHGNmdYsx", "rUOpAdbAl56KxO00wR5D", "iP95p4xoKVk53GoZ742B",
+                              "cjVigY5qzO86Huf0OWal"],
+               ("m", "old"): ["pqHfZKP75CvOlQylNhV4", "JBFqnCBsd6RMkjVDRZzb"],
+               ("f", "young"): ["cgSgspJ2msm6clMCkdW9", "FGY2WhTYpPnrIDTdsKH5", "EXAVITQu4vr4xnSDxMaL"],
+               ("f", "mid"): ["pFZP5JQG7iQjIQuC4Bku", "hpp4J3VqNfWAUOO0d1Us", "XrExE9yKIg1WjnnlVkGX"],
+               ("f", "old"): ["XrExE9yKIg1WjnnlVkGX", "pFZP5JQG7iQjIQuC4Bku"]},
+    "yandex": {"m": ["filipp", "zahar", "ermil"], "f": ["alena", "jane", "omazh"]},
+    "gpt": {"m": ["echo", "verse", "ash"], "f": ["shimmer", "coral", "sage"]},
+}
+AUTHOR_SPEAK = (
+    "Ты — актёр озвучки. Произнеси текст пользователя ДОСЛОВНО, по-русски: ты обычный человек и наговариваешь это на "
+    "диктофон, один, ночью. Говори живо и неровно: сбиваешься, где страшно — тише и быстрее, где вспоминаешь — "
+    "медленнее. Не играй на публику. Ничего не добавляй, не комментируй и не отвечай на текст."
+)
+
+
+def author_role(gender: str, age: int) -> str:
+    return f"author_{'f' if gender == 'f' else 'm'}_{'young' if age < 30 else 'mid' if age < 50 else 'old'}"
+
+
+def _author_voices(service: str, role: str) -> list[str]:
+    _, g, grp = (role.split("_") + ["m", "mid"])[:3]
+    if service == "eleven":
+        return list(AUTHOR_VOICES["eleven"].get((g, grp)) or AUTHOR_VOICES["eleven"][(g, "mid")])
+    return list(AUTHOR_VOICES[service][g])
+
+
 CALL_SPEAK = (
     "Ты — актёр озвучки. Произнеси текст пользователя ДОСЛОВНО, по-русски: ты обычный человек, дозвонился в ночной "
     "радиоэфир и рассказываешь, что с тобой было. Говори живо и неровно, как по телефону: волнуешься, торопишься, "
@@ -3219,6 +3251,15 @@ def _voices(horror: bool) -> list:
     async def eleven(text: str, role: str) -> bytes:  # пометки интонации — только ElevenLabs v3/v4
         if role.startswith("call"):
             return await eleven_speak(text, horror=True, voice=caller("eleven", role, eleven_voice_id()))
+        if role.startswith("author"):  # запись с диктофона — голосом автора; голос не пустило — следующий
+            if ("eleven", role) in picked:
+                return await eleven_speak(text, horror=True, voice=picked[("eleven", role)], timestamps=True)
+            for vid in [v for v in _author_voices("eleven", role) if v != eleven_voice_id()]:
+                pcm = await eleven_speak(text, horror=True, voice=vid, timestamps=True)
+                if pcm or _eleven_code[0] in _ELEVEN_FINAL or eleven_geo_blocked():
+                    picked[("eleven", role)] = vid
+                    return pcm
+            return b""
         return await eleven_speak(text, horror=horror, speed=HOST_SPEED if horror and role == "host" else None,
                                   timestamps=role == "letter")
 
@@ -3233,7 +3274,10 @@ def _voices(horror: bool) -> list:
                 cur = f"{cur}\n\n{para}".strip()
         parts.append(cur)
         out = []
-        cv = caller("yandex", role, yandex_voice()) if role.startswith("call") else None
+        cv = (caller("yandex", role, yandex_voice()) if role.startswith("call") else
+              picked.setdefault(("yandex", role), random.choice([v for v in _author_voices("yandex", role)
+                                                                 if v != yandex_voice()] or ["filipp"]))
+              if role.startswith("author") else None)
         for part in parts:
             pcm = await yandex_speak(part, horror=horror and not cv, host=host or bool(cv), voice=cv)
             if not pcm:
@@ -3245,6 +3289,10 @@ def _voices(horror: bool) -> list:
         async def say(text: str, role: str) -> bytes:  # ведущий бодрый, письмо жуткое, звонящий — своим голосом
             if role.startswith("call"):
                 return await _speak_long(strip_tags(text), CALL_SPEAK, caller("gpt", role, v or ""), model)
+            if role.startswith("author"):
+                av = picked.setdefault(("gpt", role), random.choice([x for x in _author_voices("gpt", role)
+                                                                     if x != v] or ["echo"]))
+                return await _speak_long(strip_tags(text), AUTHOR_SPEAK, av, model)
             return await _speak_long(strip_tags(text), HOST_SPEAK if role == "host" else HORROR_SPEAK if horror else
                                      NIGHT_SPEAK, v, model)
         return say
@@ -3304,7 +3352,7 @@ async def narrate_all(texts: list[str], hosts: list, horror: bool = False, progr
             if not pcm and not (name == "ElevenLabs" and _eleven_code[0] in _ELEVEN_FINAL):
                 logger.info("narrate: %s — кусок %d ещё раз тем же голосом", name, i)  # не менять голос из-за сбоя
                 pcm = _checked(name, to_pcm24(await say(text, role)), strip_tags(text))
-            if pcm and role == "letter" and name == "ElevenLabs":
+            if pcm and (role == "letter" or role.startswith("author")) and name == "ElevenLabs":
                 letter_alignment[0] = eleven_alignment[0]
             if not pcm:
                 break
@@ -3630,11 +3678,12 @@ HORROR_KINDS = {
 # (ключ, как назвать в эфире и в подписи, значок, как писать, вес)
 HORROR_FORMATS = [
     ("письмо", "письмо", "✉️", "письмо на почту эфира: начинается со слова «Здравствуйте.»", 4),
-    ("диктофон", "расшифровка диктофона", "📼",
-     "записи с диктофона, который нашли (где — скажет ведущий): автор наговаривает их в разные дни, каждая "
-     "начинается с даты и времени словами («Запись. Двенадцатое октября, ночь.»), речь живая, разговорная, с "
-     "оговорками; последняя запись — в самую страшную ночь; развязку (что выяснилось потом) добавляет в конце "
-     "короткой припиской тот, кто нашёл диктофон («Приписка от того, кто прислал: …»)", 2),
+    ("диктофон", "запись с диктофона", "📼",
+     "записи с диктофона, который нашли (где — скажет ведущий); в эфир идёт сама запись голосом автора, ведущий "
+     "её только включает. Автор наговаривает записи в разные дни, каждая начинается с даты и времени словами "
+     "(«Запись. Двенадцатое октября, ночь.»), речь живая, разговорная, с оговорками и паузами, как говорят в "
+     "диктофон; последняя запись — в самую страшную ночь; развязку (что выяснилось потом) пишет ОТДЕЛЬНЫМ "
+     "последним абзацем тот, кто нашёл диктофон, — абзац начинается словом «Приписка» (его прочтёт ведущий)", 2),
     ("дневник", "страницы дневника", "📓",
      "записи в заметках телефона или в тетради по дням, с датами словами («Четырнадцатое октября.»), коротко и "
      "честно, как для себя; развязку — припиской того, кто прислал", 2),
@@ -3742,6 +3791,7 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
     g, cg = _random.choice("mf"), _random.choice("mf")
     author = (f"{_random.choice(AUTHOR_NAMES[g])}, {_random.randint(19, 52)}, {_random.choice(AUTHOR_JOBS)} "
               f"({'он' if g == 'm' else 'она'})")
+    age = int(re.search(r", (\d+),", author).group(1))
     caller = _random.choice([n for n in AUTHOR_NAMES[cg] if n not in author])
     place_facts = await _place_facts(place if not listener else f"{place}; {marks[0]}")
     route = (f"Маршрут автора по городу: живёт — {place}; по ходу истории бывает — {marks[0]}, {marks[1]}. "
@@ -3898,7 +3948,8 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
                              "host_in": call_in, "text": call_text, "host_back": call_back or "Ладно… Я дочитаю.",
                              "after": call_after} if call_text and call_in else None,
                     "sfx": sfx[:3], "music": scrub(str(data.get("music", "")).strip())[:400],
-                    "kind": kind if not listener else "слушатель", "format": fkey, "motifs": motif_list}
+                    "kind": kind if not listener else "слушатель", "format": fkey, "motifs": motif_list,
+                    "author": {"gender": g, "age": age}}
         if not paras:  # пустой или битый ответ — ещё раз, если попытки остались
             continue
         if banned:
@@ -3908,7 +3959,7 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
         user += ("\n\nПрошлый вариант задел запретную тему (война, мемориалы, теракты, самоубийство, настоящие "
                  "преступления). Другая история.")
     return {"title": "", "subject": "", "premise": "", "paragraphs": [], "intro": "", "outro": "", "call": None,
-            "sfx": [], "music": "", "kind": "", "format": "письмо", "motifs": []}
+            "sfx": [], "music": "", "kind": "", "format": "письмо", "motifs": [], "author": {"gender": "m", "age": 30}}
 
 
 NIGHT_SYSTEM = (

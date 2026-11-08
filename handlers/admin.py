@@ -329,7 +329,8 @@ async def _eleven_samples(message: Message) -> None:
         mark = " ✅ (сейчас)" if key == ai.eleven_voice() else ""
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"Выбрать: {name.split(' - ')[0]}",
                                                                          callback_data=f"ev:{key}")]])
-        await message.answer_voice(BufferedInputFile(ogg, f"{key}.ogg"), caption=f"🎙 {name}{mark}", reply_markup=kb)
+        await message.answer_voice(BufferedInputFile(ogg, f"{key}.ogg"), caption=f"🎙 {name}{mark}", reply_markup=kb,
+                                   duration=radio.ogg_secs(ogg) or None)
 
 
 @router.callback_query(F.data.startswith("ev:"))
@@ -397,7 +398,10 @@ async def _set_yandex(message: Message, key: str, db: Database) -> None:
         mark = " ✅ (сейчас)" if voice == ai.yandex_voice() else ""
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"Выбрать: {name}",
                                                                          callback_data=f"yv:{voice}")]])
-        await message.answer_voice(BufferedInputFile(ogg, f"{voice}.ogg"), caption=f"🎙 {name}{mark}", reply_markup=kb)
+        from radio import ogg_secs
+
+        await message.answer_voice(BufferedInputFile(ogg, f"{voice}.ogg"), caption=f"🎙 {name}{mark}", reply_markup=kb,
+                                   duration=ogg_secs(ogg) or None)
 
 
 @router.callback_query(F.data.startswith("yv:"))

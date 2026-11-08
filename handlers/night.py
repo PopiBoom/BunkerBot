@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import random
+import re
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -260,7 +261,16 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
                                    f"{ai.HORROR_SIGNOFF}")
         intro, outro = " ".join(intro.split()), " ".join(outro.split())
         call = story.get("call")
-        body = list(story["paragraphs"])
+        letter_paras = list(story["paragraphs"])
+        fmt = story.get("format", "письмо")
+        if fmt == "диктофон":  # запись говорит сам автор; приписку того, кто прислал, читает ведущий
+            ps = next((i for i in range(len(letter_paras) - 1, 0, -1)
+                       if ai.strip_tags(letter_paras[i]).lstrip().lower().startswith("приписка")), None)
+            if ps is not None:
+                note = ai.strip_tags(letter_paras.pop(ps)).strip()
+                note = re.sub(r"^приписка[^:.—-]*[:.—-]\s*", "", note, flags=re.IGNORECASE)
+                outro = f"Запись на этом кончается. И приписка от того, кто прислал: {note} {outro}"
+        body = list(letter_paras)
         if call:  # в тексте черновика звонок — после того абзаца, где он прозвучит
             key = ai.strip_tags(call["after"]).lower()[-25:]
             at = next((i for i, p in enumerate(body) if key and key in ai.strip_tags(p).lower()), len(body) // 2)
@@ -270,8 +280,11 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
         # кусками (ведущий прерывается, звонящий, ведущий возвращается), radio.studio вклеивает их в паузу письма.
         # Владелец раньше: «история прерывается посередине» — письмо двумя кусками начиналось заново другим тоном,
         # поэтому само письмо — одним куском.
-        chunks = [intro, "\n\n".join(story["paragraphs"]), outro]
-        styles, roles = ["host", "letter", "host"], ["host", "letter", "host"]
+        chunks = [intro, "\n\n".join(letter_paras), outro]
+        styles = ["host", "letter", "host"]
+        author = story.get("author") or {}
+        roles = ["host", ai.author_role(author.get("gender", "m"), int(author.get("age") or 30))
+                 if fmt == "диктофон" else "letter", "host"]
         if call:
             chunks += [call["host_in"], call["text"], call["host_back"]]
             roles += ["host", f"call_{call['gender']}", "host"]
@@ -336,10 +349,11 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
     else:       # ночной эфир — «сквозь приёмник», как было
         mix = await asyncio.to_thread(radio.broadcast, voice, ai.SPEAK_RATE, cond["rain"], int(time.time()))
     ogg = await asyncio.to_thread(radio.to_ogg, mix)
+    secs = max(1, int(round(len(mix) / radio.SR)))
     logger.info("ночной эфир №%s%s: «%s», %.0f сек, голос %s", n, " (страшная история)" if horror else "", topic,
                 len(mix) / radio.SR, who or "?")
     return {"ogg": ogg, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic, "voice": who,
-            "letter": (letter or {}).get("id")}
+            "letter": (letter or {}).get("id"), "secs": secs}
 
 
 def _kb() -> InlineKeyboardMarkup:
@@ -394,11 +408,13 @@ async def _send_draft(bot: Bot, db: Database, chat_id: int, horror: bool, progre
     # какой голос читал (и кто до него не справился) — видно только в черновике, в канал не идёт
     who = f"<i>Голос: {html.escape(ep.get('voice', '')[:150])}</i>\n" if ep.get("voice") else ""
     msg = await bot.send_voice(chat_id, BufferedInputFile(ep["ogg"], "night.ogg"), reply_markup=_kb(),
+                               duration=ep.get("secs") or None,
                                caption=f"{ep['caption']}\n\n{who}<i>Черновик. Текст:</i>\n"
                                        f"<blockquote expandable>{html.escape(text[:680])}</blockquote>")
     await db.set_setting(DRAFT_KEY, json.dumps({"file_id": msg.voice.file_id, "caption": ep["caption"],
                                                 "n": ep["n"], "msg": msg.message_id, "chat": chat_id,
-                                                "horror": horror, "letter": ep.get("letter")}, ensure_ascii=False))
+                                                "horror": horror, "letter": ep.get("letter"),
+                                                "secs": ep.get("secs")}, ensure_ascii=False))
     return True
 
 
@@ -509,7 +525,8 @@ async def cb_night(call: CallbackQuery, bot: Bot, db: Database, config: Config) 
         if not channel:
             await call.answer("Не нашёл канал.", show_alert=True)
             return
-        sent = await bot.send_voice(channel, draft["file_id"], caption=draft["caption"])
+        sent = await bot.send_voice(channel, draft["file_id"], caption=draft["caption"],
+                                    duration=draft.get("secs") or None)
         await mark_own(db, sent.message_id)
         await db.set_setting(HORROR_COUNT_KEY if draft.get("horror") else COUNT_KEY, str(draft["n"]))
         if draft.get("horror"):
