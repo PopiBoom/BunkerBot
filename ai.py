@@ -3110,11 +3110,33 @@ async def voice_tags(text: str) -> str:
     return text
 
 
+# Кавычек в голосовом не слышно (владелец 08.11: «в глс он тоже повторяет прошлые сообщения, как в тексте, чтобы
+# заострить внимание? в глс нельзя кавычки поставить»): чужие слова в «ёлочках» бот передразнивает, как люди в
+# голосовых, — пометка QUOTE_TAG перед цитатой, после неё — возврат к своему голосу UNQUOTE_TAG. Одно слово в кавычках
+# (название, «норм») — не цитата, не трогаем.
+QUOTE_TAG = "[mockingly imitating, whiny voice]"
+UNQUOTE_TAG = "[normal voice]"
+_QUOTE = re.compile(r"«([^«»]{3,240})»|„([^„“]{3,240})“|\"([^\"]{3,240})\"")
+
+
+def voice_quotes(text: str) -> str:
+    """Цитаты в реплике — передразнить голосом (кавычки остаются: ElevenLabs по ним делает паузу)."""
+    def sub(m: re.Match) -> str:
+        q = next(g for g in m.groups() if g is not None)
+        if len(re.findall(r"\w+", q)) < 2:
+            return m.group(0)
+        rest = m.string[m.end():]
+        back = f" {UNQUOTE_TAG}" if re.search(r"\w", strip_tags(rest)) else ""
+        return f" {QUOTE_TAG} «{q.strip()}»{back} "
+    out = _QUOTE.sub(sub, text or "")
+    return re.sub(r"[ \t]{2,}", " ", re.sub(r"[ \t]+([,.!?…»])", r"\1", out)).strip()
+
+
 async def roast_speech(text: str) -> bytes:
     """Реплика Пиздюка голосом: PCM 16 бит 24 кГц или b"" (нет ключа ElevenLabs, регион, сбой)."""
     if not eleven_key() or eleven_geo_blocked() or not text.strip():
         return b""
-    tagged = await voice_tags(text)
+    tagged = voice_quotes(await voice_tags(text))
     for vid in roast_voices():
         pcm = await eleven_speak(tagged, horror=True, voice=vid, speed=1.05)
         if pcm:
