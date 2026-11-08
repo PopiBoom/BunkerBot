@@ -144,8 +144,13 @@ async def _set_eleven(message: Message, key: str, db: Database) -> None:
         pass
     if not key:
         await message.answer("🔑 <b>ElevenLabs</b> - живой голос для ночного эфира и страшных историй.\n\n"
-                             "<code>/setkey eleven ключ</code> - сохранить, <code>/setkey eleven off</code> - убрать.\n"
-                             f"Сейчас: {'есть ✅' if ai.eleven_key() else 'нет (голос запасной, gpt-audio)'}.")
+                             "<code>/setkey eleven ключ</code> - сохранить, <code>/setkey eleven off</code> - убрать, "
+                             "<code>/setkey eleven голоса</code> - прослушать и выбрать голос рубрики.\n"
+                             f"Сейчас: {'есть ✅' if ai.eleven_key() else 'нет (голос запасной)'}"
+                             f", голос рубрики - {ai.ELEVEN_VOICES[ai.eleven_voice()][1]}.")
+        return
+    if key.lower() in ("голоса", "голос", "voices"):
+        await _eleven_samples(message)
         return
     if key.lower() in ("off", "удалить", "-"):
         await db.set_setting("eleven_key", "")
@@ -281,6 +286,52 @@ async def cmd_ip(message: Message, config: Config) -> None:
         f"Прокси: {__import__('netproxy').mask(config.proxy) if config.proxy else 'нет'}\n"
         f"Telegram: {'через прокси' if config.proxy else 'напрямую'}\n"
         f"Claude, голоса и остальное: {'через прокси' if via_all else 'напрямую'}")
+
+
+ELEVEN_SAMPLE = ("[excited] Хей, всем привет, ребята! Это радио Волгограда! [laughs] [whispers] А теперь... письмо. "
+                 "[nervous] Здравствуйте. Вчера в моей квартире появилась дверь.")
+
+
+async def _eleven_samples(message: Message) -> None:
+    """Образцы голосов ElevenLabs v3 (≈150 знаков каждый) с кнопкой «Выбрать» — голос страшной рубрики."""
+    import radio
+
+    import ai
+
+    if not ai.eleven_key():
+        await message.answer("Сначала ключ: <code>/setkey eleven ключ</code>.")
+        return
+    await message.answer("🎙 Записываю образцы голосов - секунд двадцать…")
+    for key, (vid, name) in ai.ELEVEN_VOICES.items():
+        pcm = await ai.eleven_speak(ELEVEN_SAMPLE, horror=True, voice=vid)
+        if not pcm:
+            continue
+        ogg = await asyncio.to_thread(radio.to_ogg, radio._resample(pcm, ai.SPEAK_RATE))
+        mark = " ✅ (сейчас)" if key == ai.eleven_voice() else ""
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"Выбрать: {name.split(' - ')[0]}",
+                                                                         callback_data=f"ev:{key}")]])
+        await message.answer_voice(BufferedInputFile(ogg, f"{key}.ogg"), caption=f"🎙 {name}{mark}", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("ev:"))
+async def cb_eleven_voice(call: CallbackQuery, db: Database, config: Config) -> None:
+    import ai
+
+    if not _is_admin(call.from_user.id, config):
+        await call.answer("Только админ.", show_alert=True)
+        return
+    key = (call.data or "").split(":", 1)[1]
+    if key not in ai.ELEVEN_VOICES:
+        await call.answer()
+        return
+    await db.set_setting("eleven_voice", key)
+    ai.set_eleven_voice(key)
+    name = ai.ELEVEN_VOICES[key][1].split(" - ")[0]
+    await call.answer(f"Голос рубрики: {name}")
+    try:
+        await call.message.answer(f"✅ Голос «Писем Волгограда» - {name}. Проверь: /horror")
+    except Exception:
+        pass
 
 
 YANDEX_SAMPLE = "Сейчас три часа сорок минут. На почту эфира пришло письмо. Читаю без изменений."

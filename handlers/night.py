@@ -237,7 +237,7 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop) -> di
                                    "проверьте, закрыта ли у вас дверь. Всем до новых встреч, с вами было радио "
                                    "Волгограда!")
         intro, outro = " ".join(intro.split()), " ".join(outro.split())
-        paragraphs = [intro] + story["paragraphs"] + [outro]  # для текста черновика
+        paragraphs = [ai.strip_tags(p) for p in [intro] + story["paragraphs"] + [outro]]  # текст черновика — без пометок
         # Озвучка крупными кусками (владелец: «однотонно и скучно» — каждый абзац отдельно звучал как диктор с
         # нуля): вступление, письмо в две части (между ними — сбой эфира), концовка.
         letter = story["paragraphs"]

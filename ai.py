@@ -2451,6 +2451,35 @@ def eleven_geo_blocked() -> bool:
     return time.time() < _eleven_geo_until
 
 
+# Страшная рубрика — ElevenLabs v3: понимает пометки интонации в тексте ([whispers], [laughs], [excited]…) и звучит
+# живее всех (владелец 08.11 вернулся к ElevenLabs, когда сервер стал ходить через прокси). Не принята — v2 без пометок.
+ELEVEN_HORROR_MODEL = os.getenv("ELEVEN_HORROR_MODEL", "").strip() or "eleven_v3"
+ELEVEN_VOICES = {  # готовые голоса ElevenLabs (доступны любому ключу): ключ -> (voice_id, имя)
+    "brian": ("nPczCjzI2devNBz1zQrb", "Brian - низкий, рассказчик"),
+    "callum": ("N2lVS1w4EtoT3dr4eOWO", "Callum - хриплый, с хитрецой"),
+    "roger": ("CwhRBWXzGAHq8TQ4Fs17", "Roger - расслабленный, свой парень"),
+    "bill": ("pqHfZKP75CvOlQylNhV4", "Bill - старый, документальный"),
+}
+_eleven_voice = [""]
+_TAG = re.compile(r"[ \t]*\[[A-Za-z][A-Za-z ,'-]{0,30}\][ \t]*")
+
+
+def strip_tags(text: str) -> str:
+    """Пометки интонации для ElevenLabs v3 ([whispers], [laughs]) — другим голосам и в тексте черновика не нужны.
+    Абзацы (переносы строк) сохраняются."""
+    out = _TAG.sub(" ", text or "")
+    return "\n".join(re.sub(r"[ \t]{2,}", " ", line).strip() for line in out.split("\n")).strip()
+
+
+def set_eleven_voice(key: str) -> None:
+    _eleven_voice[0] = key if key in ELEVEN_VOICES else ""
+
+
+def eleven_voice() -> str:
+    """Ключ выбранного голоса (/setkey eleven голоса), по умолчанию Brian."""
+    return _eleven_voice[0] or "brian"
+
+
 def set_eleven_key(key: str) -> None:
     global _eleven_key
     _eleven_key = (key or "").strip()
@@ -2510,18 +2539,34 @@ def is_noise(pcm: bytes, rate: int = SPEAK_RATE) -> bool:
     return bool(vals) and float(np.median(vals)) > 0.6
 
 
-async def eleven_speak(text: str, horror: bool = False, voice: str | None = None, key: str | None = None) -> bytes:
-    """ElevenLabs: PCM 16 бит, 24 кГц, моно. b"" — нет ключа или сбой."""
+async def eleven_speak(text: str, horror: bool = False, voice: str | None = None, key: str | None = None,
+                       model: str | None = None) -> bytes:
+    """ElevenLabs: PCM 16 бит, 24 кГц, моно. b"" — нет ключа или сбой. В страшной рубрике — модель v3 с пометками
+    интонации в тексте; v3 не принята (тариф, сбой) — тот же текст без пометок моделью v2."""
+    if horror and not model:
+        pcm = await _eleven_once(text, True, voice, key, ELEVEN_HORROR_MODEL)
+        if pcm or eleven_geo_blocked():
+            return pcm
+        model = ELEVEN_MODEL
+    return await _eleven_once(text if (model or ELEVEN_MODEL) == ELEVEN_HORROR_MODEL else strip_tags(text), horror,
+                              voice, key, model or ELEVEN_MODEL)
+
+
+async def _eleven_once(text: str, horror: bool, voice: str | None, key: str | None, model: str) -> bytes:
     import aiohttp
 
     global _eleven_geo_until
     key = key or eleven_key()
-    if not key or not text.strip():
+    if not key or not strip_tags(text):
         return b""
-    body = {"text": text, "model_id": ELEVEN_MODEL,
-            "voice_settings": {"stability": 0.35 if horror else 0.5, "similarity_boost": 0.8,
-                               "style": 0.45 if horror else 0.2, "use_speaker_boost": True}}
-    url = f"{ELEVEN_URL}/text-to-speech/{voice or ELEVEN_VOICE}?output_format=pcm_24000"
+    if model == ELEVEN_HORROR_MODEL and model.startswith("eleven_v3"):
+        settings = {"stability": 0.5}  # у v3 живость — от пометок в тексте; 0.5 — «естественно», без срывов
+    else:
+        settings = {"stability": 0.35 if horror else 0.5, "similarity_boost": 0.8,
+                    "style": 0.45 if horror else 0.2, "use_speaker_boost": True}
+    body = {"text": text, "model_id": model, "voice_settings": settings}
+    vid = voice or (ELEVEN_VOICES[eleven_voice()][0] if horror else ELEVEN_VOICE)
+    url = f"{ELEVEN_URL}/text-to-speech/{vid}?output_format=pcm_24000"
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120), trust_env=True) as s:
             async with s.post(url, json=body, headers={"xi-api-key": key}, allow_redirects=False) as r:
@@ -2547,7 +2592,8 @@ async def eleven_speak(text: str, horror: bool = False, voice: str | None = None
                     gist = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", m.group(1) if m else page)).strip()[:200]
                     logger.warning("eleven: вместо звука %s (%d байт) с %s: %s", ctype, len(data), r.url.host, gist)
                     return b""
-                logger.info("eleven: %s, %d байт (≈%.1f с), начало %s", ctype, len(data), len(data) / 48000, data[:4])
+                logger.info("eleven %s: %s, %d байт (≈%.1f с), начало %s", model, ctype, len(data), len(data) / 48000,
+                            data[:4])
                 return data if "pcm" in ctype else to_pcm24(data)  # сказали «pcm» — по первым байтам не гадаем
     except Exception as e:
         logger.warning("eleven failed: %s", e)
@@ -2657,8 +2703,9 @@ async def narrate(text: str, horror: bool = False, host: bool = False) -> bytes:
     if horror:  # «ash» читал ровно, как диктор — у рубрики самый живой голос, не принят — прежний
         voice = HORROR_VOICE
     tries = []
+    tagged, text = text, strip_tags(text)  # пометки интонации — только ElevenLabs v3
     if eleven_key() and not eleven_geo_blocked():  # регион не пускает — сразу запасной голос, без лишних запросов
-        tries.append(("ElevenLabs", lambda: eleven_speak(text, horror=horror)))
+        tries.append(("ElevenLabs", lambda: eleven_speak(tagged, horror=horror)))
     if yandex_key():
         tries.append((f"Яндекс ({yandex_voice()})", lambda: yandex_speak(text, horror=horror, host=host)))
     # кусок у gpt-audio — секунд 10-40; 90 с на попытку, чтобы зависший сервис не растягивал историю на полчаса
@@ -2812,6 +2859,10 @@ async def horror_story(avoid: list[str], facts: str = "") -> dict:
         "автору, — так, чтобы стало не по себе), совет слушателю по этой истории (в духе «а вы — проверьте дверь») и "
         "бодрое прощание до новых встреч; glitches — номер (с нуля) одного абзаца письма, после которого в эфире "
         "сбой (самый жуткий момент); title — 2-4 слова.\n"
+        "Голос живой и понимает пометки интонации: в host_intro, letter и host_outro ставь их перед фразой в "
+        "квадратных скобках по-английски (вслух их не читают, по ним меняется подача), 1-3 на абзац: ведущему — "
+        "[excited], [laughs], [chuckles], [mischievously], [cheerful]; письму — [nervous], [whispers], [sighs], "
+        "[scared], [pause]; совет слушателю в конце — [serious] или [whispers], прощание — [cheerful].\n"
         'Верни СТРОГО JSON: {"premise": "", "escalation": ["", "", ""], "payoff": "", "subject": "", '
         '"host_intro": "", "letter": ["Здравствуйте. ...", "..."], "host_outro": "", "glitches": [3], "title": ""}'
     )
@@ -2838,7 +2889,7 @@ async def horror_story(avoid: list[str], facts: str = "") -> dict:
         intro = _no_memento(scrub(str(data.get("host_intro", "")).strip()))
         outro = _no_memento(scrub(str(data.get("host_outro", "") or data.get("outro", "")).strip()))
         whole = " ".join(paras) + " " + intro + " " + outro + " " + str(data.get("title", ""))
-        words = len(" ".join(paras).split())
+        words = len(strip_tags(" ".join(paras)).split())  # пометки [whispers] — не слова
         clean = bool(paras) and not _HORROR_BAN.search(whole)
         if clean and words > HORROR_MAX_WORDS and not asked_shorter:
             asked_shorter = True
