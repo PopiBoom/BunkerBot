@@ -168,7 +168,8 @@ async def _complete(system: str, user: str, max_tokens: int = 4000, fast: bool =
 
 
 # Поиск в интернете (серверный инструмент Claude): страшным историям — настоящие детали мест и городские легенды
-WEB_SEARCH = {"type": "web_search_20260209", "name": "web_search", "max_uses": 2}  # 3 поиска раздували вход до $0.47
+# max_uses 1: два поиска раздували вход до 70 тыс. токенов ($0.39 за историю), три — до 83 тыс. ($0.47)
+WEB_SEARCH = {"type": "web_search_20260209", "name": "web_search", "max_uses": 1}
 
 
 # ---------- генерация партии ----------
@@ -2606,10 +2607,27 @@ async def eleven_speak(text: str, horror: bool = False, voice: str | None = None
                               voice, key, model or ELEVEN_MODEL)
 
 
+eleven_error = [""]  # почему ElevenLabs не озвучил последний кусок — пишем владельцу в черновик эфира
+_ELEVEN_WHY = {"quota_exceeded": "кончились символы на тарифе", "paid_plan_required": "нужен платный тариф",
+               "invalid_api_key": "ключ не принят", "missing_permissions": "у ключа нет прав на озвучку",
+               "too_many_concurrent_requests": "занят другими запросами", "system_busy": "сервис перегружен",
+               "detected_unusual_activity": "бесплатный доступ заблокирован (необычная активность)"}
+
+
+def _eleven_reason(status: int, body: str) -> str:
+    try:
+        detail = json.loads(body).get("detail") or {}
+    except (ValueError, AttributeError):
+        detail = {}
+    code = (detail.get("status") or detail.get("code") or "") if isinstance(detail, dict) else ""
+    return _ELEVEN_WHY.get(code, f"ошибка {status}" + (f" {code}" if code else ""))
+
+
 async def _eleven_once(text: str, horror: bool, voice: str | None, key: str | None, model: str) -> bytes:
     import aiohttp
 
     global _eleven_geo_until
+    eleven_error[0] = ""
     key = key or eleven_key()
     if not key or not strip_tags(text):
         return b""
@@ -2626,6 +2644,7 @@ async def _eleven_once(text: str, horror: bool, voice: str | None, key: str | No
             async with s.post(url, json=body, headers={"xi-api-key": key}, allow_redirects=False) as r:
                 if r.status in (301, 302, 303, 307, 308):
                     where = r.headers.get("location") or ""
+                    eleven_error[0] = "не пускает сервер по региону" if "geo-restriction" in where else "редирект"
                     if "geo-restriction" in where:
                         _eleven_geo_until = time.time() + ELEVEN_GEO_RETRY
                         logger.warning("eleven: ElevenLabs не пускает этот сервер по региону (%s) — голос запасной, "
@@ -2634,7 +2653,9 @@ async def _eleven_once(text: str, horror: bool, voice: str | None, key: str | No
                         logger.warning("eleven: редирект %s на %s", r.status, where)
                     return b""
                 if r.status != 200:
-                    logger.warning("eleven: %s: %s", r.status, (await r.text())[:300])
+                    err = await r.text()
+                    eleven_error[0] = _eleven_reason(r.status, err)
+                    logger.warning("eleven: %s (%s): %s", r.status, eleven_error[0], err[:300])
                     return b""
                 data = await r.read()
                 ctype = r.headers.get("content-type") or ""
@@ -2644,12 +2665,14 @@ async def _eleven_once(text: str, horror: bool, voice: str | None, key: str | No
                     page = data[:4000].decode("utf-8", "replace")
                     m = re.search(r"<title[^>]*>(.*?)</title>", page, re.IGNORECASE | re.DOTALL)
                     gist = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", m.group(1) if m else page)).strip()[:200]
+                    eleven_error[0] = f"вместо звука страница: {gist[:60]}"
                     logger.warning("eleven: вместо звука %s (%d байт) с %s: %s", ctype, len(data), r.url.host, gist)
                     return b""
                 logger.info("eleven %s: %s, %d байт (≈%.1f с), начало %s", model, ctype, len(data), len(data) / 48000,
                             data[:4])
                 return data if "pcm" in ctype else to_pcm24(data)  # сказали «pcm» — по первым байтам не гадаем
     except Exception as e:
+        eleven_error[0] = f"сбой связи: {type(e).__name__}"
         logger.warning("eleven failed: %s", e)
         return b""
 
@@ -2728,13 +2751,14 @@ async def eleven_quota(key: str) -> tuple[int, int] | None:
         return None
 
 
+# Письмо — чётко и доверительно, без игры в страх: «шёпот на жутком, замирай на многоточиях» давали
+# неразборчивое и рваное чтение (владелец 08.11: «прерывистая, неразборчивая»).
 HORROR_SPEAK = (
-    "Ты — актёр озвучки. Произнеси текст пользователя ДОСЛОВНО, по-русски, и СЫГРАЙ его: ты ведущий ночного радио, "
-    "который читает вслух письмо слушателя, и тебе самому от него не по себе. Начни почти обычным голосом, с лёгкой "
-    "ухмылкой, — и с каждым абзацем всё тише и напряжённее. Живые перепады: где страшно — замедляйся и переходи на "
-    "шёпот, на многоточиях замирай, на вопросах — с тревогой, прямую речь того, кто пугает, говори вкрадчиво и "
-    "медленно, последнюю фразу — едва слышно. Никакой ровной дикторской подачи и никаких завываний. Ничего не "
-    "добавляй и не отвечай на текст."
+    "Ты — актёр озвучки. Произнеси текст пользователя ДОСЛОВНО, по-русски: ты ведущий ночного радио и читаешь вслух "
+    "письмо слушателя. Читай чётко и доверительно, как рассказывают другу страшный случай, который правда был: живые "
+    "интонации, паузы на точках и между абзацами, где жутко — чуть медленнее и тише. Не играй страх, не дрожи "
+    "голосом, не завывай и не шепчи весь текст — только последнюю фразу тихо и медленно, но разборчиво. Ничего не "
+    "добавляй, не комментируй и не отвечай на текст."
 )
 
 
@@ -2744,72 +2768,142 @@ HOST_SPEAK = (
     "Ты — актёр озвучки, ведущий городского радио в прямом эфире. Произнеси текст пользователя ДОСЛОВНО, по-русски, "
     "но СЫГРАЙ его, а не прочитай: улыбка в голосе, энергия, живые перепады — ускоряйся на шутке, делай паузу перед "
     "названием рубрики и объявляй его с нажимом, смейся интонацией, говори по-свойски, как с друзьями. Никакой "
-    "дикторской ровности. Если есть совет или предупреждение слушателю — эту фразу вдруг тихо, медленно и "
-    "серьёзно, почти шёпотом, а прощание — снова бодро. Ничего не добавляй и не отвечай на текст."
+    "дикторской ровности. Если есть совет или предупреждение слушателю — эту фразу тише и серьёзно, но разборчиво, "
+    "а прощание — снова бодро. Ничего не добавляй, не комментируй и не отвечай на текст."
 )
+SPEAK_PART_SECS = 40  # gpt-audio длинный кусок (целое письмо ≈ 1.5 мин) читает частями по абзацам, ≈ 40 с каждая
+
+
+async def _speak_long(text: str, system: str, voice: str | None, model: str | None) -> bytes:
+    """gpt-audio: короткое — одним запросом, длинное — частями по абзацам с паузой 0.5 с. Часть не вышла — b""."""
+    if expected_secs(text) <= SPEAK_PART_SECS + 5:
+        return to_pcm24(await speak(text, system=system, voice=voice, timeout=90, model=model))
+    parts, cur = [], ""
+    for para in (p.strip() for p in text.split("\n") if p.strip()):
+        if cur and expected_secs(cur + " " + para) > SPEAK_PART_SECS:
+            parts.append(cur)
+            cur = para
+        else:
+            cur = f"{cur}\n\n{para}".strip()
+    parts.append(cur)
+    out = []
+    for part in parts:
+        pcm = to_pcm24(await speak(part, system=system, voice=voice, timeout=90, model=model))
+        if not pcm:
+            return b""
+        out.append(pcm)
+    return (b"\x00\x00" * int(0.5 * SPEAK_RATE)).join(out)
+
+
+def _voices(horror: bool) -> list:
+    """Голоса эфира по порядку: [(имя, async say(текст с пометками, ведущий?) -> PCM 16 бит 24 кГц)].
+    ElevenLabs → Яндекс SpeechKit → gpt-audio → gpt-audio-mini."""
+    voice = HORROR_VOICE if horror else (os.getenv("AI_NIGHT_VOICE", "").strip() or None)
+
+    async def eleven(text: str, host: bool) -> bytes:  # пометки интонации — только ElevenLabs v3
+        return await eleven_speak(text, horror=horror)
+
+    async def yandex(text: str, host: bool) -> bytes:
+        return await yandex_speak(strip_tags(text), horror=horror, host=host)
+
+    def gpt(v: str | None, model: str | None):
+        async def say(text: str, host: bool) -> bytes:  # ведущий бодрый, письмо жуткое
+            return await _speak_long(strip_tags(text), HOST_SPEAK if host else HORROR_SPEAK if horror else
+                                     NIGHT_SPEAK, v, model)
+        return say
+
+    out = []
+    if eleven_key() and not eleven_geo_blocked():  # регион не пускает — сразу запасной голос, без лишних запросов
+        out.append(("ElevenLabs", eleven))
+    if yandex_key():
+        out.append((f"Яндекс ({yandex_voice()})", yandex))
+    out.append((NIGHT_SPEAK_MODEL, gpt(voice, NIGHT_SPEAK_MODEL)))
+    if voice and voice != SPEAK_VOICE:  # новый голос не приняли — тот же сервис с прежним
+        out.append((f"{NIGHT_SPEAK_MODEL} ({SPEAK_VOICE})", gpt(SPEAK_VOICE, NIGHT_SPEAK_MODEL)))
+    out.append((SPEAK_MODEL, gpt(SPEAK_VOICE, None)))
+    return out
+
+
+def _checked(name: str, pcm: bytes, text: str) -> bytes:
+    """Шум вместо речи или звука мало для текста — b"" (берём следующий голос)."""
+    if not pcm:
+        return b""
+    if is_noise(pcm):
+        logger.warning("narrate: %s вернул шум вместо речи (%d байт, начало %s)", name, len(pcm), pcm[:4])
+        return b""
+    if _secs(pcm) < 0.35 * expected_secs(text):  # голоса почти нет — кусок потерялся
+        logger.warning("narrate: %s вернул %.1f с звука на текст ≈ %.1f с", name, _secs(pcm), expected_secs(text))
+        return b""
+    return pcm
 
 
 async def narrate(text: str, horror: bool = False, host: bool = False) -> bytes:
-    """Голос эфира: ElevenLabs → Яндекс SpeechKit → gpt-audio → gpt-audio-mini. PCM 16 бит, 24 кГц.
-    Шум вместо речи или звука мало для текста — следующий."""
-    system = HOST_SPEAK if host else HORROR_SPEAK if horror else NIGHT_SPEAK  # ведущий бодрый, письмо жуткое
-    voice = os.getenv("AI_NIGHT_VOICE", "").strip() or None
-    if horror:  # «ash» читал ровно, как диктор — у рубрики самый живой голос, не принят — прежний
-        voice = HORROR_VOICE
-    tries = []
-    tagged, text = text, strip_tags(text)  # пометки интонации — только ElevenLabs v3
-    if eleven_key() and not eleven_geo_blocked():  # регион не пускает — сразу запасной голос, без лишних запросов
-        tries.append(("ElevenLabs", lambda: eleven_speak(tagged, horror=horror)))
-    if yandex_key():
-        tries.append((f"Яндекс ({yandex_voice()})", lambda: yandex_speak(text, horror=horror, host=host)))
-    # кусок у gpt-audio — секунд 10-40; 90 с на попытку, чтобы зависший сервис не растягивал историю на полчаса
-    tries.append((NIGHT_SPEAK_MODEL, lambda: speak(text, system=system, voice=voice, timeout=90,
-                                                    model=NIGHT_SPEAK_MODEL)))
-    if voice and voice != SPEAK_VOICE:  # новый голос не приняли — тот же сервис с прежним
-        tries.append((f"{NIGHT_SPEAK_MODEL} ({SPEAK_VOICE})", lambda: speak(text, system=system, voice=SPEAK_VOICE,
-                                                                           timeout=90, model=NIGHT_SPEAK_MODEL)))
-    tries.append((SPEAK_MODEL, lambda: speak(text, system=system, voice=SPEAK_VOICE, timeout=90)))
-    for name, call in tries:
-        pcm = to_pcm24(await call())
-        if not pcm:
-            continue
-        if is_noise(pcm):
-            logger.warning("narrate: %s вернул шум вместо речи (%d байт, начало %s) — пробую следующий",
-                           name, len(pcm), pcm[:4])
-            continue
-        if _secs(pcm) < 0.35 * expected_secs(text):  # голоса почти нет — кусок потерялся
-            logger.warning("narrate: %s вернул %.1f с звука на текст ≈ %.1f с — пробую следующий",
-                           name, _secs(pcm), expected_secs(text))
-            continue
-        last_voice[0] = name
-        return pcm
+    """Один кусок эфира — первым голосом, который справился (весь эфир — narrate_all)."""
+    for name, say in _voices(horror):
+        pcm = _checked(name, to_pcm24(await say(text, host)), strip_tags(text))
+        if pcm:
+            last_voice[0] = name
+            return pcm
     return b""
 
 
-last_voice = [""]  # каким сервисом озвучен последний абзац эфира — для лога
+async def narrate_all(texts: list[str], hosts: list[bool], horror: bool = False, progress=None) -> list[bytes]:
+    """Весь эфир ОДНИМ голосом: кусок не вышел — весь эфир заново следующим сервисом. Раньше каждый кусок искал
+    голос сам: кончились символы ElevenLabs посреди выпуска — письмо дочитывал другой голос, будто ведущий перебил
+    историю. progress(i, всего, сервис) — для сообщения «Озвучиваю…». [] — не вышло ни у кого."""
+    troubles = []
+    for name, say in _voices(horror):
+        out = []
+        for i, (text, host) in enumerate(zip(texts, hosts, strict=True), 1):
+            if progress:
+                await progress(i, len(texts), name)
+            pcm = _checked(name, to_pcm24(await say(text, host)), strip_tags(text))
+            if not pcm:
+                break
+            out.append(pcm)
+        if len(out) == len(texts):
+            last_voice[0], voice_trouble[0] = name, "; ".join(troubles)
+            return out
+        why = (eleven_error[0] if name == "ElevenLabs" else "") or "не озвучил"
+        troubles.append(f"{name}: {why}" + (f" на куске {len(out) + 1} из {len(texts)}" if out else ""))
+        logger.warning("narrate: %s — %s (кусок %d из %d), весь эфир заново следующим голосом", name, why,
+                       len(out) + 1, len(texts))
+    last_voice[0], voice_trouble[0] = "", "; ".join(troubles)
+    return []
+
+
+last_voice = [""]     # каким сервисом озвучен последний эфир — для лога и черновика
+voice_trouble = [""]  # какие голоса до него не справились и почему («ElevenLabs: кончились символы на тарифе»)
 
 
 HORROR_RUBRIC = "Письма Волгограда"  # рубрика «радио Волгограда» (название дал владелец)
+# 08.11 владелец: «прерывистая, неразборчивая, как будто писал робот, нет никакой жути». Прошлый промпт просил
+# «короткие фразы, обрывы, многоточия» — выходили рубленые телеграммы («Тишина. Шаги. Ближе…»), а v3 на каждом
+# многоточии и пометке замирал. Теперь письмо пишет живой человек связной речью, а страх — от сюжета: мелочь →
+# объяснения кончаются → деталь из начала в конце оказывается страшнее, чем казалась.
 HORROR_SYSTEM = (
     "Ты делаешь выпуск рубрики «" + HORROR_RUBRIC + "» на «радио Волгограда». Ведущий — свой парень из Волгограда: "
     "бодро здоровается со слушателями, читает письмо, которое прислал «слушатель», и прощается; говорит по-свойски, "
-    "с юмором и лёгким матом. Письмо — совсем другое: страшная история от первого лица. Вымысел, который звучит как "
-    "правда: живой человек пишет ночью, сбивчиво, с точным местом, временем и мелочами быта; без мата и без юмора.\n"
-    "Что делает историю по-настоящему страшной:\n"
-    "— обычная жизнь, в которой одна деталь не так: не монстр в лоб, а то, что не сходится (лишняя кружка в "
-    "раковине, свет в окне пустой квартиры, твоё имя чужим голосом);\n"
-    "— угроза приближается по шагам: сначала далеко, потом у дома, потом внутри; каждый абзац ближе и хуже;\n"
-    "— он знает о тебе то, чего знать не может; никто не верит, помощи нет;\n"
-    "— одна конкретная мерзкая деталь, которую не забыть (без крови и ран);\n"
-    "— ничего не объясняй: кто он и зачем — не раскрывай;\n"
-    "— финал в настоящем времени, «прямо сейчас»: автор пишет, а оно уже рядом; последняя фраза — короткая, как "
-    "удар, и после неё не легче; в конце автор просит слушателя сделать что-то у себя прямо сейчас.\n"
+    "с юмором и лёгким матом. Письмо — совсем другое: страшная история от первого лица, без мата и без юмора. "
+    "Вымысел, который звучит как правда.\n"
+    "Кто пишет. Обычный человек, а не писатель: своя жизнь (работа, смены, соседи, магазин у дома, маршрутка), "
+    "пишет ночью, потому что страшно и больше некому рассказать. Пишет так, как рассказывал бы другу: связно, по "
+    "порядку, нормальными предложениями разной длины; бывает, сомневается или поправляет себя («не знаю, как "
+    "объяснить», «я сначала подумал, что…»). Не нагнетает словами — пугают факты и мелочи. Нельзя: рубленые "
+    "фразы-телеграммы подряд («Тишина. Шаги. Ближе.» — так пишет робот), больше двух многоточий на всё письмо, "
+    "литературщина и клише («кровь застыла», «мурашки», «леденящий», «сердце ушло в пятки», «и тут я понял», "
+    "«тьма», «я никогда не верил в такое»).\n"
+    "Как сделать по-настоящему страшно:\n"
+    "— начало — обычная жизнь и одна мелочь, которая не сходится; автор находит ей нормальное объяснение;\n"
+    "— мелочи повторяются и подбираются ближе: сначала далеко, потом у дома, потом внутри; объяснения кончаются;\n"
+    "— одна конкретная мерзкая деталь, которую не забыть (запах, звук, вещь), — без крови и ран;\n"
+    "— деталь из начала в конце оказывается страшнее, чем казалась: слушатель сам понимает, что это значило;\n"
+    "— ничего не объясняй: кто он и зачем — не раскрывай; никто не верит, помощи нет;\n"
+    "— финал — прямо сейчас: автор дописывает письмо, а оно уже рядом. Последняя фраза — короткая, законченная и "
+    "тихая, как удар; письмо не обрывается на полуслове.\n"
     "Можно: вымышленные маньяки и убийцы (без имён), пропавшие люди, найденные тела, преследование, кто-то в "
     "квартире; жуткие существа — свои, не из кино. Насилие — только последствиями и намёками (куртка в гаражах, "
     "мокрые следы, «её больше никто не видел»): никаких ран, пыток и расчленения.\n"
-    "Пиши коротко и просто, как говорят, — под живое чтение вслух: короткие фразы, обрывы, многоточия там, где голос "
-    "замирает, вопросы, прямая речь того, кто пугает. Без литературщины и клише («кровь застыла», «мурашки», "
-    "«леденящий», «сердце ушло в пятки», «и тут я понял»).\n"
     "Нельзя: настоящие преступления, настоящие маньяки и жертвы, реальные люди и имена, дети-жертвы, сексуальное "
     "насилие, война, Сталинград, Мамаев курган, мемориалы, теракты, политика, самоубийство. Не упоминай «Memento "
     "Mori». Без markdown."
@@ -2822,7 +2916,66 @@ def _no_memento(text: str) -> str:
     return _MEMENTO.sub("радио Волгограда", text or "")
 
 
-HORROR_MAX_WORDS = 230  # письмо длиннее — одна просьба «короче» (весь эфир — 2-2.5 мин, просьба владельца)
+HORROR_MAX_WORDS = 260  # письмо длиннее — одна просьба «короче» (весь эфир — 2-2.5 мин, просьба владельца)
+LETTER_TAGS_MAX = 3     # пометок интонации на всё письмо: v3 с пометкой на каждой фразе читал рвано
+LETTER_DOTS_MAX = 2     # многоточий на всё письмо: на каждом голос замирал — «прерывисто»
+_PAUSE_TAG = re.compile(r"[ \t]*\[(?:short |long |dramatic )?(?:pause|beat|silence)\][ \t]*", re.IGNORECASE)
+# Ведущий после письма досказывал новый сюжет («мы ответили автору — письмо вернулось»), и казалось, что история
+# оборвалась и он заговорил о другом (владелец 08.11). Такие фразы из концовки выкидываем.
+_OUTRO_PLOT = re.compile(r"ответ\w* (?:ему|ей|автору)|(?:ему|ей|автору) (?:ответ|написа)|написали (?:ему|ей)|"
+                         r"письм\w* (?:верну|не дош)|адрес\w* не существ|автор\w* (?:так и )?(?:не ответ|пропал|"
+                         r"больше не)|(?:он|она) (?:так и )?не ответил|на связь не вых", re.IGNORECASE)
+
+
+_DANGLING = re.compile(r"[\s,]+(?:и|а|но|или|что|как|когда|где|у|в|во|на|к|ко|с|со|за|под|по|из|от|до|о|об|"
+                       r"он|она|оно|они|я|мы|это|уже|ещё|еще|не)$", re.IGNORECASE)
+
+
+def _tidy_text(text: str) -> str:
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return re.sub(r"[ \t]+([.,!?…»])", r"\1", text).strip()
+
+
+def tidy_letter(paras: list[str]) -> list[str]:
+    """Письмо — под живое чтение: без [pause] (паузы — точки и абзацы); пометок интонации не больше LETTER_TAGS_MAX
+    на всё письмо (первые и последняя — обычно [whispers] перед финалом); многоточий не больше LETTER_DOTS_MAX
+    (лишние — точка или запятая); последняя фраза законченная — не «…» и не тире."""
+    paras = [_PAUSE_TAG.sub(" ", p).replace("...", "…") for p in paras]
+    marks = [(i, m.start(), m.end()) for i, p in enumerate(paras) for m in _TAG.finditer(p)]
+    if len(marks) > LETTER_TAGS_MAX:
+        keep = set(marks[:LETTER_TAGS_MAX - 1] + marks[-1:])
+        for i, a, b in sorted((m for m in marks if m not in keep), key=lambda m: (m[0], -m[1])):
+            paras[i] = paras[i][:a] + " " + paras[i][b:]  # с конца абзаца — позиции остальных не съезжают
+    seen = 0
+
+    def dot(m: re.Match) -> str:
+        nonlocal seen
+        seen += 1
+        if seen <= LETTER_DOTS_MAX:
+            return m.group(0)
+        nxt = m.string[m.end():].lstrip()
+        return "" if nxt[:1] in ("?", "!", ".", ",", "»", '"') else "." if not nxt or nxt[0].isupper() else ","
+
+    paras = [_tidy_text(re.sub("…", dot, p)) for p in paras]
+    paras = [p for p in paras if strip_tags(p)]
+    if paras:  # «Он стоит у двери и…» → «Он стоит у двери.» — письмо не обрывается на полуслове
+        last = paras[-1].rstrip(" —–-…")
+        for _ in range(3):  # «…и пишу, а он —» → «…и пишу»
+            last = _DANGLING.sub("", last).rstrip(" ,—–-…")
+        paras[-1] = last if last[-1:] in (".", "!", "?", "»", '"') else last + "."
+    return paras
+
+
+def tidy_outro(outro: str) -> str:
+    """Концовка ведущего — без продолжения истории (см. _OUTRO_PLOT); осталось мало — пусто (будет запасная)."""
+    outro = _tidy_text(_PAUSE_TAG.sub(" ", outro or ""))
+    parts = re.split(r"(?<=[.!?…])\s+", outro)
+    kept = [s for s in parts if not _OUTRO_PLOT.search(strip_tags(s))]
+    if len(kept) < len(parts):
+        logger.info("horror: ведущий досказывал сюжет — выкинул: %s",
+                    " ".join(s for s in parts if s not in kept)[:200])
+    out = " ".join(kept).strip()
+    return out if len(strip_tags(out).split()) >= 8 else ""
 _HORROR_BAN = re.compile(r"войн|сталинград|мамаев|мемориал|фашист|немецк|немц|блокад|теракт|солдат|самоубий|"
                          r"повесил(?:ся|ась|ись)|суицид", re.IGNORECASE)  # «повесил трубку» — можно, «повесился» — нет
 # Где история — выбирает КОД, без повторов последних мест (владелец 08.11: «почему всегда какая-то балка Мечётка?» —
@@ -2903,9 +3056,8 @@ HORROR_CREATURE_SHARE = 0.3    # про существо; остальное —
 
 
 async def horror_story(avoid: list[str], facts: str = "") -> dict:
-    """Письмо слушателя в ночной эфир: {"title", "subject", "premise", "paragraphs", "outro", "glitches"}.
-    Запретное (война, теракты…) — одна переделка, потом пусто. glitches — номера абзацев письма, после которых в
-    эфире сбой (radio вставит помехи)."""
+    """Выпуск «Писем Волгограда»: {"title", "subject", "premise", "intro", "paragraphs", "outro"} (paragraphs —
+    письмо, с пометками интонации для ElevenLabs v3). Запретное (война, теракты…) — одна переделка, потом пусто."""
     import random as _random
 
     roll = _random.random()
@@ -2919,28 +3071,30 @@ async def horror_story(avoid: list[str], facts: str = "") -> dict:
         "место естественно; других мест Волгограда не добавляй.\n"
         + (f"Уже были (не повторяй ни приём, ни сюжет): {'; '.join(avoid)}.\n" if avoid else "")
         + (f"Что сейчас в эфире (для ведущего; числа — словами): {facts}.\n" if facts else "")
-        + "Сначала поищи в интернете (1-2 запроса), как выглядит это место и что о нём рассказывают местные (слухи, "
+        + "Сначала поищи в интернете (один запрос), как выглядит это место и что о нём рассказывают местные (слухи, "
         "легенды, приметы), и возьми 1-2 настоящие детали, чтобы звучало как правда. Настоящие преступления, маньяков, "
         "жертв и их имена не бери; источники в эфире не упоминай.\n"
         "Продумай: premise — одна фраза, что не так; escalation — три шага, каждый ближе к автору; payoff — последний "
-        "удар.\n"
-        "Напиши: subject — тема письма, как пишут в почте (2-5 слов, без кавычек и точки, например «не открывайте ему» "
-        "или «это было в нашем доме»); host_intro — ведущий в начале, 2-4 фразы, 30-45 слов: здоровается со "
-        "слушателями как с друзьями (в духе «хей, всем привет, ребята»), говорит, что это радио Волгограда, погоду и "
-        "время из фактов выше, одну живую шутку про город (без политики), объявляет «вашу любимую рубрику — "
-        + HORROR_RUBRIC + "» и что пришла куча писем, «вот одно из них»; каждый раз своими словами; letter — само "
-        "письмо, 5-6 коротких абзацев, ВСЕГО 150-190 слов (весь эфир — две минуты), первый абзац начинается со слова "
-        "«Здравствуйте.» и сразу с того, что не так (не с описания района), числа — словами; host_outro — ведущий "
-        "после письма, 2-4 фразы, 25-40 слов: «вот такая вот история, друзья», живая реакция (что вышло, когда "
-        "попробовали ответить автору, — так, чтобы стало не по себе), совет слушателю по этой истории и бодрое "
-        "прощание; glitches — номер (с нуля) одного абзаца письма, после которого в эфире сбой (самый жуткий "
-        "момент); title — 2-4 слова.\n"
-        "Голос живой и понимает пометки интонации: в host_intro, letter и host_outro ставь их перед фразой в "
-        "квадратных скобках по-английски (вслух их не читают), 1-3 на абзац: ведущему — [excited], [laughs], "
-        "[chuckles], [mischievously], [cheerful]; письму — [nervous], [whispers], [sighs], [scared], [pause]; совет "
-        "слушателю в конце — [serious] или [whispers], прощание — [cheerful].\n"
+        "удар (какая деталь из начала в нём возвращается).\n"
+        "Напиши:\n"
+        "subject — тема письма, как пишут в почте (2-5 слов, без кавычек и точки, например «не открывайте ему» или "
+        "«это было в нашем доме»);\n"
+        "host_intro — ведущий перед письмом, 2-3 фразы, 25-40 слов: здоровается как с друзьями (в духе «хей, всем "
+        "привет, ребята»), это радио Волгограда, погода и время из фактов выше, одна живая шутка про город (без "
+        "политики), объявляет «вашу любимую рубрику — " + HORROR_RUBRIC + "» и «вот одно из писем»; каждый раз своими "
+        "словами;\n"
+        "letter — письмо: 4-5 абзацев, ВСЕГО 180-220 слов (весь эфир — две минуты); начинается со слова "
+        "«Здравствуйте.», потом в одной-двух фразах — кто автор, и сразу первая странность; числа — словами;\n"
+        "host_outro — ведущий после письма, 2-3 фразы, 20-35 слов: «вот такая вот история, друзья», короткая живая "
+        "реакция именно на это письмо, совет слушателю по детали из этой истории («а вы — проверьте…») и бодрое "
+        "прощание. Без новых событий и продолжения истории: не «мы ответили автору», не «письмо вернулось»;\n"
+        "title — 2-4 слова.\n"
+        "Пометки интонации для голоса — по-английски в квадратных скобках перед фразой (вслух их не читают), скупо: "
+        "ведущему — 1-2 на реплику ([excited], [laughs], [chuckles], [mischievously], [cheerful]; совет слушателю — "
+        "[serious]); в письме — 2-3 на всё письмо: [sighs] или [nervous] в начале или середине и [whispers] перед "
+        "последней фразой. Без [pause]: паузы — это точки и абзацы.\n"
         'Верни СТРОГО JSON: {"premise": "", "escalation": ["", "", ""], "payoff": "", "subject": "", '
-        '"host_intro": "", "letter": ["Здравствуйте. ...", "..."], "host_outro": "", "glitches": [3], "title": ""}'
+        '"host_intro": "", "letter": ["Здравствуйте. ...", "..."], "host_outro": "", "title": ""}'
     )
     asked_shorter = banned = False
     web = True
@@ -2961,9 +3115,9 @@ async def horror_story(avoid: list[str], facts: str = "") -> dict:
         except ValueError:
             logger.warning("horror: ответ без JSON: %s", out[:200])
             data = {}
-        paras = [scrub(str(p).strip()) for p in data.get("letter") or [] if str(p).strip()]
-        intro = _no_memento(scrub(str(data.get("host_intro", "")).strip()))
-        outro = _no_memento(scrub(str(data.get("host_outro", "") or data.get("outro", "")).strip()))
+        paras = tidy_letter([scrub(str(p).strip()) for p in data.get("letter") or [] if str(p).strip()])
+        intro = _tidy_text(_PAUSE_TAG.sub(" ", _no_memento(scrub(str(data.get("host_intro", "")).strip()))))
+        outro = tidy_outro(_no_memento(scrub(str(data.get("host_outro", "") or data.get("outro", "")).strip())))
         whole = " ".join(paras) + " " + intro + " " + outro + " " + str(data.get("title", ""))
         words = len(strip_tags(" ".join(paras)).split())  # пометки [whispers] — не слова
         clean = bool(paras) and not _HORROR_BAN.search(whole)
@@ -2971,22 +3125,15 @@ async def horror_story(avoid: list[str], facts: str = "") -> dict:
             asked_shorter = True
             logger.info("horror: письмо на %d слов — длиннее двух минут, прошу короче", words)
             user += (f"\n\nПрошлый вариант письма — {words} слов, это слишком длинно. Та же история, но письмо "
-                     "150-190 слов, 5-6 абзацев.")
+                     "180-220 слов, 4-5 абзацев.")
             continue
         if clean:
-            logger.info("horror: письмо %d слов, %d абзацев, приём «%s»", words, len(paras), engine[:50])
-            glitches = []
-            for g in data.get("glitches") or []:
-                try:
-                    if 0 <= int(g) < len(paras) - 1:
-                        glitches.append(int(g))
-                except (TypeError, ValueError):
-                    continue
+            logger.info("horror: письмо %d слов, %d абзацев, приём «%s»; payoff: %s", words, len(paras), engine[:50],
+                        str(data.get("payoff", ""))[:160])
             subject = scrub(str(data.get("subject", "")).strip().strip("«»\"'. "))[:60]
             return {"title": scrub(str(data.get("title", "")).strip())[:60], "subject": subject,
                     "premise": f"{place[:30]} | {engine[:40]} | {data.get('premise', '')}", "intro": intro,
-                    "outro": outro,
-                    "paragraphs": [p for p in paras if not _garbled(p)][:7], "glitches": glitches[:1]}
+                    "outro": outro, "paragraphs": [p for p in paras if not _garbled(p)][:7]}
         if not paras:  # пустой или битый ответ — ещё раз, если попытки остались
             continue
         if banned:
@@ -2995,7 +3142,7 @@ async def horror_story(avoid: list[str], facts: str = "") -> dict:
         logger.info("horror: в истории запретная тема — переписываю (попытка %d)", attempt + 1)
         user += ("\n\nПрошлый вариант задел запретную тему (война, мемориалы, теракты, самоубийство, настоящие "
                  "преступления). Другая история.")
-    return {"title": "", "subject": "", "premise": "", "paragraphs": [], "intro": "", "outro": "", "glitches": []}
+    return {"title": "", "subject": "", "premise": "", "paragraphs": [], "intro": "", "outro": ""}
 
 
 NIGHT_SYSTEM = (

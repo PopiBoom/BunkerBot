@@ -6,14 +6,11 @@ Opus, тема из TOPICS, без шуток и без имён — в эфир
 звук — radio.py (полоса приёмника, эфир, ветер или дождь по погоде, позывной) → OGG/Opus.
 Публикует не сам: черновик — голосовым в личку админу с кнопками «В канал / Переписать / Выкинуть».
 /night — новый черновик (≈$0.02). Первый эфир бот прислал владельцу сам после обновления (night_first_sent).
-/horror — «страшная история» (просьба владельца: «очень жуткое про Волгоград, можно вымышленное»; потом: «сделай
-ещё страшнее… как ведущий на радио, который объявляет историю, присланную на почту»): ведущий — «на почту эфира
-пришло письмо, тема: «…», отправлено в три семнадцать ночи, читаю без изменений», дальше письмо слушателя
-(ai.horror_story: каждый раз новый приём из HORROR_ENGINES, эскалация в три ступени, удар по самому близкому, без
-клише и бытовой завязки; война/мемориалы/теракты — нельзя), приписка ведущего (что случилось, когда редакция
-ответила автору), в самых жутких местах — сбой эфира (radio glitches), под голосом гул и далёкий стук, 3-5 мин. Голос — ai.narrate: ElevenLabs по ключу
-(/setkey eleven …; на сервере закрыт по региону), Яндекс SpeechKit (/setkey yandex …), без них — gpt-audio
-(mini звучал «по-ИИшному»).
+/horror — рубрика «Письма Волгограда» на «радио Волгограда» (ai.horror_story): ведущий здоровается и объявляет
+рубрику → письмо слушателя (страшная история от первого лица, 2-2.5 мин на весь выпуск) → ведущий: «вот такая вот
+история, друзья», совет слушателю, прощание. Озвучка — ai.narrate_all ОДНИМ голосом на весь выпуск (ElevenLabs v3 →
+Яндекс → gpt-audio), тремя кусками: вступление, письмо целиком, концовка; сведение — radio.studio (джингл, под
+письмом — мрачный фон и напряжение, треск эфира только в паузах, после последней фразы — обрыв в тишину).
 """
 from __future__ import annotations
 
@@ -217,7 +214,6 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop) -> di
     now = datetime.now(MSK)
     cond = _conditions(await _weather(), now)
     clock = f"{_clock(now).capitalize()}."
-    glitches: set[int] = set()
     if horror:
         try:
             used = json.loads(await db.get_setting(HORROR_KEY, "[]") or "[]")
@@ -238,15 +234,11 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop) -> di
                                    "Волгограда!")
         intro, outro = " ".join(intro.split()), " ".join(outro.split())
         paragraphs = [ai.strip_tags(p) for p in [intro] + story["paragraphs"] + [outro]]  # текст черновика — без пометок
-        # Озвучка крупными кусками (владелец: «однотонно и скучно» — каждый абзац отдельно звучал как диктор с
-        # нуля): вступление, письмо в две части (между ними — сбой эфира), концовка.
-        letter = story["paragraphs"]
-        cut = (story["glitches"][0] + 1) if story["glitches"] else max(1, len(letter) // 2)
-        cut = min(max(1, cut), max(1, len(letter) - 1))
-        parts = [letter[:cut], letter[cut:]] if len(letter) > 1 else [letter]
-        chunks = [intro] + ["\n\n".join(p) for p in parts] + [outro]
-        styles = ["host"] + ["letter"] * len(parts) + ["host"]
-        glitches = {1} if len(parts) > 1 else set()  # сбой — после первой части письма
+        # Озвучка тремя кусками: вступление, письмо ЦЕЛИКОМ, концовка. Владелец 08.11: «история прерывается
+        # посередине» — письмо шло двумя кусками со сбоем эфира между ними, и вторую половину голос начинал заново,
+        # другим тоном. Абзацы письма — переносами строк: на них голос сам делает паузу.
+        chunks = [intro, "\n\n".join(story["paragraphs"]), outro]
+        styles = ["host", "letter", "host"]
         await db.set_setting(HORROR_KEY, json.dumps((used + [story["premise"][:160]])[-30:], ensure_ascii=False))
     else:
         try:
@@ -262,23 +254,24 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop) -> di
         await db.set_setting(TOPICS_KEY, json.dumps((used + [topic])[-30:], ensure_ascii=False))
     n = int(await db.get_setting(HORROR_COUNT_KEY if horror else COUNT_KEY, "0") or 0) + 1
     caption = _caption(horror, n, topic, now, cond["caption"])
-    voice = []
-    for i, (p, style) in enumerate(zip(chunks, styles, strict=True), 1):
-        await progress(f"🎙 Озвучиваю: {i} из {len(chunks)}" + (f" · {ai.last_voice[0]}" if ai.last_voice[0] else ""))
-        pcm = await ai.narrate(p, horror=horror, host=style == "host")
-        if not pcm:
-            return {"ogg": None, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic}
-        voice.append(pcm)
+    async def step(i: int, total: int, who: str) -> None:
+        await progress(f"🎙 Озвучиваю: {i} из {total} · {who}")
+
+    # весь выпуск — одним голосом (кусок не вышел — всё заново следующим сервисом, а не «письмо дочитал другой»)
+    voice = await ai.narrate_all(chunks, [s == "host" for s in styles], horror=horror, progress=step)
+    who = ai.last_voice[0] + (f" (не вышло: {ai.voice_trouble[0]})" if ai.voice_trouble[0] else "")
+    if not voice:
+        return {"ogg": None, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic,
+                "voice": ai.voice_trouble[0]}
     await progress("🎚 Свожу эфир…")
     if horror:  # страшная рубрика — как настоящий FM-эфир из студии
-        mix = await asyncio.to_thread(radio.studio, voice, styles, ai.SPEAK_RATE, int(time.time()), glitches)
+        mix = await asyncio.to_thread(radio.studio, voice, styles, ai.SPEAK_RATE, int(time.time()))
     else:       # ночной эфир — «сквозь приёмник», как было
-        mix = await asyncio.to_thread(radio.broadcast, voice, ai.SPEAK_RATE, cond["rain"], int(time.time()), False,
-                                      glitches)
+        mix = await asyncio.to_thread(radio.broadcast, voice, ai.SPEAK_RATE, cond["rain"], int(time.time()))
     ogg = await asyncio.to_thread(radio.to_ogg, mix)
     logger.info("ночной эфир №%s%s: «%s», %.0f сек, голос %s", n, " (страшная история)" if horror else "", topic,
-                len(mix) / radio.SR, ai.last_voice[0] or "?")
-    return {"ogg": ogg, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic}
+                len(mix) / radio.SR, who or "?")
+    return {"ogg": ogg, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic, "voice": who}
 
 
 def _kb() -> InlineKeyboardMarkup:
@@ -317,12 +310,15 @@ async def _send_draft(bot: Bot, db: Database, chat_id: int, horror: bool, progre
     ep = await make_episode(db, horror=horror, progress=progress)
     text = "\n\n".join(ep["paragraphs"])
     if not ep["ogg"]:
+        why = f" ({html.escape(ep['voice'][:300])})" if ep.get("voice") else ""
         await bot.send_message(chat_id, f"{ep['caption']}\n\n{html.escape(text[:3200])}\n\n<i>Озвучить не вышло: нет "
-                                        "ключа (/setkey yandex или OpenRouter) или сбой озвучки. Это текст.</i>")
+                                        f"ключа (/setkey yandex или OpenRouter) или сбой озвучки{why}. Это текст.</i>")
         return False
+    # какой голос читал (и кто до него не справился) — видно только в черновике, в канал не идёт
+    who = f"<i>Голос: {html.escape(ep.get('voice', '')[:150])}</i>\n" if ep.get("voice") else ""
     msg = await bot.send_voice(chat_id, BufferedInputFile(ep["ogg"], "night.ogg"), reply_markup=_kb(),
-                               caption=f"{ep['caption']}\n\n<i>Черновик. Текст:</i>\n"
-                                       f"<blockquote expandable>{html.escape(text[:780])}</blockquote>")
+                               caption=f"{ep['caption']}\n\n{who}<i>Черновик. Текст:</i>\n"
+                                       f"<blockquote expandable>{html.escape(text[:680])}</blockquote>")
     await db.set_setting(DRAFT_KEY, json.dumps({"file_id": msg.voice.file_id, "caption": ep["caption"],
                                                 "n": ep["n"], "msg": msg.message_id, "chat": chat_id,
                                                 "horror": horror}, ensure_ascii=False))
