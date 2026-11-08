@@ -1,8 +1,12 @@
 """/sud — суд чата (идея и макет приговора — с владельцем, 07.11).
 
 Админ: /sud ответом на сообщение человека (это сообщение — повод, статья 1) или /sud @ник. Дальше:
-1) ИИ-прокурор (ai.court_charges) предъявляет 2-3 статьи — улики ДОСЛОВНО из его сообщений за неделю (ИИ даёт
-   только id, текст подставляет код); нет ни одной настоящей улики — «оправдан за отсутствием состава».
+1) ИИ-прокурор (ai.court_charges) видит переписку ВСЕХ вокруг повода и пишет «обстоятельства дела» (о чём
+   говорили, что он написал, кто как отреагировал) и 1-3 статьи — улики ДОСЛОВНО из его сообщений за неделю (ИИ
+   даёт только id, текст подставляет код); один разговор — одна статья (статьи по сообщениям в пределах
+   SAME_TALK сек код склеивает); нет ни одной настоящей улики — «оправдан за отсутствием состава». Владелец 08.11:
+   «неразборчиво, однообразно, нет конкретики» — прокурор видел только реплики подсудимого, статьи были
+   «цитата - та же цитата», Ст. 1 и Ст. 2 — про одно и то же, и в каждом деле «в особо крупном».
 2) Защита: адвоката ждём LAWYER_WAIT (кнопка «🛡 Стать адвокатом» — первый нажавший, не подсудимый); выбрали —
    у него SPEECH_TIME на речь (все его сообщения в это время); последнее слово — ответ подсудимого на сообщение
    суда (иначе все его сообщения за это время). Оба высказались — ещё GRACE сек и голосование; за 30 сек —
@@ -19,6 +23,7 @@ import asyncio
 import html
 import json
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -42,6 +47,8 @@ VOTE_TIME = 120        # сек на голосование
 PUNISH = 24 * 3600     # сек: прозвище и 🤡 на каждое сообщение
 EVIDENCE_DAYS = 7      # улики — из сообщений за столько дней
 CASE_KEY = "court_no:"
+RECENT_KEY = "court_recent:"   # прошлые дела чата (статьи и речь) — чтобы прокурор не повторялся
+SAME_TALK = 20 * 60    # сообщения подсудимого ближе этого — один разговор, одна статья
 PUNISH_KEY = "court_punished"   # {"chat:uid": [до ts, прозвище]}
 
 _courts: dict[int, dict] = {}
@@ -168,35 +175,41 @@ async def cmd_sud(message: Message, command: CommandObject, bot: Bot, db: Databa
             main = {"id": rt.message_id, "text": rt.text or rt.caption}
             if rt.message_id not in {r[0] for r in rows}:
                 rows.append((rt.message_id, uid, name, main["text"], int(rt.date.timestamp())))
+                rows.sort(key=lambda r: r[4])
+        context = await _context(db, chat_id, uid, rows, main and int(rt.date.timestamp()))
+        try:
+            recent = list(json.loads(await db.get_setting(RECENT_KEY + str(chat_id), "[]") or "[]"))
+        except (ValueError, TypeError):
+            recent = []
         res = await ai.court_charges(name, await db.get_dossier(chat_id, uid),
-                                     [{"id": r[0], "name": r[2], "text": r[3]} for r in rows], promises, main=main)
+                                     [{"id": r[0], "name": r[2], "text": r[3]} for r in rows], promises, main=main,
+                                     context=context, recent=recent)
     except Exception as e:
         logger.warning("court charges failed: %s", e)
         c["phase"] = "done"
         await temp_reply(message, "Прокурор не явился (ИИ не ответил) - попробуй ещё раз.")
         return
-    by_id = {r[0]: r for r in rows}
-    charges = []
-    for ch in res["charges"]:
-        r = by_id.get(ch["msg_id"])
-        if not r:
-            continue  # улика не из его сообщений — такую статью не предъявляем
-        date = datetime.fromtimestamp(r[4], MSK).strftime("%d.%m")
-        quote = f"«{str(r[3])[:140]}» ({date})" + (f" - {ch['note']}" if ch["note"] else "")
-        charges.append((ch["title"], quote))
+    groups = _group_charges(res["charges"], {r[0]: r for r in rows})
+    charges = [(f"Ст. {i} · {g['title']}", _evidence(g["rows"])) for i, g in enumerate(groups, 1)]
+    notes = [g["note"] for g in groups]
     if not charges:
         c["phase"] = "done"
         await bot.send_message(chat_id, f"⚖️ Суд над <b>{html.escape(name)}</b>: улик не нашлось - оправдан за "
                                         "отсутствием состава. Пока что.")
         return
-    c.update(charges=charges, nickname=res["nickname"] or "Подсудимый", speech=res["speech"])
+    c.update(charges=charges, nickname=res["nickname"] or "Подсудимый", speech=res["speech"], fabula=res["fabula"])
     c["case"] = int(await db.get_setting(CASE_KEY + str(chat_id), "0") or 0) + 1
     await db.set_setting(CASE_KEY + str(chat_id), str(c["case"]))
+    recent.append(" | ".join([t for t, _q in charges] + ([c["speech"]] if c["speech"] else [])))
+    await db.set_setting(RECENT_KEY + str(chat_id), json.dumps(recent[-5:], ensure_ascii=False))
     lines = [f"⚖️ <b>СУД ЧАТА · Дело № {c['case']}</b>",
-             f"Чат против <b>{html.escape(name)}</b> · иск подал {html.escape(c['accuser'][1])}", "",
-             "<b>ОБВИНЕНИЕ</b>"]
-    for title, quote in charges:
-        lines += [f"<b>{html.escape(title)}</b>", html.escape(quote)]
+             f"Чат против <b>{html.escape(name)}</b> · иск подал {html.escape(c['accuser'][1])}", ""]
+    if c["fabula"]:
+        day = datetime.fromtimestamp(groups[0]["rows"][0][4], MSK).strftime("%d.%m")
+        lines += [f"<b>ОБСТОЯТЕЛЬСТВА · {day}</b>", html.escape(c["fabula"]), ""]
+    lines.append("<b>ОБВИНЕНИЕ</b>")
+    for (title, quote), note in zip(charges, notes, strict=True):
+        lines += [f"<b>{html.escape(title)}</b>", html.escape(quote)] + ([f"<i>{html.escape(note)}</i>"] if note else [])
     if c["speech"]:
         lines += ["", f"🗣 <i>{html.escape(c['speech'])}</i>"]
     lines += ["", f"🛡 Кто адвокат? Первый нажавший защищает, на речь - {SPEECH_TIME // 60} мин.",
@@ -209,6 +222,58 @@ async def cmd_sud(message: Message, command: CommandObject, bot: Bot, db: Databa
     task = asyncio.create_task(_run(bot, db, chat_id, c))
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
+
+
+async def _context(db: Database, chat_id: int, uid: int, rows: list[tuple], main_ts: int | None) -> list[dict]:
+    """Переписка всех вокруг повода (±10-12 сообщений); судят по @нику — по 3 до и 2 после каждого его сообщения
+    (последние 20 непустых), не больше 120 строк."""
+    if main_ts:
+        near = await db.messages_near(chat_id, main_ts, 12, 10)
+    else:
+        near, seen = [], set()
+        for r in [r for r in rows if len(str(r[3])) >= 8][-20:]:
+            for m in await db.messages_near(chat_id, r[4], 3, 2, span=1800):
+                if m[0] not in seen:
+                    seen.add(m[0])
+                    near.append(m)
+        near = sorted(near, key=lambda m: (m[4], m[0]))[-120:]
+    return [{"id": m[0], "name": m[2] or "?", "text": m[3]} for m in near]
+
+
+def _overlap(a: str, b: str) -> float:
+    """Какая доля слов a есть в b (пометка, которая просто повторяет цитату, — не нужна)."""
+    wa = {w for w in re.findall(r"\w+", ai._norm(a)) if len(w) > 2}
+    wb = {w for w in re.findall(r"\w+", ai._norm(b)) if len(w) > 2}
+    return len(wa & wb) / len(wa) if wa else 1.0
+
+
+def _group_charges(raw: list[dict], by_id: dict[int, tuple]) -> list[dict]:
+    """Статьи ИИ → улики из ЕГО сообщений (чужие id выкидываем); статьи про один разговор (ближе SAME_TALK)
+    склеиваем в одну — раньше «Лера отпиздила всех» и «лан шучу» через минуту шли двумя статьями. Не больше 3."""
+    groups: list[dict] = []
+    for ch in raw:
+        rs = sorted({by_id[i] for i in ch["msg_ids"] if i in by_id}, key=lambda r: r[4])
+        if not rs:
+            continue
+        same = next((g for g in groups if any(abs(r[4] - q[4]) <= SAME_TALK for r in rs for q in g["rows"])), None)
+        rows = sorted({*same["rows"], *rs}, key=lambda r: r[4]) if same else rs
+        note = ch["note"]
+        if note and (_overlap(note, " ".join(str(r[3]) for r in rows)) >= 0.5
+                     or _overlap(note, same["title"] if same else ch["title"]) >= 0.6):
+            note = ""   # пометка повторяет цитату или название — «цитата - та же цитата»
+        if same:
+            same["rows"], same["note"] = rows, same["note"] or note
+            continue
+        if groups and len(" ".join(str(r[3]) for r in rs).split()) < 3:
+            continue    # рецидив из одного-двух слов («Сука поспала») — без разговора непонятен, не улика
+        groups.append({"title": ch["title"], "rows": rs, "note": note})
+    return groups[:3]
+
+
+def _evidence(rs: list[tuple]) -> str:
+    """Улики статьи: «первое» → «второе» (07.11, 23:41) — не больше двух цитат по 110 знаков."""
+    quotes = " → ".join(f"«{str(r[3])[:110]}»" for r in rs[:2])
+    return quotes + datetime.fromtimestamp(rs[0][4], MSK).strftime(" (%d.%m, %H:%M)")
 
 
 @router.callback_query(F.data == "sud:law")
@@ -296,7 +361,8 @@ async def _run(bot: Bot, db: Database, chat_id: int, c: dict) -> None:
         name = c["defendant"][1]
         try:
             speech = await ai.court_verdict(name, [t for t, _q in c["charges"]], c["defense"], c["last_word"],
-                                            guilty, f"виновен {g}, оправдать {a}", c["accuser"][1])
+                                            guilty, f"виновен {g}, оправдать {a}", c["accuser"][1],
+                                            c.get("fabula", ""))
         except Exception as e:
             logger.warning("court verdict AI failed: %s", e)
             speech = ""

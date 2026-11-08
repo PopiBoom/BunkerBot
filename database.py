@@ -704,6 +704,21 @@ class Database:
             rows = list(await cur.fetchall())
         return rows[::-1]
 
+    async def messages_near(self, chat_id: int, ts: int, before: int = 12, after: int = 10,
+                            span: int = 3 * 3600) -> list[tuple]:
+        """Переписка вокруг момента ts (все участники, без отказавшихся): до before сообщений до (и сам момент) и
+        after после, не дальше span сек. [(msg_id, user_id, name, text, ts)] от старых к новым."""
+        base = ("SELECT m.msg_id, m.user_id, m.name, m.text, m.ts FROM chat_messages m WHERE m.chat_id = ? "
+                "AND NOT EXISTS (SELECT 1 FROM roast_optout o WHERE o.chat_id = m.chat_id AND o.user_id = m.user_id) ")
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(base + "AND m.ts <= ? AND m.ts >= ? ORDER BY m.ts DESC, m.msg_id DESC LIMIT ?",
+                                   (chat_id, ts, ts - span, before + 1))
+            head = list(await cur.fetchall())[::-1]
+            cur = await db.execute(base + "AND m.ts > ? AND m.ts <= ? ORDER BY m.ts, m.msg_id LIMIT ?",
+                                   (chat_id, ts, ts + span, after))
+            tail = list(await cur.fetchall())
+        return head + tail
+
     async def count_messages_since(self, chat_id: int, since: int) -> int:
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
