@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import os
 import logging
 
@@ -885,6 +886,29 @@ async def _restore_db(message: Message, bot: Bot, db: Database) -> None:
     )
 
 
+# Подписи к функциям ai.py в «Расходах ИИ» (имя функции, откуда пошёл запрос, — ai._kind)
+KIND_LABELS = {
+    "banter": "ответы на обращения к боту", "roast_auto": "бот встревает сам", "roast_photo": "комменты к фото/видео",
+    "roast_user": "/roast", "comeback": "ответки на наезды", "defend_father": "защита бати",
+    "is_father_insult": "проверка наездов на батю", "describe_photo": "описания фото (Haiku)",
+    "describe_sticker": "описания стикеров (Haiku)", "pick_sticker": "выбор стикера", "pick_reaction": "реакции",
+    "extract_promise": "ловушка обещаний", "promise_reminder": "напоминания обещаний", "update_dossier": "досье",
+    "short_answer_meaning": "смысл коротких ответов", "fix_looks": "правка «про внешность»",
+    "drop_retell": "правка пересказа фото", "channel_comment": "комменты к постам канала",
+    "own_channel_post": "посты в канал", "clown_of_day": "клоун дня", "week_show": "итоги недели",
+    "pick_quotes": "фразы дня", "daily_news": "новости чата", "serial_episode": "сериал",
+    "horror_story": "Письма Волгограда: текст", "_place_facts": "Письма Волгограда: поиск места",
+    "night_monologue": "ночной эфир: текст", "narrate_all": "озвучка эфира (OpenRouter)", "narrate": "озвучка",
+    "diss_lyrics": "дисс: текст", "court_charges": "суд: обвинение", "court_verdict": "суд: приговор",
+    "protocol": "протокол", "meme": "мемы", "video_caption": "видео-мемы", "demotivator": "демотиваторы",
+    "question_of_day": "вопрос дня", "who_poll_question": "опрос «кто из нас»", "poll_verdict": "итоги опроса",
+    "voice_reply": "войс: ответы", "transcribe": "слух: голосовые и кружки", "generate_setup": "Бункер: сценарий",
+    "narrate_round": "Бункер: ведущий", "narrate_speeches": "Бункер: речи", "narrate_intro": "Бункер: вступление",
+    "narrate_elimination": "Бункер: выбывание", "final_verdict": "Бункер: финал", "threat_chances": "Бункер: угроза",
+    "threat_outcome": "Бункер: угроза", "_mafia_text": "Мафия: ведущий", "mafia_intro": "Мафия: вступление",
+}
+
+
 @router.callback_query(F.data == "admin:ai_costs")
 async def admin_ai_costs(call: CallbackQuery, db: Database, config: Config) -> None:
     if not _is_admin(call.from_user.id, config):
@@ -908,6 +932,13 @@ async def admin_ai_costs(call: CallbackQuery, db: Database, config: Config) -> N
         f"🗓 За 30 дней: <b>{money(r['month'][0])}</b>",
         f"♾ За всё время: <b>{money(r['total'][0])}</b> · партий: {games_n} · в среднем {money(avg)}",
     ]
+    for key, title in (("kinds_day", "За сутки - что тратит"), ("kinds_week", "За 7 дней - что тратит")):
+        rows = [x for x in r.get(key) or [] if x[1]]
+        if rows:
+            lines += ["", f"<b>{title}:</b>"]
+            for kind, cost, n, tin, tout in rows[:10]:
+                lines.append(f"• {html.escape(KIND_LABELS.get(kind, kind or 'до 0.79, без метки'))}: {money(cost)} · "
+                             f"{n} запр. · {(tin or 0) // 1000}K/{(tout or 0) // 1000}K")
     if r["models"]:
         lines += ["", "<b>По моделям:</b>"]
         for model, cost, tin, tout, n in r["models"]:

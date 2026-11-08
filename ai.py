@@ -55,7 +55,7 @@ PRICES = {
 # Метка текущей партии: ставится в задаче партии и наследуется её подзадачами.
 current_game: contextvars.ContextVar[str | None] = contextvars.ContextVar("ai_game", default=None)
 
-UsageSink = Callable[[str | None, str, int, int, float], Awaitable[None]]
+UsageSink = Callable[..., Awaitable[None]]  # sink(game_key, model, input_tokens, output_tokens, cost, kind)
 _usage_sink: UsageSink | None = None
 
 _client: AsyncAnthropic | None = None
@@ -65,6 +65,21 @@ def set_usage_sink(sink: UsageSink | None) -> None:
     """Куда сохранять расход: sink(game_key, model, input_tokens, output_tokens, cost_usd)."""
     global _usage_sink
     _usage_sink = sink
+
+
+# Какая функция бота потратила (владелец 08.11: «что так сильно жрёт баланс?» — учёт был только по моделям):
+# имя функции ai.py, из которой пошёл запрос, мимо обёрток. В /admin → «💰 Расходы ИИ» — разбивка по ним.
+_KIND_SKIP = {"_kind", "_record", "_complete", "complete_any", "speak", "_speak_long", "say", "eleven", "yandex", "gpt",
+              "_eleven_once", "eleven_speak", "_eleven_bytes", "_complete_openrouter"}
+
+
+def _kind() -> str:
+    import sys
+
+    f = sys._getframe(1)
+    while f is not None and (f.f_code.co_name in _KIND_SKIP or f.f_code.co_name.startswith("<")):
+        f = f.f_back
+    return f.f_code.co_name if f is not None else "?"
 
 
 def price(model: str, input_tokens: int, output_tokens: int) -> float:
@@ -115,10 +130,11 @@ async def _record(model: str, usage) -> None:
     tin += int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
     tout = int(getattr(usage, "output_tokens", 0) or 0)
     cost = price(model, tin, tout)
-    logger.info("AI %s: in=%s out=%s ≈ $%.4f", model, tin, tout, cost)
+    kind = _kind()
+    logger.info("AI %s [%s]: in=%s out=%s ≈ $%.4f", model, kind, tin, tout, cost)
     if _usage_sink:
         try:
-            await _usage_sink(current_game.get(), model, tin, tout, cost)
+            await _usage_sink(current_game.get(), model, tin, tout, cost, kind)
         except Exception as e:
             logger.warning("usage sink failed: %s", e)
 
@@ -2411,10 +2427,11 @@ async def _complete_openrouter(system: str, user: str, model: str, max_tokens: i
     usage = data.get("usage") or {}
     tin, tout = int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
     cost = float(usage.get("cost") or 0.0)
-    logger.info("AI %s: in=%s out=%s ≈ $%.4f", model, tin, tout, cost)
+    kind = _kind()
+    logger.info("AI %s [%s]: in=%s out=%s ≈ $%.4f", model, kind, tin, tout, cost)
     if _usage_sink:
         try:
-            await _usage_sink(current_game.get(), model, tin, tout, cost)
+            await _usage_sink(current_game.get(), model, tin, tout, cost, kind)
         except Exception as e:
             logger.warning("usage sink failed: %s", e)
     choice = (data.get("choices") or [{}])[0]
@@ -2553,7 +2570,7 @@ async def speak(text: str, system: str | None = None, voice: str | None = None, 
     if usage and _usage_sink:
         try:
             await _usage_sink(current_game.get(), SPEAK_MODEL, int(usage.get("prompt_tokens") or 0),
-                              int(usage.get("completion_tokens") or 0), float(usage.get("cost") or 0.0))
+                              int(usage.get("completion_tokens") or 0), float(usage.get("cost") or 0.0), _kind())
         except Exception as e:
             logger.warning("usage sink failed: %s", e)
     spoken = "".join(said)
@@ -3345,7 +3362,11 @@ HORROR_SYSTEM = (
     "Не обрывай историю на «оно уже рядом» и не оставляй без ответа: у истории есть конец, а холодок остаётся.\n"
     "Можно: вымышленные маньяки и убийцы (без имён), пропавшие люди, найденные тела, преследование, кто-то в "
     "квартире; жуткие существа — свои, не из кино. Насилие — только последствиями и намёками (куртка в гаражах, "
-    "мокрые следы, «её больше никто не видел»): никаких ран, пыток и расчленения.\n"
+    "чужая зажигалка на подоконнике, «её больше никто не видел»): никаких ран, пыток и расчленения.\n"
+    "Вода — не главное: Волга, тина, сырость, мокрое, капли, утопленники — только если история прямо у воды, и то "
+    "одной-двумя деталями. Страх ищи в сухом и бытовом: звуки (шаги, щелчок замка, лифт, домофон), свет (лампа в "
+    "подъезде, экран телефона, фары), вещи (чужая куртка, ключи, записка), запахи (табак, хлорка, жжёная проводка, "
+    "чужие духи), люди и то, как они себя ведут.\n"
     "Нельзя: настоящие преступления, настоящие маньяки и жертвы, реальные люди и имена, дети-жертвы, сексуальное "
     "насилие, война, Сталинград, Мамаев курган, мемориалы, теракты, политика, самоубийство. Не упоминай «Memento "
     "Mori». Без markdown."
@@ -3430,21 +3451,15 @@ _HORROR_BAN = re.compile(r"войн|сталинград|мамаев|мемор
 # в промпте был список мест с Мечёткой, а один приём прямо назывался «в балке Мечётки»; ИИ хватался за него).
 HORROR_PLACES = [
     "общага у проходной на Тракторном",
-    "панельная девятиэтажка на Спартановке, окна на водохранилище",
     "высотки «Семь ветров» в Дзержинском районе, где вечно воет ветер",
     "деревянные двухэтажки в Жилгородке",
     "хрущёвки у трамвайного кольца в Бекетовке",
     "частный сектор Ельшанки",
     "старая Сарепта в Красноармейском районе, дома позапрошлого века",
-    "шлюзы Волго-Донского канала ночью",
     "бараки у судоверфи в Красноармейском районе",
     "подземная станция скоростного трамвая поздно вечером",
     "подземный переход у железнодорожного вокзала",
-    "набережная и речной вокзал после полуночи",
-    "ночная маршрутка в Волжский через плотину ГЭС",
     "промзона в Волжском",
-    "дача в Средней Ахтубе, ерики и тополя",
-    "остров Сарпинский, паромная переправа и рыбацкие домики",
     "гаражный кооператив за рынком",
     "студенческая общага у Университетского проспекта",
     "Ангарский посёлок, бараки и пустыри",
@@ -3452,6 +3467,45 @@ HORROR_PLACES = [
     "ночная электричка от вокзала до Тингуты",
 ]
 HORROR_PLACE_GAP = 8  # столько последних мест не повторяем
+# Места у воды — отдельно и редко (владелец 08.11: «почему всё скатывается к воде? тина, мокрая и т.д.»: из 21 места
+# 6 были у воды, из знаковых — ещё 6, и выпуск почти всегда попадал к Волге). Теперь вода — 1 выпуск из WATER_EVERY и
+# не два раза подряд; в остальных местах и маршрутах воды нет.
+HORROR_WATER_PLACES = [
+    "панельная девятиэтажка на Спартановке, окна на водохранилище",
+    "шлюзы Волго-Донского канала ночью",
+    "набережная и речной вокзал после полуночи",
+    "ночная маршрутка в Волжский через плотину ГЭС",
+    "дача в Средней Ахтубе, ерики и тополя",
+    "остров Сарпинский, паромная переправа и рыбацкие домики",
+]
+HORROR_WATER_LANDMARKS = [
+    "Центральная набережная, лестница к Волге и речной вокзал",
+    "Нулевая продольная вдоль Волги",
+    "мост через Волгу — тот самый «танцующий»",
+    "Рабоче-Крестьянская, длинный спуск к Волге",
+    "ГЭС и плотина ночью",
+]
+# Кто пишет и кто звонит — тоже код (живой прогон 08.11: двое из трёх авторов — «Дима, работаю сменами на складе»,
+# обе звонящие — «Света»): имя, возраст и работа на выпуск.
+AUTHOR_NAMES = {"m": ["Артём", "Кирилл", "Женя", "Олег", "Рома", "Влад", "Серёга", "Паша", "Игорь", "Тимур", "Стас",
+                      "Никита", "Валера", "Гоша", "Денис"],
+                "f": ["Катя", "Оля", "Настя", "Лена", "Юля", "Вика", "Ира", "Марина", "Надя", "Даша", "Алина",
+                      "Таня", "Кристина", "Люба", "Соня"]}
+AUTHOR_JOBS = ["кассир в сетевом магазине", "курьер на велике", "охранник в торгушке", "бариста", "таксист",
+               "продавец на Центральном рынке", "мастер по ремонту телефонов", "администратор в фитнес-клубе",
+               "повар в шаурмичной", "оператор колл-центра", "парикмахер", "сварщик на Тракторном",
+               "студент ВолГУ", "кладовщик в аптечной сети", "диспетчер в такси", "монтажник интернета",
+               "официант в кафе на Мира", "водитель маршрутки", "мерчендайзер", "ночной продавец в круглосуточном"]
+WATER_EVERY = 6        # примерно один выпуск из шести — у воды
+WATER_MARK = "у воды"  # пометка в истории тем (avoid): прошлый выпуск был у воды — этот нет
+WATER_MAX = 4          # слов про воду в письме не у воды больше этого — одна переделка «без воды»
+_WATER = re.compile(r"\b(?:вод[аеуыо]\w*|мокр\w*|тин[аеуыо]\b|тиной|сырост\w*|сыр(?:ой|ая|ое|ые|ом|ую)\b|волг(?:а|и|у|ой|е)\b|"
+                    r"утоп\w*|утон\w*|луж\w*|капл\w*|капа[еюл]\w*|ерик\w*|реки|реку|речк\w*|ила\b|плесен\w*|"
+                    r"набережн\w*|шлюз\w*|плотин\w*|колод[ец]\w*)", re.IGNORECASE)
+
+
+def water_words(text: str) -> list[str]:
+    return _WATER.findall(strip_tags(text or ""))
 # Знаковые места и улицы, по которым ходит автор (владелец 08.11: «именно волгоградские улицы, больше про знаковые
 # места — например: и дальше я пошёл в торгушку, а он везде за мной шёл…»). Код берёт два на выпуск, без повторов.
 # Без войны и мемориалов (Мамаев курган, Аллея Героев, площадь Павших Борцов — нельзя).
@@ -3462,24 +3516,18 @@ HORROR_LANDMARKS = [
     "ТЦ «Мармелад»",
     "«Комсомолл» в Тракторозаводском",
     "МЕГА у Волжского и трасса до неё",
-    "Центральная набережная, лестница к Волге и речной вокзал",
     "ЦПКиО и колесо обозрения",
     "проспект Ленина вечером, от Дворца спорта до площади Ленина",
     "улица Мира и пешеходная часть у фонтанов",
     "Вторая продольная — пустая остановка на ней",
-    "Нулевая продольная вдоль Волги",
-    "мост через Волгу — тот самый «танцующий»",
-    "Волгоград Арена и пойма Царицы",
     "Центральный рынок и подземный переход у него",
     "трамвайное кольцо на Тракторном",
     "станция скоростного трамвая «Комсомольская»",
     "улица Землячки и остановка у ТЦ",
     "улица Ангарская и пустыри за гаражами",
-    "Рабоче-Крестьянская, длинный спуск к Волге",
     "железнодорожный вокзал и пригородные кассы",
     "Красноармейск: улица Тулака и остановка у ДК",
     "автовокзал и ночные маршрутки до Волжского",
-    "ГЭС и плотина ночью",
 ]
 HORROR_SLANG = ("местные словечки (к месту, не все сразу): «торгушка» (торговый центр), «маршрутка», «скоростной» "
                 "или «метротрам», «продольная», «Тракторный», «Красноармейск», «Спартановка», «Бекетовка»")
@@ -3521,11 +3569,10 @@ HORROR_MANIAC = [
 HORROR_CREATURES = [
     "кто-то по ночам ходит на четвереньках под окнами и зовёт людей голосами их родных",
     "в последнем вагоне с каждой остановкой кто-то сидит ближе, а остальные пассажиры его не видят",
-    "старый колодец или вентиляция отвечает, если сказать туда своё имя, — и запоминает его",
+    "вентиляция в ванной отвечает, если сказать туда своё имя, — и запоминает его",
     "следы, похожие на человеческие, но слишком длинные, ночью подходят к самым окнам",
     "высокая худая фигура каждую ночь стоит на этаж ниже — у твоих окон",
     "то, что забирает тех, о ком все забыли, — и соседи перестают помнить, что тут кто-то жил",
-    "из воды ночью выходят утонувшие и садятся смотреть на окна домов",
     "кто-то рисует углём на стенах лица жильцов с закрытыми глазами — чьё нарисовали, того потом не находят",
     "в одном гаражном боксе по ночам горит свет, оттуда скребутся и просят открыть голосом пропавшего хозяина",
     "отражение в лифте улыбается на секунду раньше тебя и однажды не выходит следом",
@@ -3543,14 +3590,14 @@ _MONTH_GEN = ["января", "февраля", "марта", "апреля", "�
               "ноября", "декабря"]
 _MONTH_PREP = ["январе", "феврале", "марте", "апреле", "мае", "июне", "июле", "августе", "сентябре", "октябре",
                "ноябре", "декабре"]
-_SEASON = {12: "зима: мороз, гололёд, ветер с Волги, рано темнеет", 1: "зима: мороз, гололёд, ветер с Волги",
-           2: "конец зимы: мороз, грязный снег, гололёд", 3: "ранняя весна: слякоть, грязь, лёд на Волге тает",
-           4: "весна: сырость, грязь, первые тёплые дни", 5: "весна: тепло, зелень, первые жаркие дни",
+_SEASON = {12: "зима: мороз, гололёд, ветер, рано темнеет", 1: "зима: мороз, гололёд, ветер",
+           2: "конец зимы: мороз, грязный снег, гололёд", 3: "ранняя весна: грязный снег, ветер, рано темнеет",
+           4: "весна: первые тёплые дни, ветер, пыль", 5: "весна: тепло, зелень, первые жаркие дни",
            6: "лето: жара, пыль, душные ночи", 7: "лето: жара, пыль, душные ночи, комары у воды",
            8: "конец лета: жара, сухая трава, тёмные тёплые ночи",
            9: "начало осени: тёплые дни, холодные ночи, жёлтые листья",
-           10: "осень: дожди, листопад, холодает, рано темнеет",
-           11: "поздняя осень: холод, дожди, слякоть, рано темнеет"}
+           10: "осень: листопад, холодает, рано темнеет",
+           11: "поздняя осень: холод, голые деревья, первый иней, рано темнеет"}
 
 
 def date_words(d: date) -> str:
@@ -3615,8 +3662,16 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
             HORROR_CREATURES if roll < HORROR_MANIAC_SHARE + HORROR_CREATURE_SHARE else HORROR_ENGINES)
     engine = _random.choice([e for e in pool if not any(e[:40] in a for a in avoid)] or pool)
     recent = avoid[-HORROR_PLACE_GAP:]
-    place = _random.choice([p for p in HORROR_PLACES if not any(p[:30] in a for a in recent)] or HORROR_PLACES)
+    wet = (_random.random() < 1 / WATER_EVERY and not any(WATER_MARK in a for a in avoid[-1:])) if not listener else False
+    places = HORROR_WATER_PLACES if wet else HORROR_PLACES
+    place = _random.choice([p for p in places if not any(p[:30] in a for a in recent)] or places)
     marks = _random.sample([m for m in HORROR_LANDMARKS if not any(m[:25] in a for a in recent)] or HORROR_LANDMARKS, 2)
+    if wet:  # у воды — один знаковый «водный», второй городской
+        marks[1] = _random.choice(HORROR_WATER_LANDMARKS)
+    g, cg = _random.choice("mf"), _random.choice("mf")
+    author = (f"{_random.choice(AUTHOR_NAMES[g])}, {_random.randint(19, 52)}, {_random.choice(AUTHOR_JOBS)} "
+              f"({'он' if g == 'm' else 'она'})")
+    caller = _random.choice([n for n in AUTHOR_NAMES[cg] if n not in author])
     place_facts = await _place_facts(place if not listener else f"{place}; {marks[0]}")
     route = (f"Маршрут автора по городу: живёт — {place}; по ходу истории бывает — {marks[0]}, {marks[1]}. "
              "Называй места так, как говорят местные, по ходу действия («после смены пошёл в торгушку на "
@@ -3635,7 +3690,8 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
                if sign else "В host_intro ведущий говорит, что письмо прислал слушатель, который попросил не "
                "называть имя.") + "\n" + route)
     else:
-        story_src = (f"Главный приём: {engine}. Впиши приём в эту жизнь естественно.\n" + route)
+        story_src = (f"Главный приём: {engine}. Впиши приём в эту жизнь естественно.\n"
+                     f"Автор письма: {author} — такая у него жизнь и работа; имя можно назвать или нет.\n" + route)
     com = "\n".join(f'<comment name={json.dumps(str(c.get("name", ""))[:40], ensure_ascii=False)}>'
                      f'{str(c.get("text", ""))[:220]}</comment>' for c in (comments or [])[:25])
     user = (
@@ -3674,7 +3730,8 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
         "title — 2-4 слова.\n"
         "call — звонок в студию сразу после письма: gender — \"m\" или \"f\"; host_in — ведущий слышит звонок и "
         "снимает трубку, 1-2 короткие фразы («О, у нас звонок! Алло, вы в эфире»); text — звонящий, 3-5 фраз, 40-70 "
-        "слов, живая разговорная речь с запинками, как по телефону: представляется по имени (выдуманному), у него "
+        f"слов, живая разговорная речь с запинками, как по телефону: представляется — его зовут {caller} (gender — "
+        f"{'f' if cg == 'f' else 'm'}), у него "
         "было похожее — связано с местом или деталью письма, без развязки, тревожно; host_outro потом начинается с "
         "реакции ведущего на звонок.\n"
         "sfx — 2-3 звука по сюжету письма в самых жутких местах: after — ТОЧНО последние 4-7 слов фразы из letter, "
@@ -3693,8 +3750,8 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
         '"call": {"gender": "f", "host_in": "", "text": ""}, "sfx": [{"after": "", "sound": "", "secs": 2}], '
         '"music": ""}'
     )
-    asked_shorter = banned = False
-    for attempt in range(3):  # не больше одной просьбы «короче» и одной переделки из-за запретной темы
+    asked_shorter = banned = asked_dry = False
+    for attempt in range(4):  # не больше одной просьбы «короче» и одной переделки из-за запретной темы
         out = await _complete(HORROR_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=16000, effort="high")
         try:
             data = _extract_json(out)
@@ -3707,6 +3764,13 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
         whole = " ".join(paras) + " " + intro + " " + outro + " " + str(data.get("title", ""))
         words = len(strip_tags(" ".join(paras)).split())  # пометки [whispers] — не слова
         clean = bool(paras) and not _HORROR_BAN.search(whole)
+        wets = water_words(" ".join(paras))
+        if clean and not wet and not listener and len(wets) > WATER_MAX and not asked_dry:
+            asked_dry = True
+            logger.info("horror: в письме %d слов про воду (%s) — прошу без воды", len(wets), ", ".join(wets[:8]))
+            user += (f"\n\nВ прошлом варианте слишком много воды ({', '.join(wets[:8])}). Место истории не у воды: "
+                     "та же история, но без воды, сырости, тины и мокрого — страх через звуки, свет, вещи, запахи и людей.")
+            continue
         if clean and words > HORROR_MAX_WORDS and not asked_shorter:
             asked_shorter = True
             logger.info("horror: письмо на %d слов — длиннее двух минут, прошу короче", words)
@@ -3714,7 +3778,8 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
                      "450-700 слов, 7-10 абзацев, с той же развязкой.")
             continue
         if clean:
-            logger.info("horror: письмо %d слов, %d абзацев, приём «%s»; payoff: %s", words, len(paras), engine[:50],
+            logger.info("horror: письмо %d слов, %d абзацев, приём «%s», место «%s»%s, воды %d; payoff: %s", words,
+                        len(paras), engine[:50], place[:40], " (у воды)" if wet else "", len(wets),
                         str(data.get("payoff", ""))[:160])
             subject = scrub(str(data.get("subject", "")).strip().strip("«»\"'. "))[:60]
             call = data.get("call") if isinstance(data.get("call"), dict) else {}
@@ -3733,7 +3798,7 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
                                 "secs": max(1.0, min(4.0, secs))})
             return {"title": scrub(str(data.get("title", "")).strip())[:60], "subject": subject,
                     "premise": f"{place[:30]} | {marks[0][:25]} | {engine[:40] if not listener else 'письмо слушателя'}"
-                               f" | {data.get('premise', '')}", "intro": intro,
+                               f"{' | ' + WATER_MARK if wet else ''} | {data.get('premise', '')}", "intro": intro,
                     "outro": outro, "paragraphs": [p for p in paras if not _garbled(p)][:16],
                     "call": {"gender": "f" if str(call.get("gender", "")).lower().startswith("f") else "m",
                              "host_in": call_in, "text": call_text} if call_text and call_in else None,

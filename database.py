@@ -292,6 +292,10 @@ class Database:
                 await db.execute("ALTER TABLE stickers ADD COLUMN descr TEXT")
             if "kind" not in cols:
                 await db.execute("ALTER TABLE stickers ADD COLUMN kind TEXT NOT NULL DEFAULT 'sticker'")
+            # Миграция: расходы ИИ — какая функция бота потратила (разбивка в /admin → «Расходы ИИ»)
+            cur = await db.execute("PRAGMA table_info(ai_usage)")
+            if "kind" not in {r[1] for r in await cur.fetchall()}:
+                await db.execute("ALTER TABLE ai_usage ADD COLUMN kind TEXT")
             await db.commit()
 
     # --- стикеры чата (бот запоминает и кидает по ситуации) ---
@@ -945,12 +949,12 @@ class Database:
     # --- расходы на ИИ ---
 
     async def add_ai_usage(self, game_key: str | None, model: str, input_tokens: int,
-                           output_tokens: int, cost: float) -> None:
+                           output_tokens: int, cost: float, kind: str | None = None) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "INSERT INTO ai_usage (ts, game_key, model, input_tokens, output_tokens, cost) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (int(time.time()), game_key, model, input_tokens, output_tokens, cost),
+                "INSERT INTO ai_usage (ts, game_key, model, input_tokens, output_tokens, cost, kind) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (int(time.time()), game_key, model, input_tokens, output_tokens, cost, kind),
             )
             await db.commit()
 
@@ -982,6 +986,11 @@ class Database:
                 "FROM ai_usage GROUP BY model ORDER BY SUM(cost) DESC"
             )
             report["models"] = list(await cur.fetchall())
+            for name, since in (("kinds_day", now - 86400), ("kinds_week", now - 7 * 86400)):
+                cur = await db.execute(
+                    "SELECT COALESCE(kind, ''), SUM(cost), COUNT(*), SUM(input_tokens), SUM(output_tokens) "
+                    "FROM ai_usage WHERE ts >= ? GROUP BY kind ORDER BY SUM(cost) DESC LIMIT 12", (since,))
+                report[name] = list(await cur.fetchall())
             return report
 
     # --- статистика Бункера ---
