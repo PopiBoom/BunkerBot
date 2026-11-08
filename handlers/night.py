@@ -220,9 +220,10 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop) -> di
         except ValueError:
             used = []
         day = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"][now.weekday()]
-        facts = (f"сейчас {_clock(now)}, {day}; " + (cond["line"] or "погода неизвестна")
+        facts = (f"сегодня {ai.date_words(now.date())}, {day}; сейчас {_clock(now)}; "
+                 + (cond["line"] or "погода неизвестна")
                  + ("; на улице светло" if cond["end"].startswith("До заката") else "; на улице темно"))
-        story = await ai.horror_story(used[-10:], facts)
+        story = await ai.horror_story(used[-10:], facts, now.date())
         if not story["paragraphs"]:
             raise RuntimeError("ИИ не написал историю")
         topic = story["subject"] or story["title"] or "без темы"
