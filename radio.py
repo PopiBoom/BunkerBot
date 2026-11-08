@@ -329,6 +329,58 @@ def _jingle(up: bool = True) -> np.ndarray:
     return out / (np.abs(out).max() or 1)
 
 
+def _tension(ln: int, rng: np.random.Generator) -> np.ndarray:
+    """Напряжение под письмом (владелец 08.11: «добавь помехи, напряжение в эфире»): низкий гул, который медленно
+    ползёт вверх и нарастает; тонкий писк в ушах к концу; в последней трети — стук сердца, всё чаще. float32."""
+    out = np.zeros(ln, dtype=np.float32)
+    span = max(ln / SR, 1.0)
+    for p0 in range(0, ln, BED_SEG):  # кусками — без массивов на весь эфир
+        n = min(BED_SEG, ln - p0)
+        t = (np.arange(n, dtype=np.float64) + p0) / SR
+        prog = t / span
+        ph = 2 * np.pi * (52 * t + 22 * span * prog ** 2.5 / 2.5)            # 52 → 74 Гц, фаза непрерывна
+        drone = np.sin(ph) + 0.6 * np.sin(1.012 * ph + 1.3) + 0.3 * np.sin(2.003 * ph)
+        drone *= (0.2 + 0.8 * prog ** 1.3) / 1.9                              # нарастает к концу
+        phw = 2 * np.pi * (7800 * t + 600 * span * prog ** 2 / 2)             # писк 7.8 → 8.4 кГц
+        whine = np.sin(phw) * np.clip((prog - 0.55) / 0.45, 0, 1) * 0.05
+        out[p0:p0 + n] = (drone + whine).astype(np.float32)
+    t0 = 0.62 * span  # сердце: с последней трети, 64 → 96 ударов в минуту
+    beat = np.arange(int(0.16 * SR)) / SR
+    lub = (np.sin(2 * np.pi * 55 * beat) * np.exp(-beat * 28)).astype(np.float32)
+    dub = (np.sin(2 * np.pi * 47 * beat) * np.exp(-beat * 32) * 0.7).astype(np.float32)
+    tt = t0
+    while tt < span - 0.4:
+        prog = (tt - t0) / max(span - t0, 1e-3)
+        for at, snd, amp in ((tt, lub, 1.0), (tt + 0.17, dub, 1.0)):
+            i = int(at * SR)
+            k = min(len(snd), ln - i)
+            if k > 0:
+                out[i:i + k] += snd[:k] * amp * (0.5 + 0.5 * prog)
+        tt += 60 / (64 + 32 * prog)
+    return out
+
+
+def _interference(mix: np.ndarray, a: int, b: int, rng: np.random.Generator) -> None:
+    """Помехи на голосе письма: каждые 5-9 с сигнал на миг проваливается (голос тише) и трещит эфир."""
+    pos = a + int(3 * SR)
+    while pos < b - int(2 * SR):
+        n = int(rng.uniform(0.08, 0.25) * SR)
+        ramp = min(int(0.015 * SR), n // 3)
+        dip = np.full(n, 0.22, dtype=np.float32)  # провал сигнала: голос на ~13 дБ тише
+        dip[:ramp] = np.linspace(1, 0.22, ramp, dtype=np.float32)
+        dip[-ramp:] = np.linspace(0.22, 1, ramp, dtype=np.float32)
+        mix[pos:pos + n] *= dip
+        burst = _band(rng.standard_normal(n).astype(np.float32), 1200, 6000)
+        burst /= max(float(np.abs(burst).max()), 1e-6)
+        mix[pos:pos + n] += burst * np.hanning(n).astype(np.float32) * np.float32(_db(-21) * rng.uniform(0.6, 1))
+        for _ in range(rng.integers(2, 6)):  # потрескивания вокруг
+            c = pos + int(rng.integers(-n, 2 * n))
+            ln = min(90, len(mix) - c)
+            if ln > 0 and c >= 0:
+                mix[c:c + ln] += (np.exp(-np.arange(ln) / 14) * rng.choice([-1, 1]) * _db(-24)).astype(np.float32)
+        pos += int(rng.uniform(5, 9) * SR)
+
+
 def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed: int = 0,
            glitches: set[int] | None = None) -> np.ndarray:
     """Страшная рубрика как настоящий эфир (float32, 48 кГц, пик ≈ -1 дБ). styles — "host" / "letter" для каждого
@@ -364,6 +416,9 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
     mix = np.zeros(n, dtype=np.float32)
     mix[:len(head)] += head * _db(-6)
     mix[start:start + len(voice)] += voice
+    for a0, b0, st in spans:  # помехи — только на письме
+        if st == "letter":
+            _interference(mix, start + a0, start + b0, rng)
     end = start + len(voice) + int(0.6 * SR)
     mix[end:end + len(tail)] += tail * _db(-8)
     # гул и стук — только под письмом, с плавным входом и выходом
@@ -372,11 +427,11 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
         a, b = start + letters[0][0], start + letters[-1][1]
         ln = b - a
         base, phase = rng.uniform(46, 55), rng.uniform(0, 6)
-        bed = np.zeros(ln, dtype=np.float32)
+        bed = _band(_tension(ln, rng), 25, 12000) * np.float32(_db(+2))  # нарастающее напряжение
         p0 = 0
-        while p0 < ln:  # кусками по 30 с — память не растёт с длиной
+        while p0 < ln:  # гул и далёкий стук — кусками по 30 с, память не растёт с длиной
             seg_n = min(BED_SEG, ln - p0)
-            bed[p0:p0 + seg_n] = _band(_drone(seg_n, rng, p0 / SR, base, phase), 30, 900)
+            bed[p0:p0 + seg_n] += _band(_drone(seg_n, rng, p0 / SR, base, phase), 30, 900) * np.float32(_db(-5))
             p0 += seg_n
         fi, fo = min(int(2.0 * SR), ln // 3), min(int(1.5 * SR), ln // 3)
         bed[:fi] *= np.linspace(0, 1, fi, dtype=np.float32)
