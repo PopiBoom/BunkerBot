@@ -45,6 +45,7 @@ HORROR_COUNT_KEY = "horror_no2"  # у рубрики страшных истор
 FIRST_KEY = "night_first_sent"
 HORROR_FIRST_KEY = "horror_first_sent"
 HORROR_KEY = "horror_titles"
+MOTIFS_KEY = "horror_motifs"     # ключевые детали прошлых выпусков — не повторять (владелец: «ключи и т.д.»)
 TOPICS_KEY = "night_topics"
 TOPICS = [
     "обычные дни, которые не запоминаются", "люди за соседними окнами", "дорога домой ночью",
@@ -190,7 +191,8 @@ def _conditions(w: dict | None, now: datetime) -> dict:
 # ---------- эфир ----------
 
 
-def _caption(horror: bool, n: int, topic: str, now: datetime, weather: str, bot_username: str = "") -> str:
+def _caption(horror: bool, n: int, topic: str, now: datetime, weather: str, bot_username: str = "",
+             fmt: str = "письмо") -> str:
     """Подпись к голосовому (и в канале): рубрика, номер выпуска, тема письма, время и погода; у рубрики — как
     прислать свою историю (ссылка открывает бота сразу на письме)."""
     when = f"{now:%H:%M}" + (f" · {html.escape(weather)}" if weather else "")
@@ -200,8 +202,9 @@ def _caption(horror: bool, n: int, topic: str, now: datetime, weather: str, bot_
         subject = (topic or "без темы").strip()
         subject = subject[:1].upper() + subject[1:]
         link = deep_link(bot_username)
+        icon, name = next(((f[2], f[1]) for f in ai.HORROR_FORMATS if f[0] == fmt), ("✉️", "письмо"))
         return (f"🩸 <b>{ai.HORROR_RUBRIC.upper()}</b> · выпуск №{n}\n"
-                f"✉️ <i>«{html.escape(subject)}»</i>\n\n"
+                f"{icon} <i>«{html.escape(subject)}»</i>" + ("" if fmt == "письмо" else f" · {name}") + "\n\n"
                 f"📻 Радио Волгограда · {when}"
                 + (f"\n\n📨 Свою историю можно оставить в этом боте: <a href=\"{link}\">@{html.escape(bot_username)}</a>"
                    if link else ""))
@@ -236,9 +239,15 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
                  + (cond["line"] or "погода неизвестна")
                  + ("; на улице светло" if cond["end"].startswith("До заката") else "; на улице темно"))
         coms = await inbox.comments(db)
-        story = await ai.horror_story(used[-10:], facts, now.date(), listener=letter, comments=coms)
+        try:
+            motifs = list(json.loads(await db.get_setting(MOTIFS_KEY, "[]") or "[]"))
+        except (ValueError, TypeError):
+            motifs = []
+        story = await ai.horror_story(used[-10:], facts, now.date(), listener=letter, comments=coms, motifs=motifs)
         if not story["paragraphs"]:
             raise RuntimeError("ИИ не написал историю")
+        if story.get("motifs"):
+            await db.set_setting(MOTIFS_KEY, json.dumps((motifs + story["motifs"])[-40:], ensure_ascii=False))
         if ai.eleven_key() and not ai.eleven_geo_blocked():  # музыка и звуки — пока озвучивается голос
             music_task = asyncio.create_task(ai.eleven_ambient(story.get("music", "")))
             sfx_tasks = [asyncio.create_task(ai.eleven_sfx(x["sound"], x["secs"])) for x in story.get("sfx") or []]
@@ -251,20 +260,21 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
                                    f"{ai.HORROR_SIGNOFF}")
         intro, outro = " ".join(intro.split()), " ".join(outro.split())
         call = story.get("call")
-        paragraphs = [ai.strip_tags(p) for p in [intro] + story["paragraphs"]
-                      + ([f"📞 {call['host_in']}", f"- {call['text']}"] if call else []) + [outro]]  # без пометок
-        # Озвучка кусками: вступление, письмо ЦЕЛИКОМ, (звонок в студию: ведущий снимает трубку, звонящий), концовка.
-        # Владелец 08.11: «история прерывается посередине» — письмо шло двумя кусками со сбоем эфира между ними, и
-        # вторую половину голос начинал заново, другим тоном. Абзацы письма — переносами строк.
-        chunks = [intro, "\n\n".join(story["paragraphs"])]
-        styles, roles = ["host", "letter"], ["host", "letter"]
+        body = list(story["paragraphs"])
+        if call:  # в тексте черновика звонок — после того абзаца, где он прозвучит
+            key = ai.strip_tags(call["after"]).lower()[-25:]
+            at = next((i for i, p in enumerate(body) if key and key in ai.strip_tags(p).lower()), len(body) // 2)
+            body = body[:at + 1] + [f"📞 {call['host_in']}", f"- {call['text']}", f"📞 {call['host_back']}"] + body[at + 1:]
+        paragraphs = [ai.strip_tags(p) for p in [intro] + body + [outro]]  # текст черновика — без пометок
+        # Озвучка: вступление, письмо ЦЕЛИКОМ, концовка; звонок посреди письма (владелец 08.11) — тремя отдельными
+        # кусками (ведущий прерывается, звонящий, ведущий возвращается), radio.studio вклеивает их в паузу письма.
+        # Владелец раньше: «история прерывается посередине» — письмо двумя кусками начиналось заново другим тоном,
+        # поэтому само письмо — одним куском.
+        chunks = [intro, "\n\n".join(story["paragraphs"]), outro]
+        styles, roles = ["host", "letter", "host"], ["host", "letter", "host"]
         if call:
-            chunks += [call["host_in"], call["text"]]
-            styles += ["host_call", "call"]
-            roles += ["host", f"call_{call['gender']}"]
-        chunks.append(outro)
-        styles.append("host")
-        roles.append("host")
+            chunks += [call["host_in"], call["text"], call["host_back"]]
+            roles += ["host", f"call_{call['gender']}", "host"]
         await db.set_setting(HORROR_KEY, json.dumps((used + [story["premise"][:160]])[-30:], ensure_ascii=False))
     else:
         try:
@@ -280,7 +290,7 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
         roles = [False] * len(paragraphs)
         await db.set_setting(TOPICS_KEY, json.dumps((used + [topic])[-30:], ensure_ascii=False))
     n = int(await db.get_setting(HORROR_COUNT_KEY if horror else COUNT_KEY, "0") or 0) + 1
-    caption = _caption(horror, n, topic, now, cond["caption"], bot_username)
+    caption = _caption(horror, n, topic, now, cond["caption"], bot_username, story.get("format", "письмо"))
     async def step(i: int, total: int, who: str) -> None:
         await progress(f"🎙 Озвучиваю: {i} из {total} · {who}")
 
@@ -310,12 +320,19 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
         if music_task:
             data = await music_task
             music = await asyncio.to_thread(radio.decode, data) if data else None
-        extras = (f"звуков {len(events)} из {len(story.get('sfx') or [])}, музыка {'ElevenLabs' if music is not None else 'своя'}"
-                  f", звонок {'есть' if story.get('call') else 'нет'}"
+        interrupt = None
+        call = story.get("call")
+        if call and len(voice) >= 6:
+            at = ai.sfx_time(call["after"], letter_text, letter_secs)
+            interrupt = (at if at is not None else letter_secs * 0.55, voice[3:6])
+        extras = (f"{story.get('format', 'письмо')}, тема «{story.get('kind', '')}», звуков {len(events)} из "
+                  f"{len(story.get('sfx') or [])}, музыка {'ElevenLabs' if music is not None else 'своя'}, звонок "
+                  + (f"посреди письма ({interrupt[0]:.0f} с из {letter_secs:.0f})" if interrupt else "нет")
                   + (", метки времени" if ai.letter_alignment[0] else ""))
         logger.info("horror: %s", extras)
         who = f"{who} · {extras}" if who else extras
-        mix = await asyncio.to_thread(radio.studio, voice, styles, ai.SPEAK_RATE, int(time.time()), events, music)
+        mix = await asyncio.to_thread(radio.studio, voice[:3], styles, ai.SPEAK_RATE, int(time.time()), events, music,
+                                      interrupt, story.get("format") == "диктофон")
     else:       # ночной эфир — «сквозь приёмник», как было
         mix = await asyncio.to_thread(radio.broadcast, voice, ai.SPEAK_RATE, cond["rain"], int(time.time()))
     ogg = await asyncio.to_thread(radio.to_ogg, mix)
