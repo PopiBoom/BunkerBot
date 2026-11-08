@@ -438,14 +438,87 @@ _voice_text: dict[tuple[int, int], str] = {}    # (чат, id голосовог
 
 
 def _voice_back(chat_id: int, message: Message, bot_id: int) -> bool:
-    """Отвечать ли голосом: человек сам говорит голосом — в ответ на голосовое бота или в голосовом разговоре."""
-    if (chat_id, message.message_id) not in _heard or not ai.eleven_key() or ai.eleven_geo_blocked():
-        return False
+    """Отвечать ли голосом: к боту обратились голосовым — голос на голос, как в живом разговоре (владелец 08.11:
+    «сделай, чтобы глс как живое общение было»; сюда попадают только обращения к боту)."""
+    return (chat_id, message.message_id) in _heard and bool(ai.eleven_key()) and not ai.eleven_geo_blocked()
+
+
+# Пустое голосовое (владелец 08.11: «на пустые глс он тоже хуйню отвечает»): тишина, шум, одни «эээ/ммм» —
+# расшифровка давала «[…]» или междометия, и бот отвечал на них как на реплику. Теперь пустое узнаём по звуку
+# (громче шума меньше VOICED_MIN с — расшифровку даже не зовём) и по расшифровке (`_empty_speech`). Если это ответ
+# боту или идёт голосовой разговор с ним — живая реакция («чё? не слышно», EMPTY_VOICE_LINES), иначе молчим.
+VOICED_MIN = 0.4
+_FILLER = re.compile(r"^(?:э+|м+|а+|о+|у+|х[мэ]+|эм+|ам+|ну+|ой|ах|ох|эх|кхм|пф+|тс+|ш+|хе+|ха)$", re.IGNORECASE)
+EMPTY_VOICE_LINES = [
+    "Чё? Нихуя не слышно было.", "Ты в кармане записал, что ли?", "Сопишь ты красиво. А сказать-то что хотел?",
+    "Это голосовое или ты просто подышал мне в ухо?", "Ещё раз, только теперь со словами.",
+    "Тишина в эфире. Мысль по дороге потерял?", "Я, конечно, умный, но тишину переводить не умею.",
+    "Повтори, у тебя там шуршит всё.", "Записал голосовое и передумал говорить? Сильно.", "Алло, приём, тебя не слышно.",
+    "Шум ветра я понял. Дальше что?", "Это ты так молчишь в мою сторону?",
+]
+_empty_last: dict[tuple[int, int], float] = {}
+_empty_used: list[str] = []
+
+
+def _voiced_secs(wav: bytes) -> float:
+    """Сколько секунд в записи громче шума (кадры 20 мс громче -38 дБ)."""
+    import io
+    import wave
+
+    import numpy as np
+
+    try:
+        with wave.open(io.BytesIO(wav)) as w:
+            rate = w.getframerate()
+            x = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768
+    except Exception:
+        return 99.0  # не разобрали — пусть решает расшифровка
+    fr = max(1, rate // 50)
+    m = len(x) // fr
+    if m == 0:
+        return 0.0
+    lv = 10 * np.log10(np.mean(np.square(x[:m * fr].reshape(m, fr)), axis=1) + 1e-12)
+    return float((lv > -38).sum()) * fr / rate
+
+
+def _empty_speech(text: str) -> bool:
+    """В расшифровке нет слов: «[…]», «(неразборчиво)», «*дыхание*», одни «эээ», «ммм»."""
+    t = re.sub(r"\[[^\]]*\]|\([^)]*\)|\*[^*]*\*", " ", text or "")
+    words = re.findall(r"\w+", t.lower())
+    return not words or all(_FILLER.match(w) for w in words)
+
+
+async def _hear_voice(data: bytes) -> tuple[str, bool]:
+    """(что сказано, пустое ли). «Пустое» — точно знаем, что слов нет, а не «нет ключа» или сбой расшифровки."""
+    wav = await asyncio.to_thread(frames.audio_wav, data, HEAR_MAX_SEC)
+    if not wav:
+        return "", False
+    if await asyncio.to_thread(_voiced_secs, wav) < VOICED_MIN:
+        return "", True
+    if not ai.openrouter_available():
+        return "", False
+    speech = await ai.transcribe(wav)
+    if ai.hear_failed[0]:
+        return "", False
+    return ("", True) if _empty_speech(speech) else (speech, False)
+
+
+async def _answer_empty_voice(bot: Bot, chat_id: int, message: Message) -> None:
+    """Пустое голосовое боту (ответом на него или в голосовом разговоре) — реакция как у живого; иначе молчим."""
+    user = message.from_user
     rt = message.reply_to_message
-    if rt and rt.from_user and rt.from_user.id == bot_id and rt.voice:
-        return True
-    who = message.from_user
-    return bool(who) and time.time() - _voice_talk.get((chat_id, who.id), 0) < VOICE_TALK
+    to_bot = bool(rt and rt.from_user and rt.from_user.id == bot.id)
+    talking = time.time() - _voice_talk.get((chat_id, user.id), 0) < VOICE_TALK
+    key = (chat_id, user.id)
+    if not (to_bot or talking) or _bunker_active(chat_id) or time.time() - _empty_last.get(key, 0) < 60:
+        return
+    _empty_last[key] = time.time()
+    line = random.choice([t for t in EMPTY_VOICE_LINES if t not in _empty_used[-4:]] or EMPTY_VOICE_LINES)
+    _empty_used.append(line)
+    del _empty_used[:-8]
+    _mark("пустое голосовое", line)
+    await _say_human(bot, chat_id, line, reply_to=message.message_id,  # голосом говорили — голосом и отвечаем
+                     voice=bool(ai.eleven_key()) and not ai.eleven_geo_blocked(), to_user=user.id)
 
 
 async def _voice_said(db: Database, chat_id: int, msg_id: int) -> str:
@@ -848,7 +921,7 @@ async def cmd_golos(message: Message, command: CommandObject, bot: Bot, db: Data
         await bot.send_chat_action(chat_id, "record_voice")
         ctx = await db.recent_messages(chat_id, limit=25)
         answer = await ai.banter(name, text, _as_dicts(ctx), dossier=await db.get_dossier(chat_id, who.id),
-                                 samples=await db.style_sample(chat_id), is_father=is_father)
+                                 samples=await db.style_sample(chat_id), is_father=is_father, spoken=True)
         _mark("/golos - ответ голосом", answer)
         answer = await ai.polish(answer, text, _as_dicts(await db.recent_messages(chat_id, limit=20)),
                                  author=ai.FATHER_NAME if is_father else name)
@@ -1231,6 +1304,7 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     text = "\n".join(texts) or (last_msg.text or "")
     rt = last_msg.reply_to_message
     voice_back = _voice_back(chat_id, last_msg, bot.id)  # говорит с ботом голосом — и бот ему голосом
+    voice = voice_back or _roll_voice(chat_id)  # решаем заранее: голосом ИИ пишет как говорят вслух
     said = rt.text if rt and rt.from_user and rt.from_user.id == bot.id else None
     if not said and rt and rt.from_user and rt.from_user.id == bot.id and rt.voice:  # ответ на голосовое бота
         said = await _voice_said(db, chat_id, rt.message_id)
@@ -1243,6 +1317,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
                 logger.debug("short answer meaning failed: %s", e)
         text = (f"(отвечает на твою реплику «{said[:300]}»"
                 + (f"; смысл ответа: {meaning}" if meaning else "") + f")\n{text}")
+    if (chat_id, last_msg.message_id) in _heard:  # это расшифровка его голосового
+        text = f"(сказал голосом) {text}"
     rude = any(r for m, r in items if m.from_user and who and m.from_user.id == who.id)
     samples = await db.style_sample(chat_id)
     await _remember_lines(db, chat_id)
@@ -1276,7 +1352,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
             answer = random.choice(MIRRORS).format(n="бать" if is_father else name)
         if ai.available():
             try:
-                jab = await ai.comeback(name, text, short=True, dossier=dossier, samples=samples, is_father=is_father)
+                jab = await ai.comeback(name, text, short=True, dossier=dossier, samples=samples, is_father=is_father,
+                                        spoken=voice)
                 _mark("послали - зеркалка + добивка", f"{answer} {jab}")
                 if jab:  # редактор проверяет ответ целиком, как одно сообщение
                     full = await ai.polish(f"{answer} {jab}", text,
@@ -1289,7 +1366,7 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
         if not _why.get():
             _mark("послали - зеркалка")
         await _say_human(bot, chat_id, ai.vary_father(answer) if is_father else answer,
-                         reply_to=last_msg.message_id, voice=voice_back or _roll_voice(chat_id),
+                         reply_to=last_msg.message_id, voice=voice,
                          to_user=who.id if who else None)
         if who:
             _thread.setdefault((chat_id, who.id), []).append(time.time())
@@ -1299,13 +1376,14 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     if ai.available():
         try:
             if rude:
-                answer = await ai.comeback(name, text, dossier=dossier, samples=samples, is_father=is_father)
+                answer = await ai.comeback(name, text, dossier=dossier, samples=samples, is_father=is_father,
+                                           spoken=voice)
             else:
                 ctx = await db.recent_messages(chat_id, limit=25)
                 quote = (await _old_quote(db, chat_id, who.id)
                          if who and not greeting and random.random() < QUOTE_RECALL else "")
                 answer = await ai.banter(name, text, _as_dicts(ctx), dossier=dossier, samples=samples,
-                                         is_father=is_father, quote=quote)
+                                         is_father=is_father, quote=quote, spoken=voice)
             _mark(("ответка на грубость" if rude else "ответ на обращение") + (" бате" if is_father else ""), answer)
             if answer:  # редактор: связно ли, к месту ли, коротко ли
                 answer = await ai.polish(answer, text, _as_dicts(await db.recent_messages(chat_id, limit=20)),
@@ -1319,7 +1397,7 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
         answer = ai.vary_father(answer)
     if answer:
         await _say_human(bot, chat_id, answer, reply_to=last_msg.message_id,
-                         voice=voice_back or _roll_voice(chat_id), to_user=who.id if who else None)
+                         voice=voice, to_user=who.id if who else None)
         if who:
             _thread.setdefault((chat_id, who.id), []).append(time.time())
         if random.random() < STICKER_AFTER:
@@ -1618,13 +1696,19 @@ async def on_group_voice(message: Message, bot: Bot, db: Database, config=None) 
     if not await _enabled(db) or await db.is_optout(chat_id, user.id):
         return
     voice = message.voice
-    speech = ""
+    speech, empty = "", False
     if (voice.file_size or 0) <= VIDEO_MAX and not _bunker_active(chat_id):
         try:
-            speech = await _hear((await bot.download(voice)).read())
+            speech, empty = await _hear_voice((await bot.download(voice)).read())
         except Exception as e:
             logger.warning("voice download failed: %s", e)
-    if not speech:  # не расслышал (нет ключа, тишина) — хотя бы помним, что было голосовое
+    if empty:  # голосовое без слов — не реплика: в память как есть, боту — живая реакция
+        logger.info("пустое голосовое в %s от %s (%s сек)", chat_id, _name(message), voice.duration or 0)
+        await db.add_chat_message(chat_id, message.message_id, user.id, _name(message), user.username,
+                                  f"[голосовое без слов, {voice.duration or 0} сек]")
+        await _answer_empty_voice(bot, chat_id, message)
+        return
+    if not speech:  # не расслышал (нет ключа, сбой) — хотя бы помним, что было голосовое
         await db.add_chat_message(chat_id, message.message_id, user.id, _name(message), user.username,
                                   f"[голосовое, {voice.duration or 0} сек]")
         return

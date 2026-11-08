@@ -599,9 +599,9 @@ async def admin_rant(call: CallbackQuery, db: Database, config: Config) -> None:
     if call.message:
         await call.message.answer(
             f"🎙 Голосовые в канал {state}\n\nРаз в день в случайное время ({rant.FROM_HOUR}-{rant.TO_HOUR} МСК) "
-            "Пиздюк голосом (тот, что в /golos) наезжает на подписоту канала, каждое третье — с требованием "
-            "реакций. /podpisota — прямо сейчас (/podpisota реакции — с реакциями). ≈$0.02 + ≈150 символов "
-            "ElevenLabs за голосовое.")
+            "Пиздюк голосом (тот, что в /golos) — по кругу: наезд на подписоту, смешная история про канал, наезд с "
+            "просьбой поставить реакцию. /podpisota — прямо сейчас (/podpisota история / реакции). ≈$0.03 + "
+            "150-300 символов ElevenLabs за голосовое.")
 
 
 @router.callback_query(F.data == "admin:roast_freq")

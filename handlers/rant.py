@@ -1,14 +1,16 @@
 """Голосовое Пиздюка в канал: наезд на подписоту.
 
 08.11 владелец: «чтобы бот голосом, который стоит с /golos, иногда в канал обидную херню про подписоту выкидывал и
-говорил, чтобы реакции ставили иногда»; примеры одобрил («Давай»): раз в день в случайное время, каждое третье — с
-требованием реакций, сразу в канал, без одобрения.
+говорил, чтобы реакции ставили иногда»; примеры одобрил («Давай»): раз в день в случайное время, сразу в канал, без
+одобрения. Потом: «без упоминаний, какие реакции ставить — у меня не все доступны» и «иногда пусть рассказывает
+историю и смешно шутит, связанное с каналом». По кругу (счёт `rant_no`): наезд → смешная история → наезд с просьбой
+поставить реакцию (любую, не называя).
 
 Время дня выбирается на первом тике дня — случайное между FROM_HOUR и TO_HOUR МСК (если бот запустился посреди дня —
 не раньше чем через 10 минут). Текст — ai.channel_rant (Opus medium, ≈$0.02; тема из ai.RANT_TOPICS без повторов
-последних TOPIC_GAP, прошлые голосовые — «не повторяй»), с пометками интонации; голос — ai.roast_speech (тот, что в
-/golos, ElevenLabs v4). Реакцию просит из разрешённых в канале (словами). Без ключа ElevenLabs не выходит.
-/podpisota — выкинуть сейчас (/podpisota реакции — с просьбой о реакциях). Вкл/выкл — /admin «🎙 Голосовые в канал».
+последних TOPIC_GAP, история — завязка из ai.RANT_STORIES, прошлые голосовые — «не повторяй»), с пометками
+интонации; голос — ai.roast_speech (тот, что в /golos, ElevenLabs v4). Без ключа ElevenLabs не выходит.
+/podpisota — выкинуть сейчас (/podpisota история, /podpisota реакции). Вкл/выкл — /admin «🎙 Голосовые в канал».
 """
 from __future__ import annotations
 
@@ -33,17 +35,13 @@ MSK = timezone(timedelta(hours=3))
 ON_KEY = "rant_on"
 DAY_KEY = "rant_day"        # день, когда голосовое уже вышло (или пробовали — упало, не повторяем весь день)
 SLOT_KEY = "rant_slot"      # «ГГГГ-ММ-ДД ЧЧ:ММ» — во сколько сегодня
-NO_KEY = "rant_no"          # сколько вышло всего (каждое CTA_EVERY-е — с реакциями)
+NO_KEY = "rant_no"          # сколько вышло всего: по кругу наезд → история → наезд с реакциями
 TEXTS_KEY = "rant_texts"    # прошлые тексты — не повторяться
 TOPICS_KEY = "rant_topics"  # прошлые темы
 FROM_HOUR, TO_HOUR = 12, 23
-CTA_EVERY = 3
+CYCLE = ("rant", "story", "cta")  # что выходит по кругу
 TOPIC_GAP = 6
 _lock = asyncio.Lock()
-
-# какие реакции бот может попросить — и как их назвать вслух
-REACTION_NAMES = {"🔥": "огонёк", "🤡": "клоуна", "💩": "какашку", "👻": "привидение", "🖕": "средний палец",
-                  "😈": "чертёнка", "💯": "сотку", "🙈": "обезьянку", "👀": "глаза", "😭": "рыдающую рожу"}
 
 
 def _today() -> str:
@@ -58,22 +56,9 @@ def _load(raw: str) -> list:
     return data if isinstance(data, list) else []
 
 
-async def _reactions(bot: Bot, chan: int) -> list[str]:
-    """Какие реакции разрешены в канале — словами. Ограничений нет (или не узнали) — весь наш список."""
-    try:
-        allowed = getattr(await bot.get_chat(chan), "available_reactions", None)
-    except Exception:
-        allowed = None
-    if allowed:
-        emojis = {getattr(r, "emoji", None) for r in allowed}
-        names = [n for e, n in REACTION_NAMES.items() if e in emojis]
-        if names:
-            return names
-    return list(REACTION_NAMES.values())
-
-
-async def post(bot: Bot, db: Database, cta: bool | None = None) -> str:
-    """Записать и выложить голосовое в канал. "" — вышло, иначе — почему нет (для админа и лога)."""
+async def post(bot: Bot, db: Database, kind: str | None = None) -> str:
+    """Записать и выложить голосовое в канал. kind — rant / story / cta (None — по кругу CYCLE).
+    "" — вышло, иначе — почему нет (для админа и лога)."""
     import radio
     from handlers import channel_posts
 
@@ -86,12 +71,12 @@ async def post(bot: Bot, db: Database, cta: bool | None = None) -> str:
         return "не нашёл канал: привяжи его к чату (Канал → Обсуждение) или впиши BOT_CHANNEL_ID в .env"
     async with _lock:
         no = int(await db.get_setting(NO_KEY, "0") or 0) + 1
-        if cta is None:
-            cta = no % CTA_EVERY == 0
+        kind = kind or CYCLE[(no - 1) % len(CYCLE)]
         texts = _load(await db.get_setting(TEXTS_KEY, "[]"))
         topics = _load(await db.get_setting(TOPICS_KEY, "[]"))
-        topic = random.choice([t for t in ai.RANT_TOPICS if t not in topics[-TOPIC_GAP:]] or ai.RANT_TOPICS)
-        text = await ai.channel_rant(texts, topic, cta, await _reactions(bot, chan) if cta else [])
+        pool = ai.RANT_STORIES if kind == "story" else ai.RANT_TOPICS
+        topic = random.choice([t for t in pool if t not in topics[-TOPIC_GAP:]] or pool)
+        text = await ai.channel_rant(texts, topic, cta=kind == "cta", story=kind == "story")
         if not ai.strip_tags(text):
             return "ИИ ничего не придумал"
         pcm = await ai.roast_speech(text)
@@ -109,8 +94,7 @@ async def post(bot: Bot, db: Database, cta: bool | None = None) -> str:
         await db.set_setting(NO_KEY, str(no))
         await db.set_setting(TEXTS_KEY, json.dumps((texts + [ai.strip_tags(text)])[-20:], ensure_ascii=False))
         await db.set_setting(TOPICS_KEY, json.dumps((topics + [topic])[-20:], ensure_ascii=False))
-        logger.info("голосовое в канал №%d (%s, %d с%s): %s", no, topic, secs, ", с реакциями" if cta else "",
-                    ai.strip_tags(text)[:200])
+        logger.info("голосовое в канал №%d (%s: %s, %d с): %s", no, kind, topic, secs, ai.strip_tags(text)[:200])
         return ""
 
 
@@ -142,8 +126,10 @@ async def tick(bot: Bot, db: Database) -> None:
 
 @router.message(Command("podpisota"))
 async def cmd_podpisota(message: Message, command: CommandObject, bot: Bot, db: Database) -> None:
-    """/podpisota — голосовое в канал сейчас; /podpisota реакции — с требованием реакций."""
-    cta = True if (command.args or "").strip().lower().startswith("реак") else None
+    """/podpisota — голосовое в канал сейчас (по кругу); /podpisota история / реакции / наезд — что именно."""
+    arg = (command.args or "").strip().lower()
+    kind = ("story" if arg.startswith("ист") else "cta" if arg.startswith("реак") else
+            "rant" if arg.startswith("наезд") else None)
     if _lock.locked():
         await temp_reply(message, "🎙 Уже записываю - минуту.")
         return
@@ -152,5 +138,5 @@ async def cmd_podpisota(message: Message, command: CommandObject, bot: Bot, db: 
         await bot.send_chat_action(message.chat.id, "record_voice")
     except Exception:
         pass
-    why = await post(bot, db, cta=cta)
+    why = await post(bot, db, kind=kind)
     await temp_reply(message, "🎙 Голосовое в канале." if not why else f"Не вышло: {why}.")
