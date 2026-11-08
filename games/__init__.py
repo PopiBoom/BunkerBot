@@ -133,6 +133,13 @@ def _flag_needed() -> bool:
             need = True
     except Exception:
         pass
+    try:  # пишется дисс-трек (минута-две) — перезапуск молча оборвал бы запись
+        from handlers import diss
+
+        if diss.busy():
+            need = True
+    except Exception:
+        pass
     try:  # идёт суд чата (≈5 мин) — перезапуск оборвал бы заседание
         from handlers import court
 

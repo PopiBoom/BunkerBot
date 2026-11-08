@@ -588,3 +588,42 @@ def render_serial_cover(season: int, episode: int, title: str, logline: str, cas
         d.text((PAD, h - 120), _wrap(d, "В РОЛЯХ:  " + " · ".join(_plain(c) for c in cast[:6]), _mono(24),
                                      w - 2 * PAD, 1)[0], font=_mono(24), fill=MUTED)
     return _png(img)
+
+
+def render_diss_cover(name: str, title: str, genre: str, photo: bytes | None, seed: int = 0, side: int = 320) -> bytes:
+    """Обложка дисс-трека (значок у аудио в Telegram — до 320×320, JPEG до 200 КБ): тёмный фон с красным
+    свечением, аватарка героя, «ДИСС», название, плашка «ОСТОРОЖНО: МАТ»."""
+    s = 1000
+    img = Image.new("RGB", (s, s), (12, 10, 14))
+    d = ImageDraw.Draw(img)
+    for r in range(700, 0, -10):  # красное свечение за аватаркой
+        t = r / 700
+        d.ellipse((s / 2 - r, 330 - r, s / 2 + r, 330 + r),
+                  fill=(int(12 + 150 * (1 - t) ** 2), int(10 + 16 * (1 - t) ** 2), int(14 + 24 * (1 - t) ** 2)))
+    img = _noise(img, seed or 7)
+    av = _avatar(name, 360, photo, seed)
+    ring = Image.new("RGBA", (380, 380), (0, 0, 0, 0))
+    ImageDraw.Draw(ring).ellipse((0, 0, 379, 379), fill=(245, 240, 235, 255))
+    img.paste(ring, (s // 2 - 190, 70), ring)
+    img.paste(av, (s // 2 - 180, 80), av)
+    stamp = _stamp("ДИСС", 130, CLOWN_RED, -7)
+    img.paste(stamp, (s // 2 - stamp.width // 2, 400), stamp)
+    d = ImageDraw.Draw(img)
+    y = 400 + stamp.height + 10
+    size = 72
+    t = _plain(title).upper()
+    while size > 40 and d.textlength(t, font=_bold(size)) > s - 2 * PAD:
+        size -= 4
+    d.text((s / 2, y + size / 2), _wrap(d, t, _bold(size), s - 2 * PAD, 1)[0], font=_bold(size), fill=TEXT,
+           anchor="mm")
+    d.text((s / 2, y + size + 46), _wrap(d, f"ПИЗДЮК · {genre.upper()} · НА {_plain(name).upper()}", _mono(30),
+                                         s - 2 * PAD, 1)[0], font=_mono(30), fill=GOLD, anchor="mm")
+    label = "ОСТОРОЖНО: МАТ"
+    lw = int(d.textlength(label, font=_bold(28))) + 44
+    x1, y1 = s - 50, s - 44
+    d.rectangle((x1 - lw, y1 - 64, x1, y1), fill=(245, 240, 235))
+    d.rectangle((x1 - lw + 6, y1 - 58, x1 - 6, y1 - 6), outline=(12, 10, 14), width=3)
+    d.text((x1 - lw / 2, y1 - 32), label, font=_bold(28), fill=(12, 10, 14), anchor="mm")
+    out = io.BytesIO()
+    img.resize((side, side), Image.LANCZOS).save(out, "JPEG", quality=88)
+    return out.getvalue()

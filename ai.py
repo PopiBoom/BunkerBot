@@ -1641,6 +1641,81 @@ async def court_verdict(name: str, charges: list[str], defense: str, last_word: 
     return await fix_looks(text) if text else ""
 
 
+# ---------- дисс-трек (/diss): текст пишет Opus, песню с вокалом — ElevenLabs Music ----------
+# Выбор владельца 08.11 из «нового»: песня-дисс на участника по его досье. Текст — по-русски, в рифму, с матом и 2-4
+# настоящими деталями из досье и его сообщений (без выдумок), красные линии те же. Стиль музыки — английскими
+# словами без имён артистов (ElevenLabs отказывает, если назвать исполнителя).
+DISS_GENRES = {  # ключ -> (название, стили для ElevenLabs, слогов в секунду — темп подачи текста)
+    "рэп": ("рэп", ["aggressive russian hip-hop diss track", "hard boom bap drums", "deep sub bass", "dark piano loop",
+                    "confident male rap vocals", "punchy clear delivery", "92 BPM"], 4.6),
+    "трэп": ("трэп", ["russian trap diss track", "rolling hi-hats", "heavy 808 bass", "dark synth melody",
+                      "aggressive male rap vocals", "ad-libs", "140 BPM half-time"], 4.8),
+    "панк": ("панк-рок", ["russian punk rock", "fast distorted guitars", "driving drums", "shouted male vocals",
+                          "gang vocals on chorus", "raw garage production", "176 BPM"], 4.2),
+    "рок": ("рок", ["russian alternative rock", "crunchy guitars", "big drums", "gritty male vocals",
+                    "anthemic chorus", "live band sound", "128 BPM"], 3.6),
+    "шансон": ("шансон", ["russian chanson", "accordion", "nylon string guitar", "husky male vocals",
+                          "tavern atmosphere", "waltz feel", "100 BPM"], 3.2),
+    "попса": ("попса", ["2000s russian pop", "catchy synth hook", "four on the floor beat", "bright male vocals",
+                        "big singalong chorus", "120 BPM"], 3.6),
+    "метал": ("метал", ["heavy metal", "downtuned distorted guitars", "double bass drums",
+                        "aggressive shouted male vocals", "dark heavy riffs", "160 BPM"], 3.8),
+}
+DISS_ALIASES = {"реп": "рэп", "rap": "рэп", "трап": "трэп", "trap": "трэп", "punk": "панк", "rock": "рок",
+                "поп": "попса", "pop": "попса", "металл": "метал", "metal": "метал", "шансончик": "шансон"}
+DISS_SECTIONS = (("verse1", "Verse 1", 8), ("chorus", "Chorus", 4), ("verse2", "Verse 2", 8), ("outro", "Outro", 2))
+
+
+def diss_genre(word: str) -> str | None:
+    w = (word or "").strip().lower().replace("ё", "е")
+    w = DISS_ALIASES.get(w, w)
+    return w if w in DISS_GENRES else None
+
+
+def _diss_lines(v, n: int) -> list[str]:
+    lines = [re.sub(r"\s+", " ", scrub(str(x))).strip(" -—") for x in (v if isinstance(v, list) else [])]
+    return [ln[:120] for ln in lines if ln and not about_looks(ln)][:n]
+
+
+async def diss_lyrics(name: str, dossier: str, messages: list[dict], promises: list[str], gender: str | None,
+                      genre: str, father: bool = False, avoid: list[str] | None = None, clean: bool = False) -> dict:
+    """Текст дисса: {"title", "facts", "verse1", "chorus", "verse2", "outro"} (списки строк). clean — без мата и
+    грубых слов (ElevenLabs отказал по содержанию — одна попытка помягче)."""
+    jn = json.dumps(name, ensure_ascii=False)
+    prom = "\n".join(f"<promise>{p}</promise>" for p in promises)
+    who = {"m": "он (пиши в мужском роде)", "f": "она (пиши в женском роде)"}.get(gender or "", "пол неизвестен "
+                                                                                       "(обходи род глаголов)")
+    user = (
+        f"Герой дисса: {jn}, {who}.\n<dossier>{dossier}</dossier>\n"
+        f"Его сообщения за последние две недели:\n{_msgs_block(messages)}\n"
+        + (f"Его обещания, срок которых вышел:\n{prom}\n" if prom else "")
+        + ("Прошлые диссы на него — не повторяй эти строки и шутки:\n" + "\n".join(f"<old>{a}</old>" for a in avoid)
+           + "\n" if avoid else "")
+        + ("Это батя — создатель бота: дисс по-сыновьи, дерзко, но с любовью.\n" if father else "")
+        + f"\nНапиши текст дисс-трека от лица Пиздюка, жанр — {DISS_GENRES[genre][0]}. Сначала facts — 3-5 "
+        "конкретных фактов о нём ТОЛЬКО из досье, сообщений и обещаний (что говорил, что обещал и слил, чем "
+        "хвастался, на что ныл), каждый — коротко, с деталью. Потом песня строго на этих фактах: каждый куплет "
+        "бьёт по 2-3 фактам, конкретно и узнаваемо для чата (можно короткая цитата его слов), ничего не "
+        "выдумывай сверх фактов. Рифма парная (AABB), ритм ровный, строки 6-11 слов — чтобы их можно было "
+        "спеть/зачитать. verse1 — 8 строк, chorus — 4 строки, цепкий, с его именем, его поют дважды; verse2 — 8 "
+        "строк, сильнее первого, панч в конце; outro — 2 строки, добивание. title — название трека, 1-4 слова, "
+        "по главному факту. "
+        + ("БЕЗ мата и грубых оскорблений — смешно должно быть от фактов. " if clean else
+           "Мат — 4-6 крепких слов на всю песню, разные, к месту. ")
+        + "Без имён реальных артистов и чужих песен. Имена людей — ровно как в переписке. " + _SAFE_TOPICS +
+        ' Верни СТРОГО JSON: {"title": "", "facts": [""], "verse1": [""], "chorus": [""], "verse2": [""], '
+        '"outro": [""]}'
+    )
+    data = _extract_json(await _complete(ROAST_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=8000,
+                                         effort="medium"))
+    out = {"title": _ok(data.get("title"))[:40] or "Дисс", "facts": _diss_lines(data.get("facts"), 6)}
+    for key, _label, n in DISS_SECTIONS:
+        out[key] = _diss_lines(data.get(key), n)
+    if not out["chorus"] or len(out["verse1"]) < 4:
+        raise ValueError("дисс: ИИ не дописал текст")
+    return out
+
+
 SERIAL_SYSTEM = (
     "Ты — сценарист злого комедийного сериала про компанию друзей из Telegram-чата. Герои — реальные участники, "
     "характеры — по их досье и манере говорить.\n"
@@ -2732,6 +2807,115 @@ async def _eleven_once(text: str, horror: bool, voice: str | None, key: str | No
         eleven_error[0] = f"сбой связи: {type(e).__name__}"
         logger.warning("eleven failed: %s", e)
         return b""
+
+
+# ElevenLabs Music (/diss): песня с вокалом по нашему тексту — composition plan (куски с текстом, стилями и длиной).
+# Только платный тариф (у владельца с 08.11 подписка), ≈ $0.15-0.30 за минуту песни, длина куска — по слогам текста.
+ELEVEN_MUSIC_MODEL = os.getenv("ELEVEN_MUSIC_MODEL", "").strip() or "music_v2_5"
+DISS_NEGATIVE = ["female vocals", "english lyrics", "autotune overload", "lo-fi muffled mix", "spoken word only"]
+_VOWELS = re.compile(r"[аеёиоуыэюяaeiouy]", re.IGNORECASE)
+music_error = [""]  # почему ElevenLabs не сделал песню — пишем админу
+
+
+def _secs_for(lines: list[str], rate: float, pad: float = 1.6) -> int:
+    """Сколько мс дать куску песни: слоги / темп подачи + запас (ElevenLabs v2 держит длину кусков строго)."""
+    syl = sum(max(1, len(_VOWELS.findall(ln))) for ln in lines)
+    return int(max(6.0, min(110.0, syl / rate + pad + 0.35 * len(lines))) * 1000)
+
+
+def diss_plan(lyrics: dict, genre: str, name: str, v1: bool = False) -> dict:
+    """composition_plan для ElevenLabs: вступление (бит и «Это Пиздюк»), куплет, припев, куплет, припев, концовка."""
+    styles, rate = DISS_GENRES[genre][1], DISS_GENRES[genre][2]
+    sung = rate < 4.0
+    hook = ["catchy hook", "gang vocals", "louder"]
+    verse = ["tight flow"] if not sung else []
+    chorus = lyrics.get("chorus") or []
+    parts = [("Intro", [f"Это Пиздюк. Дисс на {name}."], ["spoken intro over the beat", "beat building up"], 3.0),
+             ("Verse 1", lyrics.get("verse1") or [], verse, rate),
+             ("Chorus", chorus, hook, rate * 0.85),
+             ("Verse 2", lyrics.get("verse2") or [], verse, rate),
+             ("Chorus", chorus, hook, rate * 0.85),
+             ("Outro", lyrics.get("outro") or [], ["fading out", "final punchline"], rate)]
+    parts = [p for p in parts if p[1]]
+    if v1:
+        return {"positive_global_styles": styles, "negative_global_styles": DISS_NEGATIVE,
+                "sections": [{"section_name": label, "positive_local_styles": local, "negative_local_styles": [],
+                              "duration_ms": _secs_for(lines, r), "lines": [ln[:200] for ln in lines][:30]}
+                             for label, lines, local, r in parts]}
+    chunks = []
+    for i, (label, lines, local, r) in enumerate(parts):
+        chunks.append({"text": f"[{label}]\n" + "\n".join(ln[:200] for ln in lines[:30]),
+                       "duration_ms": _secs_for(lines, r),
+                       "positive_styles": (styles + local)[:50] if i < 2 else (styles[:3] + local)[:50],
+                       "negative_styles": DISS_NEGATIVE})
+    return {"chunks": chunks}
+
+
+async def eleven_music(plan: dict, model: str | None = None, key: str | None = None) -> tuple[bytes, str]:
+    """Песня по плану: (mp3, "") или (b"", код причины). Коды: "content" — отказ по содержанию (без подсказки),
+    "model" — модель не принята, остальные — как у озвучки (quota_exceeded, paid_plan_required…). Есть подсказка
+    ElevenLabs (стиль похож на чужого артиста) — повторяем с ней сами."""
+    import aiohttp
+
+    music_error[0] = ""
+    key = key or eleven_key()
+    if not key:
+        music_error[0] = "нет ключа ElevenLabs (/setkey eleven ключ)"
+        return b"", "no_key"
+    model = model or ELEVEN_MUSIC_MODEL
+    body = {"composition_plan": plan, "model_id": model}
+    total = sum(c.get("duration_ms", 0) for c in plan.get("chunks") or plan.get("sections") or [])
+    for attempt in range(2):
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120 + total / 1000 * 3),
+                                             trust_env=True) as s:
+                async with s.post(f"{ELEVEN_URL}/music?output_format=mp3_44100_128", json=body,
+                                  headers={"xi-api-key": key}, allow_redirects=False) as r:
+                    if r.status in (301, 302, 303, 307, 308):
+                        music_error[0] = "ElevenLabs не пускает сервер по региону"
+                        return b"", "geo"
+                    if r.status == 200:
+                        data = await r.read()
+                        ctype = r.headers.get("content-type") or ""
+                        costs = {k: v for k, v in r.headers.items() if any(w in k.lower() for w in
+                                                                          ("cost", "credit", "song", "char"))}
+                        logger.info("music %s: %s, %d байт, %.0f с по плану, заголовки %s", model, ctype, len(data),
+                                    total / 1000, costs)
+                        if "audio" in ctype or "octet" in ctype or data[:3] == b"ID3" or data[:2] == b"\xff\xfb":
+                            return data, ""
+                        music_error[0] = f"вместо песни пришло {ctype}"
+                        return b"", "bad_reply"
+                    err = await r.text()
+                    logger.warning("music %s: %s %s", model, r.status, err[:600])
+                    try:
+                        detail = json.loads(err).get("detail") or {}
+                    except (ValueError, AttributeError):
+                        detail = {}
+                    code = ""
+                    if isinstance(detail, dict):
+                        code = str(detail.get("status") or detail.get("code") or "")
+                        sug = (detail.get("data") or {}).get("composition_plan_suggestion") \
+                            if isinstance(detail.get("data"), dict) else None
+                        if code == "bad_composition_plan" and sug and attempt == 0:
+                            logger.info("music: ElevenLabs предложил свой план (стиль похож на чужой) — беру его")
+                            body["composition_plan"] = sug
+                            continue
+                        if code in ("bad_composition_plan", "bad_prompt"):
+                            music_error[0] = "ElevenLabs не пропустил текст песни"
+                            return b"", "content"
+                    text = err.lower()
+                    if r.status in (400, 422) and ("model" in text and ("not" in text or "invalid" in text)):
+                        music_error[0] = f"модель {model} не принята"
+                        return b"", "model"
+                    music_error[0] = _ELEVEN_WHY.get(code, f"ошибка {r.status}" + (f" {code}" if code else ""))
+                    if code == "paid_plan_required" or r.status == 402:
+                        music_error[0] = "музыка ElevenLabs - только на платном тарифе"
+                    return b"", code or str(r.status)
+        except Exception as e:
+            music_error[0] = f"сбой связи: {type(e).__name__}"
+            logger.warning("music failed: %s", e)
+            return b"", "net"
+    return b"", "content"
 
 
 # Яндекс SpeechKit (API v1): живые русские голоса, пускает сервер, где ElevenLabs закрыт по региону (07.11, выбор
