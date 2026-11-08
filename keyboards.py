@@ -35,7 +35,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     builder.row(InlineKeyboardButton(text="📢 Посты в канал (тест): вкл/выкл", callback_data="admin:chan_posts"))
     builder.row(
         InlineKeyboardButton(text="🃏 Карточки: вкл/выкл", callback_data="admin:cards"),
-        InlineKeyboardButton(text="🎬 Сериал: вкл/выкл", callback_data="admin:serial"),
+        InlineKeyboardButton(text="📰 Новости: вкл/выкл", callback_data="admin:news"),
     )
     builder.row(InlineKeyboardButton(text="📥 Загрузить историю чата", callback_data="admin:roast_import"))
     builder.row(

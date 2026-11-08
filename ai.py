@@ -1641,6 +1641,46 @@ async def court_verdict(name: str, charges: list[str], defense: str, last_word: 
     return await fix_looks(text) if text else ""
 
 
+# ---------- новости чата за день (handlers/news.py, 21:00) ----------
+# 08.11 владелец: сериал выключить, вместо него — новости в 21:00. Уроки сериала/суда («бессмыслица», «нет
+# конкретики»): каждый сюжет — ОДНО реальное событие дня, понятное без чтения чата (кто, что, чем кончилось),
+# цитаты — только дословные и не больше одной на сюжет.
+
+async def daily_news(messages: list[dict], dossiers: dict[str, str], date_text: str) -> dict:
+    """Выпуск новостей за день: {"intro", "stories": [{"headline", "text", "msg_id"}], "weather", "outro"}."""
+    dos = "\n".join(f"<dossier name={json.dumps(n, ensure_ascii=False)}>{d[:500]}</dossier>"
+                     for n, d in list(dossiers.items())[:8] if d)
+    user = (
+        f"Переписка чата за сегодня ({date_text}), по порядку:\n{_msgs_block(messages)}\n\n"
+        + (f"Досье участников (для понимания, кто есть кто):\n{dos}\n\n" if dos else "")
+        + "Ты — ведущий вечерних «Новостей чата» в 21:00: серьёзный тон диктора, а по сути — злой стёб. Сделай "
+        "выпуск за сегодня.\n"
+        "stories — 3-4 сюжета, каждый про ОДНО реальное событие дня из переписки (разные события, самое громкое — "
+        "первым). headline — короткий заголовок как в новостях, 4-9 слов, с именем героя или деталью события; "
+        "text — 2-3 коротких предложения: кто, что сделал или сказал, как отреагировали остальные, чем кончилось — "
+        "чтобы понял человек, который чат не читал; максимум одна дословная цитата в «» на сюжет; смешно — от "
+        "казённого тона и неожиданного вывода в конце. msg_id — id главного сообщения сюжета (из списка) или null.\n"
+        "intro — одна фраза приветствия ведущего с крючком на главный сюжет; weather — «погода в чате на завтра», "
+        "одна фраза по настроению дня; outro — одна фраза прощания с подколом.\n"
+        "Только то, что было в переписке, ничего не выдумывай; имена — ровно как в переписке; мат — к месту, 2-4 "
+        "слова на весь выпуск. " + _SAFE_TOPICS +
+        ' Верни СТРОГО JSON: {"intro": "", "stories": [{"headline": "", "text": "", "msg_id": null}], '
+        '"weather": "", "outro": ""}'
+    )
+    data = _extract_json(await _complete(ROAST_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=8000,
+                                         effort="medium"))
+    said = [str(m["text"]) for m in messages]
+    stories = []
+    for x in data.get("stories") or []:
+        if not isinstance(x, dict):
+            continue
+        head, text = _ok(x.get("headline")), _short(_fix_quotes(_ok(x.get("text")), said), 420)
+        if head and text:
+            stories.append({"headline": head[:90], "text": await fix_looks(text), "msg_id": _mid(x.get("msg_id"))})
+    return {"intro": _short(_ok(data.get("intro")), 220), "stories": stories[:4],
+            "weather": _short(_ok(data.get("weather")), 200), "outro": _short(_ok(data.get("outro")), 200)}
+
+
 # ---------- дисс-трек (/diss): текст пишет Opus, песню с вокалом — ElevenLabs Music ----------
 # Выбор владельца 08.11 из «нового»: песня-дисс на участника по его досье. Текст — по-русски, в рифму, с матом и 2-4
 # настоящими деталями из досье и его сообщений (без выдумок), красные линии те же. Стиль музыки — английскими

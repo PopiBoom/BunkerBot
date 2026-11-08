@@ -555,27 +555,27 @@ async def admin_quiet_kick(call: CallbackQuery, db: Database, config: Config) ->
         )
 
 
-@router.callback_query(F.data.in_({"admin:cards", "admin:serial"}))
+@router.callback_query(F.data.in_({"admin:cards", "admin:news"}))
 async def admin_toggle_fun(call: CallbackQuery, db: Database, config: Config) -> None:
-    """Карточки участников (раз в день, без ИИ) и сериал про чат (20:00, ≈$0.03 серия) — вкл/выкл."""
+    """Карточки участников (раз в день, без ИИ) и новости чата (21:00, ≈$0.03 выпуск) — вкл/выкл."""
     if not _is_admin(call.from_user.id, config):
         await call.answer(texts.ADMIN_ONLY, show_alert=True)
         return
-    from handlers import collect, serial
+    from handlers import collect, news
 
-    key = collect.ON_KEY if call.data == "admin:cards" else serial.ON_KEY
+    key = collect.ON_KEY if call.data == "admin:cards" else news.ON_KEY
     on = (await db.get_setting(key, "1")) == "1"
     await db.set_setting(key, "0" if on else "1")
-    what = "Карточки" if call.data == "admin:cards" else "Сериал"
-    state = "выключены ⛔" if on and what == "Карточки" else "выключен ⛔" if on else (
-        "включены ✅" if what == "Карточки" else "включён ✅")
+    what = "Карточки" if call.data == "admin:cards" else "Новости"
+    state = "выключены ⛔" if on else "включены ✅"
     await call.answer(f"{what} {state}", show_alert=True)
     if call.message:
         about = ("🃏 Раз в день в случайное время (12-22 МСК) бот выкидывает карточку участника - кто первый нажмёт "
                  "«Поймать», того и карточка. Альбом - кнопкой «📒 Моя коллекция» (в личку) или /collection. Без ИИ."
                  if what == "Карточки" else
-                 f"🎬 Каждый день в {serial.HOUR}:00 МСК (если в чате за день было от {serial.MIN_TODAY} сообщений) - "
-                 "новая серия про чат с опросом «что дальше». /serial - серия сейчас. ≈$0.03 за серию.")
+                 f"📰 Каждый день в {news.HOUR}:00 МСК (если в чате за день было от {news.MIN_TODAY} сообщений) - "
+                 "выпуск «Новостей чата»: 3-4 сюжета дня и погода в чате на завтра. /news - выпуск сейчас. "
+                 "≈$0.03 за выпуск.")
         await call.message.answer(f"{what} {state}\n\n{about}")
 
 

@@ -627,3 +627,39 @@ def render_diss_cover(name: str, title: str, genre: str, photo: bytes | None, se
     out = io.BytesIO()
     img.resize((side, side), Image.LANCZOS).save(out, "JPEG", quality=88)
     return out.getvalue()
+
+
+def render_news(date: str, issue: int, headline: str, ticker: list[str]) -> bytes:
+    """Заставка «Новостей чата»: экран эфира — плашка «НОВОСТИ ЧАТА», «ЭФИР 21:00», главный заголовок крупно,
+    внизу бегущая строка с остальными сюжетами."""
+    w, h = 1000, 600
+    img = Image.new("RGB", (w, h), (10, 18, 40))
+    d = ImageDraw.Draw(img)
+    for i in range(h):  # синий студийный градиент
+        t = i / h
+        d.line((0, i, w, i), fill=(int(14 + 20 * (1 - t)), int(26 + 34 * (1 - t)), int(58 + 60 * (1 - t))))
+    for x in range(-h, w, 46):  # лёгкие диагонали «студии»
+        d.line((x, 0, x + h, h), fill=(30, 48, 92), width=2)
+    img = _noise(img, issue)
+    d = ImageDraw.Draw(img)
+    d.rectangle((PAD - 10, 50, PAD + 430, 116), fill=CLOWN_RED)
+    d.text((PAD + 6, 83), "НОВОСТИ ЧАТА", font=_bold(44), fill=(255, 255, 255), anchor="lm")
+    d.rectangle((PAD + 430, 50, PAD + 666, 116), fill=(245, 240, 235))
+    d.ellipse((PAD + 450, 74, PAD + 468, 92), fill=CLOWN_RED)
+    d.text((PAD + 480, 83), "ЭФИР 21:00", font=_bold(30), fill=(14, 22, 44), anchor="lm")
+    d.text((PAD - 10, 146), f"{date} · ВЫПУСК № {issue}", font=_mono(26), fill=(200, 210, 235), anchor="lm")
+    y = 196
+    size = 64
+    t = _plain(headline).upper()
+    while size > 38 and len(_wrap(d, t, _bold(size), w - 2 * PAD, 4)) > 3:
+        size -= 4
+    for line in _wrap(d, t, _bold(size), w - 2 * PAD, 3):
+        d.text((PAD, y), line, font=_bold(size), fill=(255, 255, 255))
+        y += int(size * 1.18)
+    d.rectangle((PAD, y + 14, PAD + 120, y + 22), fill=CLOWN_RED)
+    d.rectangle((0, h - 92, w, h - 30), fill=(245, 240, 235))
+    d.rectangle((0, h - 92, 150, h - 30), fill=CLOWN_RED)
+    d.text((75, h - 61), "СРОЧНО", font=_bold(30), fill=(255, 255, 255), anchor="mm")
+    run = "  •  ".join(_plain(x) for x in ticker) or "в чате всё спокойно, подозрительно спокойно"
+    d.text((172, h - 61), _wrap(d, run, _bold(28), w - 190, 1)[0], font=_bold(28), fill=(14, 22, 44), anchor="lm")
+    return _png(img)

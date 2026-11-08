@@ -1908,6 +1908,9 @@ async def _heavy(bot: Bot, db: Database) -> None:
             key = f"roast_clown:{chat_id}"
             if await db.get_setting(key, "") == today or _bunker_active(chat_id):
                 continue
+            from handlers import news
+            if await news.pending(db, chat_id):  # новости тоже в 21:00 — клоун после них, не разом
+                continue
             await db.set_setting(key, today)
             try:
                 await _clown_of_day(bot, db, chat_id)
@@ -1966,12 +1969,12 @@ async def background(bot: Bot, db: Database) -> None:
                         _spawn(night.resume_tick(bot, db))  # перезапуск посреди сборки эфира — собрать заново
                 except Exception as e:
                     logger.warning("night first tick failed: %s", e)
-                # Сериал про чат — раз в день вечером
+                # Новости чата — раз в день в 21:00 МСК (сериал сам больше не выходит — serial.AUTO)
                 try:
-                    from handlers import serial
-                    await serial.tick(bot, db)
+                    from handlers import news
+                    await news.tick(bot, db)
                 except Exception as e:
-                    logger.warning("serial tick failed: %s", e)
+                    logger.warning("news tick failed: %s", e)
                 # Тишина в чате — «вопрос дня»
                 try:
                     from handlers import fun

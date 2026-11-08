@@ -35,6 +35,7 @@ from handlers.collect import router as collect_router
 from handlers.court import observe as court_observe
 from handlers.court import router as court_router
 from handlers.diss import router as diss_router
+from handlers.news import router as news_router
 from handlers.night import router as night_router
 from handlers.protocol import router as protocol_router
 from handlers.serial import router as serial_router
@@ -232,6 +233,7 @@ async def main() -> None:
     dp.include_router(protocol_router)  # /protocol
     dp.include_router(court_router)     # /sud
     dp.include_router(diss_router)      # /diss — дисс-трек (ElevenLabs Music)
+    dp.include_router(news_router)      # /news — новости чата (сами в 21:00)
     dp.include_router(serial_router)    # /serial
     dp.include_router(night_router)     # /night — ночной эфир, черновик в личку
     # Стёб-бот последним: ловит все остальные сообщения групп
