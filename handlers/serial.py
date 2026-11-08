@@ -141,9 +141,13 @@ async def cmd_serial(message: Message, bot: Bot, db: Database) -> None:
         await temp_reply(message, "Серия не снялась: мало героев или сценарист не справился - попробуй позже.")
 
 
+AUTO = False  # 08.11 владелец: «отключай сериал в чате» — сам больше не выходит (вместо него новости в 21:00);
+#               /serial вручную у админа остался
+
+
 async def tick(bot: Bot, db: Database) -> None:
-    """Из фона: раз в день в HOUR МСК — серия в каждом живом чате."""
-    if (await db.get_setting(ON_KEY, "1")) != "1" or not ai.available():
+    """Из фона: раз в день в HOUR МСК — серия в каждом живом чате (выключено: AUTO = False)."""
+    if not AUTO or (await db.get_setting(ON_KEY, "1")) != "1" or not ai.available():
         return
     from handlers.roast import _bunker_active
 
