@@ -194,11 +194,11 @@ async def after_start(bot: Bot, db, config, problem: str) -> None:
         if job.get("kind") == "wchess":
             from games.chess import widget
 
-            await widget.create(bot, db, user, job.get("name") or "")
+            await widget.create(bot, db, user, job.get("name") or "", where=job.get("where"))
         elif job.get("kind") == "durak":
             from games.durak import game as durak
 
-            await durak.create(bot, db, user, job.get("name") or "")
+            await durak.create(bot, db, user, job.get("name") or "", where=job.get("where"))
     except Exception:  # noqa: BLE001 — бот работает и без этого
         logger.exception("бета: действие после запуска не вышло")
 

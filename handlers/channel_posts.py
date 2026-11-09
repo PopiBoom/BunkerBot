@@ -41,6 +41,21 @@ async def channel_id(bot: Bot, db: Database) -> int | None:
     return None
 
 
+async def father_chat(bot: Bot, db: Database) -> int | None:
+    """Чат канала бати — группа его комментариев (linked_chat_id), иначе самая живая группа бота. Для «/durak_chat»
+    и «/chess_chat» из лички."""
+    channel = await channel_id(bot, db)
+    if channel:
+        try:
+            linked = getattr(await bot.get_chat(channel), "linked_chat_id", None)
+            if linked:
+                return int(linked)
+        except Exception as e:  # noqa: BLE001
+            logger.info("father_chat: %s", e)
+    groups = [c for c in await db.active_chats(int(time.time()) - 14 * 86400) if c < 0]
+    return groups[0] if groups else None
+
+
 _own_mem: set[int] = set()  # свои посты — сразу в память: пересылка в обсуждение может прийти раньше записи в базу
 
 

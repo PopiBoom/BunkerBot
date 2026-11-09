@@ -5,7 +5,8 @@
 /chess_widget (админ; в личке или в группе): вызвавшему в личку — доска-виджет (`widget.html`, HTML-виджет Telegram
 13.2), а в канал бати — картинка-вызов со ссылкой `t.me/<бот>?start=wch_<id>` и кнопкой «♟ Сыграть» (пост — в
 `channel_posts.mark_own`). Сначала вызов шёл владельцу в личку и пересылался оттуда — 09.11 он попросил «не надо мне
-это в бот кидать»: теперь сразу в канал, в личку — только «не вышло, перешли сам: ссылка». Кто первым откроет ссылку (не сам вызвавший), тот
+это в бот кидать»: теперь сразу в канал, в личку — только «не вышло, перешли сам: ссылка». /chess_chat — приглашение в
+чат (из группы — в неё, из лички — в чат канала). Соперник нашёлся или вызов отменили — пост удаляется. Кто первым откроет ссылку (не сам вызвавший), тот
 соперник, цвета жребием; ему в личку — своя доска. Каждый играет в своей личке с ботом: нажал свою фигуру — точки,
 куда можно (ходы считает бот: `l` в состоянии), нажал клетку — ход (запрос виджета `m:<id>:<откуда><куда>`, пешка —
 в ферзя). Правила — python-chess. 🏳 — двумя нажатиями, 🤝 — предложить / согласиться, после партии «🔁 Реванш»
@@ -289,7 +290,17 @@ async def _send_card(bot: Bot, db: Database, chat_id: int, text: str, kb: Inline
     return await bot.send_message(chat_id, text, reply_markup=kb, disable_web_page_preview=True)
 
 
-async def create(bot: Bot, db: Database, uid: int, name: str = "") -> None:
+async def _drop_post(bot: Bot, st: dict) -> None:
+    """Соперник нашёлся или вызов отменили — пост-приглашение в канале/чате удаляем (владелец 09.11)."""
+    post = st.pop("post", None)
+    if post:
+        try:
+            await bot.delete_message(post[0], post[1])
+        except Exception as e:  # noqa: BLE001 — уже удалили руками
+            logger.info("шахматы-виджет: пост %s не удалился: %s", post, e)
+
+
+async def create(bot: Bot, db: Database, uid: int, name: str = "", where: int | None = None) -> None:
     """Новый вызов: доска вызвавшему в личку, картинка со ссылкой — сразу в канал."""
     from handlers.channel_posts import channel_id, mark_own
 
@@ -300,6 +311,7 @@ async def create(bot: Bot, db: Database, uid: int, name: str = "") -> None:
             if st and not st.get("w") and not st.get("end"):
                 st["end"] = {"why": "cancel", "win": 0}
                 await _push(bot, st, st["host"][0])
+                await _drop_post(bot, st)
                 await _save(db, old, st)
     gid = secrets.token_urlsafe(6)
     name = name or ("Батя" if uid == _owner() else "Игрок")
@@ -318,14 +330,15 @@ async def create(bot: Bot, db: Database, uid: int, name: str = "") -> None:
     text = f"♟ <b>{html.escape(name)} ищет соперника в шахматы</b>\nКто первый нажмёт - тот и играет."
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="♟ Сыграть", url=link)]])
     # сразу в канал (09.11 владелец: «не надо мне это в бот кидать» — раньше шло в личку и пересылалось оттуда)
-    channel, post, problem = await channel_id(bot, db), None, ""
+    channel, post, problem = where or await channel_id(bot, db), None, ""
     if channel:
         try:
             post = await _send_card(bot, db, channel, text, kb)
-            await mark_own(db, post.message_id)  # стёб-бот не обсуждает свой же пост
+            if not where:
+                await mark_own(db, post.message_id)  # стёб-бот не обсуждает свой же пост
         except Exception as e:  # noqa: BLE001
-            logger.warning("шахматы-виджет: в канал не ушло: %s", e)
-            problem = f"В канал не ушло ({html.escape(str(e)[:150])})"
+            logger.warning("шахматы-виджет: вызов в %s не ушёл: %s", channel, e)
+            problem = f"{'В чат' if where else 'В канал'} не ушло ({html.escape(str(e)[:150])})"
     else:
         problem = "Канал не нашёл (бот должен быть админом канала)"
     async with _lock(gid):
@@ -375,6 +388,7 @@ async def join(bot: Bot, db: Database, user, gid: str) -> None:
             return
         await _push(bot, st, host[0])
         await _note(bot, st, host[0], f"♟ {html.escape(guest[1])} принял вызов! Ты {_side(st, host[0])}.")
+        await _drop_post(bot, st)  # соперник нашёлся — приглашение больше не нужно
         await _save(db, gid, st)
     if await db.get_setting(OPEN, "") == gid:
         await db.set_setting(OPEN, "")
@@ -575,21 +589,30 @@ async def _replay(bot: Bot, db: Database, st: dict) -> None:
 tgbeta_on_widget("", on_query)  # остальные запросы виджетов (дурак — «u…», games/durak)
 
 
-@router.message(Command("chess_widget"))
+@router.message(Command("chess_widget", "chess_chat"))
 async def cmd_chess_widget(message: Message, bot: Bot, db: Database, config: Config) -> None:
-    """/chess_widget — вызов в шахматы: доска и ссылка в личку, ссылка — пересылкой в канал."""
+    """/chess_widget — вызов в шахматы: доска в личку, приглашение — в канал; /chess_chat — приглашение в чат (из
+    группы — в эту группу, из лички — в чат канала)."""
     import tgbeta
 
     user = message.from_user
     if user is None or not config.is_admin(user.id):
         return
+    where = None
+    if (message.text or "").split()[0].split("@")[0].lower() == "/chess_chat":
+        from handlers.channel_posts import father_chat
+
+        where = message.chat.id if message.chat.type in ("group", "supergroup") else await father_chat(bot, db)
+        if not where:
+            await bot.send_message(user.id, "♟ Не нашёл чат - вызови /chess_chat прямо в группе.")
+            return
     if not tgbeta.active():
         from handlers.admin import _restart_when_free
 
-        await tgbeta.enable(db, {"kind": "wchess", "user": user.id, "name": _name(user)})
+        await tgbeta.enable(db, {"kind": "wchess", "user": user.id, "name": _name(user), "where": where})
         await bot.send_message(user.id, "♟ Доска-виджет работает только через бету Telegram (Bot API 10.4) - "
                                         "включаю её и перезапускаюсь. Через ~15 сек пришлю доску и ссылку для канала."
                                         "\n\nЕсли после этого бот начнёт глючить - /beta off.")
         _restart_when_free()
         return
-    await create(bot, db, user.id, _name(user))
+    await create(bot, db, user.id, _name(user), where=where)

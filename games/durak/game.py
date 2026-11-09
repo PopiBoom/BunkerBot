@@ -2,7 +2,10 @@
 → подкидной, 2-6 игроков, без игры против Пиздюка).
 
 /durak (админ; личка или группа): вызвавшему в личку — стол-виджет (`widget.html`), в канал бати — картинка со
-ссылкой `t.me/<бот>?start=dur_<id>` («Сесть за стол»; в личку не шлём — просьба владельца, как у шахмат). Кто открыл ссылку — за
+ссылкой `t.me/<бот>?start=dur_<id>` («Сесть за стол»; в личку не шлём — просьба владельца, как у шахмат);
+/durak_chat — то же в чат (из группы — в неё, из лички — в чат канала). Раздали или стол закрыли — пост удаляется.
+Новый стол закрывает прошлые столы хозяина; партию, где 10 мин никто сам не ходит, бот закрывает; тому, за кого
+таймер сходил дважды подряд, уведомления не шлём, пока не вернётся. Кто открыл ссылку — за
 столом (до 6), ему в личку свой стол. Хозяин стола жмёт «▶️ Начать» (от 2 игроков; сел шестой — начинается само).
 
 Правила (классика): колода 36, по 6 карт, козырь — нижняя карта колоды (её видно под колодой). Первым заходит тот,
@@ -66,6 +69,8 @@ GRACE = 10              # сек остальным подкинуть посл�
 LOBBY_TTL = 3 * 3600    # стол не начался — закрывается
 GAME_TTL = 4 * 3600     # партия дольше — закрывается без дурака
 TICK = 2
+IDLE_CLOSE = 10 * 60    # 10 мин никто сам не ходит (за всех ходят таймеры) — партия закрывается
+AFK_QUIET = 2           # за игрока сходили таймеры столько раз подряд — уведомления ему больше не шлём
 NAME_LEN = 14
 MAX_DATA = 1024
 
@@ -328,11 +333,14 @@ def _auto_defend(st: dict) -> None:
 
 def timeout(st: dict, now: float, notes: dict) -> None:
     """Кто-то завис: заходящий — младшей картой, отбивающийся — «Беру», подкидывающие — пас."""
+    afk = st.setdefault("afk", {})
     if not st["table"]:
         hand = sorted(_hand(st, st["att"]), key=lambda c: (c[1] == st["trump"][1], _rank(c)))
+        afk[str(st["att"])] = afk.get(str(st["att"]), 0) + 1
         if hand:
             attack(st, st["att"], hand[0], notes)
     elif _unbeaten(st) and not st["taking"]:
+        afk[str(st["dfd"])] = afk.get(str(st["dfd"]), 0) + 1
         _auto_defend(st)
     else:
         for u in _throwers(st):
@@ -459,8 +467,44 @@ async def _send_notes(bot: Bot, st: dict, notes: dict, unnote: list[int] = ()) -
     for u in unnote:
         if u not in notes:
             await _unnote(bot, st, u)
+    afk = st.get("afk") or {}
     for u, text in notes.items():
+        if afk.get(str(u), 0) >= AFK_QUIET:  # ушёл — не дёргать (за него ходят таймеры), вернётся — снова пишем
+            await _unnote(bot, st, u)
+            continue
         await _note(bot, st, u, text)
+
+
+async def _drop_post(bot: Bot, st: dict) -> None:
+    """Игра началась или стол закрыли — пост-приглашение в канале/чате удаляем (владелец 09.11)."""
+    post = st.pop("post", None)
+    if post:
+        try:
+            await bot.delete_message(post[0], post[1])
+        except Exception as e:  # noqa: BLE001 — уже удалили руками
+            logger.info("дурак: пост %s не удалился: %s", post, e)
+
+
+async def _close_host_tables(bot: Bot, db: Database, uid: int, why: str) -> None:
+    """Новый стол у хозяина — его прошлые столы (несобранные и начатые) закрыть: иначе брошенная партия шла дальше
+    на таймерах и слала ему «отбивайся» (владелец 09.11: «игры нет, а мне пишет в лс»)."""
+    try:  # сразу после перезапуска ticker мог ещё не прочитать список
+        _live.update(json.loads(await db.get_setting(LIVE, "[]") or "[]"))
+    except ValueError:
+        pass
+    for gid in list(_live):
+        async with _lock(gid):
+            st = await _load(db, gid)
+            if not st or st.get("host") != uid or st["phase"] not in ("lobby", "play"):
+                continue
+            st.update(phase="end", durak=None, cancel=why)
+            st.pop("due", None)
+            for u in _ids(st):
+                await _unnote(bot, st, u)
+            await _push(bot, st)
+            await _drop_post(bot, st)
+            await _save(db, gid, st)
+            await _set_live(db, gid, False)
 
 
 def _deal_notes(st: dict) -> dict:
@@ -468,17 +512,19 @@ def _deal_notes(st: dict) -> dict:
     return {st["att"]: "🃏 Твой ход"}
 
 
-async def create(bot: Bot, db: Database, uid: int, name: str = "") -> None:
-    """Новый стол: стол-виджет хозяину, картинка со ссылкой — сразу в канал."""
+async def create(bot: Bot, db: Database, uid: int, name: str = "", where: int | None = None) -> None:
+    """Новый стол: стол-виджет хозяину, картинка со ссылкой — в канал (where — в этот чат: /durak_chat)."""
     from handlers.channel_posts import channel_id, mark_own
 
+    await _close_host_tables(bot, db, uid, "Стол закрыт - собрали новый")
     old = await db.get_setting(OPEN, "")
-    if old:  # прошлый стол так и не начался — закрыть
+    if old:  # чужой стол, который так и не начался, — тоже закрыть (вызов один)
         async with _lock(old):
             st = await _load(db, old)
             if st and st["phase"] == "lobby":
                 st.update(phase="end", cancel="Стол закрыт - собрали новый")
                 await _push(bot, st)
+                await _drop_post(bot, st)
                 await _save(db, old, st)
                 await _set_live(db, old, False)
     gid = secrets.token_urlsafe(6)
@@ -499,14 +545,15 @@ async def create(bot: Bot, db: Database, uid: int, name: str = "") -> None:
     text = f"🃏 <b>{html.escape(name)} собирает на дурака</b>\nДо {MAX_PLAYERS} игроков."
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🃏 Сесть за стол", url=link)]])
     # сразу в канал (09.11 владелец: «не надо мне это в бот кидать» — раньше шло в личку и пересылалось оттуда)
-    channel, post, problem = await channel_id(bot, db), None, ""
+    channel, post, problem = where or await channel_id(bot, db), None, ""
     if channel:
         try:
             post = await _send_card(bot, db, channel, text, kb, CARD, CARD_KEY)
-            await mark_own(db, post.message_id)  # стёб-бот не обсуждает свой же пост
+            if not where:
+                await mark_own(db, post.message_id)  # стёб-бот не обсуждает свой же пост
         except Exception as e:  # noqa: BLE001
-            logger.warning("дурак: в канал не ушло: %s", e)
-            problem = f"В канал не ушло ({html.escape(str(e)[:150])})"
+            logger.warning("дурак: вызов в %s не ушёл: %s", channel, e)
+            problem = f"{'В чат' if where else 'В канал'} не ушло ({html.escape(str(e)[:150])})"
     else:
         problem = "Канал не нашёл (бот должен быть админом канала)"
     async with _lock(gid):
@@ -554,6 +601,7 @@ async def join(bot: Bot, db: Database, user, gid: str) -> None:
             settle(st, time.time(), notes)
             notes.update(_deal_notes(st))
             started = True
+            await _drop_post(bot, st)
         else:
             notes[st["host"]] = f"🃏 {html.escape(name)} сел за стол ({n} из {MAX_PLAYERS})."
         await _push(bot, st, skip=uid)
@@ -647,9 +695,14 @@ async def on_query(bot: Bot, db: Database, q: dict) -> None:
         if not ev["changed"]:
             await _answer(bot, qid, answer)
         else:
+            if kind in ("ua", "ud", "ub", "ut", "us") and "err" not in answer:
+                st.setdefault("afk", {})[str(uid)] = 0  # сам сходил — снова в игре
+                st["acted"] = time.time()
             await _save(db, gid, st)
             await _answer(bot, qid, answer)  # нажавшему — сразу
             await _push(bot, st)
+            if ev.get("started"):
+                await _drop_post(bot, st)
             await _send_notes(bot, st, notes, [uid])
             if ev["done"]:
                 await _finish(bot, db, st)
@@ -724,6 +777,8 @@ async def _tick_one(bot: Bot, db: Database, gid: str, now: float) -> None:
             st.update(phase="end", cancel="Стол закрыт - так и не начали")
         elif now - st.get("start", now) > GAME_TTL:
             st.update(phase="end", durak=None, cancel="Игра закрыта - слишком долго")
+        elif now - st.get("acted", st.get("start", now)) > IDLE_CLOSE:
+            st.update(phase="end", durak=None, cancel="Игра закрыта - никто не ходит")
         elif st.get("due") and now >= st["due"]:
             timeout(st, now, notes)
         else:
@@ -732,6 +787,9 @@ async def _tick_one(bot: Bot, db: Database, gid: str, now: float) -> None:
         await _send_notes(bot, st, notes)
         if st["phase"] == "end":
             if st.get("cancel"):
+                for u in _ids(st):
+                    await _unnote(bot, st, u)
+                await _drop_post(bot, st)
                 await _set_live(db, gid, False)
             else:
                 await _finish(bot, db, st)
@@ -757,19 +815,28 @@ async def ticker(bot: Bot, db: Database) -> None:
 tgbeta.on_widget("u", on_query)
 
 
-@router.message(Command("durak"))
+@router.message(Command("durak", "durak_chat"))
 async def cmd_durak(message: Message, bot: Bot, db: Database, config: Config) -> None:
-    """/durak — стол в дурака: стол и картинка-ссылка в личку, ссылка — пересылкой в канал."""
+    """/durak — стол в дурака: стол хозяину в личку, приглашение — в канал; /durak_chat — приглашение в чат (из группы —
+    в эту группу, из лички — в чат канала: группа его комментариев)."""
     user = message.from_user
     if user is None or not config.is_admin(user.id):
         return
+    where = None
+    if (message.text or "").split()[0].split("@")[0].lower() == "/durak_chat":
+        from handlers.channel_posts import father_chat
+
+        where = message.chat.id if message.chat.type in ("group", "supergroup") else await father_chat(bot, db)
+        if not where:
+            await bot.send_message(user.id, "🃏 Не нашёл чат - вызови /durak_chat прямо в группе.")
+            return
     if not tgbeta.active():
         from handlers.admin import _restart_when_free
 
-        await tgbeta.enable(db, {"kind": "durak", "user": user.id, "name": player_name(user)})
+        await tgbeta.enable(db, {"kind": "durak", "user": user.id, "name": player_name(user), "where": where})
         await bot.send_message(user.id, "🃏 Стол-виджет работает только через бету Telegram (Bot API 10.4) - "
                                         "включаю её и перезапускаюсь. Через ~15 сек пришлю стол и ссылку для канала."
                                         "\n\nЕсли после этого бот начнёт глючить - /beta off.")
         _restart_when_free()
         return
-    await create(bot, db, user.id, player_name(user))
+    await create(bot, db, user.id, player_name(user), where=where)
