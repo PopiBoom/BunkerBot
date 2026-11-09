@@ -981,7 +981,7 @@ KIND_LABELS = {
     "drop_retell": "правка пересказа фото", "channel_comment": "комменты к постам канала", "rant_replies": "ответы на комменты под голосовым",
     "own_channel_post": "посты в канал", "clown_of_day": "клоун дня", "week_show": "итоги недели",
     "pick_quotes": "фразы дня", "daily_news": "новости чата",
-    "horror_story": "Письма Волгограда: текст", "_place_facts": "Письма Волгограда: поиск места",
+    "gossip_story": "Сплетни Волгограда: текст", "horror_story": "Письма Волгограда: текст", "_place_facts": "Письма Волгограда: поиск места",
     "_horror_plans": "Письма Волгограда: два плана и судья", "_listener_check": "Письма Волгограда: проверка понятности",
     "night_monologue": "ночной эфир: текст", "narrate_all": "озвучка эфира (OpenRouter)", "narrate": "озвучка",
     "diss_lyrics": "дисс: текст", "court_charges": "суд: обвинение", "court_verdict": "суд: приговор",

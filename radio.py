@@ -611,10 +611,11 @@ def _ep(f: float, ln: float) -> np.ndarray:
     return (tone * np.minimum(1, t / 0.004) * np.exp(-t * 1.1)).astype(np.float32)
 
 
-def _talk_bed(n: int, rng: np.random.Generator) -> np.ndarray:
+def _talk_bed(n: int, rng: np.random.Generator, chords: list | None = None, bpm: float = BED_BPM) -> np.ndarray:
     """Подложка под ведущего: спокойный вечерний грув — электропиано по ля-минору, бас, мягкая бочка, щелчок и
-    тарелочка с лёгким свингом. float32, пик ≈ 1."""
-    beat = 60 / BED_BPM
+    тарелочка с лёгким свингом. float32, пик ≈ 1. chords/bpm — другая гармония и темп (весёлая — у сплетен)."""
+    chords = chords or _CHORDS
+    beat = 60 / bpm
     bar = 4 * beat
     out = np.zeros(n + int(3 * SR), dtype=np.float32)
     tb = np.arange(int(0.3 * SR)) / SR
@@ -636,7 +637,7 @@ def _talk_bed(n: int, rng: np.random.Generator) -> np.ndarray:
     i = 0
     while i * bar * SR < n:
         t0 = i * bar
-        root, notes = _CHORDS[i % len(_CHORDS)]
+        root, notes = chords[i % len(chords)]
         for hit, ln, amp in ((0.0, 2.8, 0.2), (1.5 * beat, 1.8, 0.12), (3.0 * beat, 1.2, 0.08)):
             for j, f in enumerate(notes):
                 key = (f, ln)
@@ -1303,6 +1304,99 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
     for i in range(0, n, BED_SEG):  # еле слышный «воздух» студии — чтобы не было цифровой тишины
         seg = mix[i:i + BED_SEG]
         seg += rng.standard_normal(len(seg), dtype=np.float32) * np.float32(_db(-66))
+    mix = _band(mix, 30, 15000)
+    mix = _peak1(mix)
+    mix *= _db(-1)
+    return mix
+
+
+# ---------- «Сплетни Волгограда»: весёлый эфир (09.11) ----------
+# Тот же ведущий «как на FM», но без помех и мрака: бодрый позывной в мажоре, весёлая подложка (до мажор, 104 удара в
+# минуту), между частями выпуска (тема → версия 1 → 2 → 3 → ставка) — короткий «дзынь», как перебивка в шоу.
+GOSSIP_BPM = 104
+_GOSSIP_CHORDS = [  # до мажор: Cmaj7 – Am7 – Fmaj7 – G6
+    (130.81, (261.63, 329.63, 392.0, 493.88)),
+    (110.0, (220.0, 261.63, 329.63, 392.0)),
+    (87.31, (174.61, 220.0, 261.63, 329.63)),
+    (98.0, (196.0, 246.94, 293.66, 329.63)),
+]
+GOSSIP_BED_DB = -17.0   # подложка под ведущим (полоса телефона, в паузах; под словами ещё на 7 дБ тише)
+STING_DB = -7.0         # «дзынь» между частями — от громкости ведущего (полоса телефона)
+
+
+def _gossip_jingle(up: bool = True) -> np.ndarray:
+    """Позывной сплетен: быстрое арпеджио колокольчиков в до мажоре (вверх — в начале, вниз — в конце)."""
+    notes = [523.25, 659.25, 783.99, 1046.5]
+    if not up:
+        notes = notes[::-1]
+    step = int(0.1 * SR)
+    out = np.zeros(step * len(notes) + int(1.3 * SR), dtype=np.float32)
+    for i, f in enumerate(notes):
+        b = _bell(f, 1.3, 0.8 if i < len(notes) - 1 else 1.1)
+        out[i * step:i * step + len(b)] += b
+        if i == len(notes) - 1:  # последняя — с терцией сверху, «та-дам»
+            out[i * step:i * step + len(b)] += _bell(f * 1.26, 1.3, 0.5)
+    return out / (np.abs(out).max() or 1)
+
+
+def _sting() -> np.ndarray:
+    """Короткая перебивка между частями: два звонких «дзынь» вверх."""
+    step = int(0.09 * SR)
+    out = np.zeros(step + int(0.8 * SR), dtype=np.float32)
+    out[:int(0.8 * SR)] += _bell(783.99, 0.8, 0.8)
+    out[step:step + int(0.8 * SR)] += _bell(1046.5, 0.8, 1.0)
+    return out / (np.abs(out).max() or 1)
+
+
+def gossip(voice_chunks: list[bytes], rate: int = 24000, seed: int = 0) -> np.ndarray:
+    """«Сплетни Волгограда» (float32, 48 кГц, пик ≈ -1 дБ): позывной, ведущий «как на FM» поверх весёлой подложки,
+    между кусками голоса — «дзынь», в конце позывной вниз. Без помех эфира."""
+    rng = np.random.default_rng(seed)
+    parts = [_on_air(_band(v, 70, 11000)) for v in (_resample(p, rate) for p in voice_chunks) if len(v)]
+    if not parts:
+        return np.zeros(SR, dtype=np.float32)
+    ref = _speech_db(parts[0])
+    for v in parts:  # все куски — одной громкости
+        v *= np.float32(_db(ref - _speech_db(v)))
+    sting = _sting()
+    gap_in, gap_out = int(0.35 * SR), int(0.55 * SR)  # тишина до «дзынь» и от его начала до голоса
+    total = sum(len(v) for v in parts) + (len(parts) - 1) * (gap_in + gap_out)
+    voice = np.zeros(total, dtype=np.float32)
+    stings, pos = [], 0
+    for i, v in enumerate(parts):
+        if i:
+            stings.append(pos + gap_in)
+            pos += gap_in + gap_out
+        voice[pos:pos + len(v)] = v
+        pos += len(v)
+    voice = _peak1(voice)
+    ref_hp = _speech_db(_band(voice, *PHONE_BAND))      # громкость ведущего в полосе телефона
+
+    def to_level(x: np.ndarray, rel: float) -> np.ndarray:
+        r = float(np.sqrt(np.mean(np.square(_band(x, *PHONE_BAND), dtype=np.float64)))) or 1.0
+        return x * np.float32(_db(ref_hp + rel) / r)
+
+    head = to_level(_gossip_jingle(True), -3.0)
+    tail = to_level(_gossip_jingle(False), -6.0)
+    start = len(head) - int(0.5 * SR)                    # ведущий вступает, пока позывной ещё звенит
+    end = start + len(voice) + int(0.5 * SR)
+    n = end + len(tail) + int(0.3 * SR)
+    mix = np.zeros(n, dtype=np.float32)
+    mix[:len(head)] += head
+    mix[start:start + len(voice)] += voice
+    mix[end:end + len(tail)] += tail
+    st = to_level(sting, STING_DB)
+    for at in stings:
+        p = start + at
+        mix[p:p + len(st)] += st[:max(0, min(len(st), n - p))]
+    a, b = max(0, start - int(0.6 * SR)), min(n, end + int(0.8 * SR))   # подложка — под всем голосом
+    bed = to_level(_talk_bed(b - a, rng, _GOSSIP_CHORDS, GOSSIP_BPM), GOSSIP_BED_DB)
+    fi, fo = min(int(0.5 * SR), (b - a) // 3), min(int(1.5 * SR), (b - a) // 3)
+    bed[:fi] *= np.linspace(0, 1, fi, dtype=np.float32)
+    bed[-fo:] *= np.linspace(1, 0, fo, dtype=np.float32)
+    _duck(bed, _slice(voice, a - start, b - start), -7.0)
+    mix[a:b] += bed
+    del bed, voice
     mix = _band(mix, 30, 15000)
     mix = _peak1(mix)
     mix *= _db(-1)

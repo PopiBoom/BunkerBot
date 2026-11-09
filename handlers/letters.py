@@ -1,4 +1,5 @@
-"""Письма подписчиков для «Писем Волгограда» и комментарии под выпусками (владелец 08.11).
+"""Письма подписчиков для «Писем Волгограда» и комментарии под выпусками (владелец 08.11); тем же путём — сплетни
+для «Сплетен Волгограда» (09.11, kind="gossip": ссылка ?start=gossip, выпуск — /spletni).
 
 Письма: в личке у бота кнопка «✉️ Отправить письмо» (/start и ссылка t.me/<бот>?start=letter из подписи выпуска) →
 «напиши коротко, что случилось…» → одно сообщение текстом → «как подписать: именем / анонимно» → письмо уходит
@@ -41,17 +42,46 @@ PROMPT = ("✉️ <b>Письмо в «Письма Волгограда»</b>\n
           "было странного или страшного. Одним сообщением, текстом.\n\n"
           "Возможно, следующий выпуск будет именно про твой случай.")
 
-_waiting: dict[int, float] = {}       # кто сейчас пишет письмо: uid -> когда нажал
-_pending: dict[int, dict] = {}        # письмо ждёт выбора подписи: uid -> {"text", "ts"}
+GOSSIP_PROMPT = ("🗣 <b>Сплетня для «Сплетен Волгограда»</b>\n\n"
+                 "Расскажи, что слышал: кто (без фамилий - имена мы всё равно поменяем), где в Волгограде, что "
+                 "случилось и что про это говорят. Одним сообщением, текстом.\n\n"
+                 "Самые сочные выйдут в эфир - с твоим именем или анонимно, как скажешь.")
+# Тексты по виду: письмо в «Письма Волгограда» (horror) или сплетня в «Сплетни Волгограда» (gossip)
+KINDS = {
+    "horror": {"prompt": PROMPT, "button": "✉️ Отправить письмо", "what": "Письмо", "rubric": "«Писем Волгограда»",
+               "cmd": "/horror", "sign": "Как подписать письмо в эфире?",
+               "sent": "📨 Письмо ушло в редакцию «Писем Волгограда». Если его возьмут в эфир - бот напишет и пришлёт "
+                       "ссылку на выпуск.",
+               "taken": "🎙 Твоё письмо приняли в редакцию «Писем Волгограда». Когда выйдет выпуск - пришлю ссылку.",
+               "used": "🎙 Твоё письмо вышло в эфир «Писем Волгограда»", "thanks": "Спасибо, что не побоялся рассказать.",
+               "short": "Маловато - расскажи чуть подробнее: где это было и что случилось."},
+    "gossip": {"prompt": GOSSIP_PROMPT, "button": "🗣 Слить сплетню", "what": "Сплетня", "rubric": "«Сплетен Волгограда»",
+               "cmd": "/spletni", "sign": "Как подписать сплетню в эфире?",
+               "sent": "🤫 Сплетня ушла в редакцию «Сплетен Волгограда». Если её возьмут в эфир - бот напишет и пришлёт "
+                       "ссылку на выпуск.",
+               "taken": "🎙 Твою сплетню взяли в «Сплетни Волгограда». Когда выйдет выпуск - пришлю ссылку.",
+               "used": "🎙 Твоя сплетня вышла в эфир «Сплетен Волгограда»", "thanks": "Спасибо, что поделился 🤫",
+               "short": "Маловато - расскажи подробнее: кто, где и что случилось."},
+}
+
+_waiting: dict[int, tuple[float, str]] = {}  # кто сейчас пишет: uid -> (когда нажал, вид)
+_pending: dict[int, dict] = {}        # письмо ждёт выбора подписи: uid -> {"text", "ts", "kind"}
 _cache: dict = {"loaded": False, "post": None, "thread": None}
 
 
-def letter_button() -> InlineKeyboardButton:
-    return InlineKeyboardButton(text="✉️ Отправить письмо", callback_data="lt:new")
+def _kind(x: dict | str | None) -> str:
+    k = x.get("kind", "horror") if isinstance(x, dict) else (x or "horror")
+    return k if k in KINDS else "horror"
 
 
-def deep_link(bot_username: str) -> str:
-    return f"https://t.me/{bot_username}?start=letter" if bot_username else ""
+def letter_button(kind: str = "horror") -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=KINDS[_kind(kind)]["button"],
+                                callback_data="lt:new" if _kind(kind) == "horror" else f"lt:new:{kind}")
+
+
+def deep_link(bot_username: str, kind: str = "horror") -> str:
+    return (f"https://t.me/{bot_username}?start={'letter' if _kind(kind) == 'horror' else kind}"
+            if bot_username else "")
 
 
 async def _load(db: Database) -> list[dict]:
@@ -66,9 +96,9 @@ async def _save(db: Database, items: list[dict]) -> None:
     await db.set_setting(INBOX_KEY, json.dumps(items[-MAX_KEEP:], ensure_ascii=False))
 
 
-async def approved(db: Database) -> list[dict]:
-    """Взятые в эфир и ещё не вышедшие письма, новые сверху."""
-    return [x for x in reversed(await _load(db)) if x.get("status") == "ok"]
+async def approved(db: Database, kind: str = "horror") -> list[dict]:
+    """Взятые в эфир и ещё не вышедшие письма (или сплетни — kind="gossip"), новые сверху."""
+    return [x for x in reversed(await _load(db)) if x.get("status") == "ok" and _kind(x) == kind]
 
 
 async def get(db: Database, lid: int) -> dict | None:
@@ -81,26 +111,27 @@ async def mark_used(bot: Bot, db: Database, lid: int, link: str) -> None:
     for x in items:
         if x.get("id") == lid:
             x["status"], x["link"] = "used", link
+            t = KINDS[_kind(x)]
             try:
-                await bot.send_message(x["uid"], "🎙 Твоё письмо вышло в эфир «Писем Волгограда»"
-                                       + (f": {link}" if link else ".") + "\nСпасибо, что не побоялся рассказать.")
+                await bot.send_message(x["uid"], t["used"] + (f": {link}" if link else ".") + "\n" + t["thanks"])
             except Exception as e:
                 logger.info("letters: автору %s не написать: %s", x.get("uid"), e)
     await _save(db, items)
 
 
-async def ask(bot: Bot, uid: int) -> None:
-    _waiting[uid] = time.time()
+async def ask(bot: Bot, uid: int, kind: str = "horror") -> None:
+    kind = _kind(kind)
+    _waiting[uid] = (time.time(), kind)
     _pending.pop(uid, None)
-    await bot.send_message(uid, PROMPT, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+    await bot.send_message(uid, KINDS[kind]["prompt"], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✖️ Отмена", callback_data="lt:cancel")]]))
 
 
-@router.callback_query(F.data == "lt:new")
+@router.callback_query(F.data.startswith("lt:new"))
 async def cb_new(call: CallbackQuery, bot: Bot) -> None:
     await call.answer()
     try:
-        await ask(bot, call.from_user.id)
+        await ask(bot, call.from_user.id, (call.data or "")[7:] or "horror")
     except Exception as e:
         logger.info("letters: не написать %s: %s", call.from_user.id, e)
 
@@ -112,7 +143,7 @@ async def cb_cancel(call: CallbackQuery) -> None:
     await call.answer("Отменил.")
     if call.message:
         try:
-            await call.message.edit_text("Ок, письмо не отправляю. Передумаешь - жми «✉️ Отправить письмо» в /start.")
+            await call.message.edit_text("Ок, не отправляю. Передумаешь - жми кнопку в /start.")
         except Exception:
             pass
 
@@ -121,7 +152,7 @@ def _is_writing(message: Message) -> bool:
     u = message.from_user
     if message.chat.type != "private" or not u:
         return False
-    ts = _waiting.get(u.id)
+    ts = (_waiting.get(u.id) or (0, ""))[0]
     if not ts or time.time() - ts > WAIT_TTL:
         _waiting.pop(u.id, None)
         return False
@@ -131,12 +162,13 @@ def _is_writing(message: Message) -> bool:
 @router.message(_is_writing)
 async def on_letter(message: Message, db: Database) -> None:
     uid = message.from_user.id
+    kind = (_waiting.get(uid) or (0, "horror"))[1]
     text = (message.text or message.caption or "").strip()
     if not text:
         await message.answer("Пришли историю текстом, пожалуйста - голосовые и картинки сюда пока не принимаю.")
         return
     if len(text) < MIN_LEN:
-        await message.answer("Маловато - расскажи чуть подробнее: где это было и что случилось.")
+        await message.answer(KINDS[kind]["short"])
         return
     day = [x for x in await _load(db) if x.get("uid") == uid and time.time() - x.get("ts", 0) < 86400]
     if len(day) >= DAY_LIMIT:
@@ -144,9 +176,9 @@ async def on_letter(message: Message, db: Database) -> None:
         await message.answer("На сегодня писем хватит - редакция и так не спит. Приходи завтра.")
         return
     _waiting.pop(uid, None)
-    _pending[uid] = {"text": text[:MAX_LEN], "ts": time.time()}
+    _pending[uid] = {"text": text[:MAX_LEN], "ts": time.time(), "kind": kind}
     name = (message.from_user.first_name or "").strip()[:30] or "без имени"
-    await message.answer("Как подписать письмо в эфире?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+    await message.answer(KINDS[kind]["sign"], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=f"Именем «{name}»", callback_data="lt:sign:1"),
         InlineKeyboardButton(text="Анонимно", callback_data="lt:sign:0")]]))
 
@@ -162,15 +194,16 @@ async def cb_sign(call: CallbackQuery, bot: Bot, db: Database, config: Config) -
     items = await _load(db)
     lid = max([x.get("id", 0) for x in items] + [0]) + 1
     name = (u.first_name or "").strip()[:30]
+    kind = _kind(p.get("kind"))
+    t = KINDS[kind]
     entry = {"id": lid, "uid": u.id, "name": name, "username": u.username or "", "sign": name if named else "",
-             "text": p["text"], "ts": int(time.time()), "status": "new"}
+             "text": p["text"], "ts": int(time.time()), "status": "new", "kind": kind}
     items.append(entry)
     await _save(db, items)
     await call.answer("Отправлено!")
     if call.message:
         try:
-            await call.message.edit_text("📨 Письмо ушло в редакцию «Писем Волгограда». Если его возьмут в эфир - "
-                                         "бот напишет и пришлёт ссылку на выпуск.")
+            await call.message.edit_text(t["sent"])
         except Exception:
             pass
     who = html.escape(name or "без имени") + (f" (@{html.escape(u.username)})" if u.username else "")
@@ -179,13 +212,13 @@ async def cb_sign(call: CallbackQuery, bot: Bot, db: Database, config: Config) -
         InlineKeyboardButton(text="🗑 Отклонить", callback_data=f"lt:no:{lid}")]])
     for aid in config.admin_ids:
         try:
-            await bot.send_message(aid, f"✉️ <b>Письмо № {lid}</b> для «Писем Волгограда» от {who}\n"
+            await bot.send_message(aid, f"{t['button'].split()[0]} <b>{t['what']} № {lid}</b> для {t['rubric']} от {who}\n"
                                         f"Подпись в эфире: {html.escape(entry['sign']) or 'анонимно'}\n\n"
                                         f"<blockquote expandable>{html.escape(entry['text'])}</blockquote>",
                                    reply_markup=kb)
         except Exception as e:
             logger.info("letters: админу %s не отправить: %s", aid, e)
-    logger.info("letters: письмо № %s от %s (%s знаков)", lid, u.id, len(entry["text"]))
+    logger.info("letters: %s № %s от %s (%s знаков)", kind, lid, u.id, len(entry["text"]))
 
 
 @router.callback_query(F.data.startswith("lt:ok:") | F.data.startswith("lt:no:"))
@@ -210,18 +243,18 @@ async def cb_review(call: CallbackQuery, bot: Bot, db: Database, config: Config)
     was = x.get("status")
     x["status"] = "ok" if ok else "no"
     await _save(db, items)
-    await call.answer("Взято - выбери его в /horror." if ok else "Отклонено.")
+    t = KINDS[_kind(x)]
+    await call.answer(f"Взято - выбери в {t['cmd']}." if ok else "Отклонено.")
     if call.message:
         try:
             await call.message.edit_reply_markup(reply_markup=None)
-            await call.message.reply("✅ Взято в эфир - в /horror выбери, из какого письма делать выпуск." if ok
+            await call.message.reply(f"✅ Взято в эфир - в {t['cmd']} выбери, из чего делать выпуск." if ok
                                      else "🗑 Отклонено.")
         except Exception:
             pass
     if ok and was != "ok":
         try:
-            await bot.send_message(x["uid"], "🎙 Твоё письмо приняли в редакцию «Писем Волгограда». Когда выйдет "
-                                             "выпуск - пришлю ссылку.")
+            await bot.send_message(x["uid"], t["taken"])
         except Exception as e:
             logger.info("letters: автору %s не написать: %s", x.get("uid"), e)
 

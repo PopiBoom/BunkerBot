@@ -43,7 +43,9 @@ START_TEXT = (
     "👋 Привет, {name}!\n\n"
     "Я Пиздюк - бот чата и канала «радио Волгограда».\n\n"
     "✉️ Случилось что-то жуткое в Волгограде? Жми «Отправить письмо» - возможно, следующий выпуск "
-    "«Писем Волгограда» будет именно про твой случай."
+    "«Писем Волгограда» будет именно про твой случай.\n\n"
+    "🗣 Знаешь сочную историю? Жми «Слить сплетню» - имена поменяем, а в «Сплетнях Волгограда» разберём, что там "
+    "на самом деле."
 )
 
 
@@ -53,7 +55,7 @@ async def _start_keyboard(bot: Bot, config: Config) -> InlineKeyboardMarkup:
     from handlers.letters import letter_button
     from subscription import chat_link
 
-    rows = [[letter_button()]]
+    rows = [[letter_button()], [letter_button("gossip")]]
     for chat in config.required_chats:
         try:
             title, url = await chat_link(bot, chat)
@@ -81,10 +83,10 @@ async def cmd_start(message: Message, command: CommandObject, bot: Bot, db: Data
 
         await durak_join(bot, db, user, arg[4:])
         return
-    if arg == "letter":  # ссылка из подписи выпуска «Писем Волгограда»
+    if arg in ("letter", "gossip"):  # ссылка из подписи выпуска «Писем Волгограда» / «Сплетен Волгограда»
         from handlers.letters import ask
 
-        await ask(bot, user.id)
+        await ask(bot, user.id, "horror" if arg == "letter" else "gossip")
         return
     name = user.first_name or "друг"
     await message.answer(_personalize(START_TEXT, name), reply_markup=await _start_keyboard(bot, config),

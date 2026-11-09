@@ -987,3 +987,64 @@ def render_horror_cover(fmt: str, n: int, subject: str, date: str, date_words: s
     out = io.BytesIO()
     img.save(out, format="JPEG", quality=90)
     return out.getvalue()
+
+
+# ---------- «Сплетни Волгограда»: обложка выпуска (09.11) ----------
+# Жёлтая газета: красная шапка рубрики, тема слуха крупно, три версии полосками с шансами в процентах (как в
+# выпуске), штамп «ПО СЕКРЕТУ» и подвал. Рисуем сами (Pillow), без ИИ.
+
+_TABLOID_Y, _TABLOID_R, _TABLOID_K = (255, 214, 10), (206, 22, 34), (22, 20, 18)
+
+
+def render_gossip_cover(n: int, subject: str, versions: list[tuple[str, int]], date: str) -> bytes:
+    """1080×1080 JPEG: «СПЛЕТНИ ВОЛГОГРАДА · выпуск №N», тема, версии [(суть, проценты)], дата."""
+    side, pad = 1080, 64
+    img = Image.new("RGB", (side, side), _TABLOID_Y)
+    d = ImageDraw.Draw(img)
+    for y in range(0, side, 18):  # растр жёлтой прессы: точки чуть темнее фона
+        for x in range((y // 18) % 2 * 9, side, 18):
+            d.ellipse([x - 2, y - 2, x + 2, y + 2], fill=(242, 198, 0))
+    d.rectangle([0, 0, side, 150], fill=_TABLOID_R)
+    d.text((side / 2, 66), "СПЛЕТНИ ВОЛГОГРАДА", font=_serif(70, True), fill=(255, 255, 255), anchor="mm")
+    d.text((side / 2, 124), f"ВЫПУСК №{n} · РАДИО ВОЛГОГРАДА", font=_bold(28), fill=(255, 226, 120), anchor="mm")
+    d.rectangle([0, 150, side, 160], fill=_TABLOID_K)
+    # тема слуха — крупно, до трёх строк (не влезает — шрифт мельче)
+    text = f"«{_plain(subject or 'без темы').strip()}»"
+    for size in (74, 66, 58, 52):
+        lines = _wrap(d, text, _bold(size), side - 2 * pad, 3)
+        if not lines[-1].endswith("…") or size == 52:
+            break
+    y = 200
+    for line in lines:
+        d.text((pad, y), line, font=_bold(size), fill=_TABLOID_K)
+        y += int(size * 1.18)
+    # штамп «ПО СЕКРЕТУ» справа над версиями
+    stamp = _stamp("ПО СЕКРЕТУ", 34, _TABLOID_R, 8)
+    y = max(y + 24, 470)
+    img.paste(stamp, (side - pad - stamp.width, y - stamp.height // 2 - 6), stamp)
+    d.text((pad, y), "ЧТО ТАМ НА САМОМ ДЕЛЕ:", font=_bold(32), fill=_TABLOID_K, anchor="lm")
+    y += 46
+    bar_w = side - 2 * pad
+    for i, (label, pct) in enumerate(versions[:3]):
+        box = 118
+        d.rounded_rectangle([pad, y, side - pad, y + box], radius=18, fill=(255, 246, 200), outline=_TABLOID_K,
+                            width=4)
+        d.text((pad + 26, y + 38), f"{i + 1}.", font=_bold(40), fill=_TABLOID_R, anchor="lm")
+        for fs in (36, 33, 30, 27):  # длинная суть — мельче, а не обрезана
+            lab = _wrap(d, _plain(label), _bold(fs), bar_w - 250, 1)[0]
+            if not lab.endswith("…"):
+                break
+        d.text((pad + 80, y + 38), lab, font=_bold(fs), fill=_TABLOID_K, anchor="lm")
+        d.text((side - pad - 26, y + 38), f"{pct}%", font=_bold(44), fill=_TABLOID_R, anchor="rm")
+        bx0, bx1, by = pad + 26, side - pad - 26, y + 78
+        d.rounded_rectangle([bx0, by, bx1, by + 20], radius=10, fill=(230, 214, 160))
+        fill = bx0 + int((bx1 - bx0) * max(0, min(100, pct)) / 100)
+        if fill > bx0 + 20:
+            d.rounded_rectangle([bx0, by, fill, by + 20], radius=10, fill=_TABLOID_R)
+        y += box + 18
+    d.rectangle([0, side - 74, side, side], fill=_TABLOID_K)
+    d.text((pad, side - 37), f"РАДИО ВОЛГОГРАДА · {date}", font=_bold(26), fill=_TABLOID_Y, anchor="lm")
+    d.text((side - pad, side - 37), "СЛИТЬ СПЛЕТНЮ - В БОТЕ", font=_bold(26), fill=(255, 255, 255), anchor="rm")
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=90)
+    return out.getvalue()
