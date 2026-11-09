@@ -56,7 +56,7 @@ START = "dur_"          # /start dur_<id>
 HTML = Path(__file__).with_name("widget.html").read_text("utf-8")
 CARD = Path(__file__).resolve().parents[2] / "assets" / "lobby" / "durak.jpg"
 CARD_KEY = "durak_card"
-CAPTION = "🃏 Дурак у Пиздюка · не видно стол - обнови Telegram"
+CAPTION = "🃏 Дурак"  # старые клиенты сами пишут «обновите Telegram»
 RANKS, SUITS = "6789TJQKA", "shdc"
 SIGN = {"s": "♠", "h": "♥", "d": "♦", "c": "♣"}
 MAX_PLAYERS, HAND = 6, 6
@@ -455,7 +455,7 @@ async def _send_notes(bot: Bot, st: dict, notes: dict, unnote: list[int] = ()) -
 
 def _deal_notes(st: dict) -> dict:
     att = st["att"]
-    return {u: f"🃏 Раздал! Козырь - {show(st['trump'])}. "
+    return {u: f"🃏 Козырь {show(st['trump'])}. "
                + ("Ты заходишь." if u == att else f"Заходит {html.escape(_nm(st, att))}.") for u in _ids(st)}
 
 
@@ -486,10 +486,8 @@ async def create(bot: Bot, db: Database, uid: int, name: str = "") -> None:
     await _set_live(db, gid, True)
     me = await bot.me()
     link = f"https://t.me/{me.username}?start={START}{gid}"
-    text = (f"🃏 <b>{html.escape(name)} собирает на дурака</b>\n\n"
-            "За столом до 6. Жми «Сесть за стол» - карты придут в личку, играем у Пиздюка (нужен свежий Telegram). "
-            "Последний с картами - дурак.\n\n"
-            f'👉 <a href="{link}">Сесть за стол</a>')
+    # коротко и без ссылки в тексте — кнопка под постом и так есть (владелец 09.11: «убери, сократи лишнее»)
+    text = f"🃏 <b>{html.escape(name)} собирает на дурака</b>\nДо {MAX_PLAYERS} игроков."
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🃏 Сесть за стол", url=link)]])
     # сразу в канал (09.11 владелец: «не надо мне это в бот кидать» — раньше шло в личку и пересылалось оттуда)
     channel, post, problem = await channel_id(bot, db), None, ""
@@ -519,23 +517,20 @@ async def join(bot: Bot, db: Database, user, gid: str) -> None:
     async with _lock(gid):
         st = await _load(db, gid)
         if not st:
-            await bot.send_message(uid, "🃏 Такого стола нет - жди новый в канале.")
+            await bot.send_message(uid, "🃏 Такого стола нет.")
             return
         if uid in _ids(st):  # уже за столом — прислать стол заново (потерял)
             await _send_table(bot, st, uid)
             await _save(db, gid, st)
             return
         if st["phase"] != "lobby":
-            await bot.send_message(uid, "🃏 За этим столом уже играют - жди следующий в канале.")
+            await bot.send_message(uid, "🃏 За этим столом уже играют.")
             return
         if len(st["players"]) >= MAX_PLAYERS:
-            await bot.send_message(uid, "🃏 Стол полный - жди следующий в канале.")
+            await bot.send_message(uid, "🃏 Стол полный.")
             return
         name = player_name(user)
         st["players"].append([uid, name])
-        host = _nm(st, st["host"])
-        await bot.send_message(uid, f"🃏 Ты за столом у {html.escape(host)}! Карты придут сюда, как только начнём. "
-                                    "Не видно стол - обнови Telegram.")
         try:
             await _send_table(bot, st, uid)
         except TelegramBadRequest as e:
@@ -672,10 +667,8 @@ async def _finish(bot: Bot, db: Database, st: dict) -> None:
     if not channel:
         return
     names = ", ".join(html.escape(n) for _u, n in st["players"])
-    first = html.escape(_nm(st, st["out"][0])) if st.get("out") else ""
-    text = (f"🃏 <b>Дурак у Пиздюка</b>\nИграли: {names}.\n"
-            + ("Ничья - дурака нет." if durak is None else f"Дурак - <b>{html.escape(_nm(st, durak))}</b> 🤡")
-            + (f"\nПервым вышел {first}." if first and len(st["players"]) > 2 else ""))
+    text = (("🃏 Ничья - дурака нет" if durak is None else f"🃏 Дурак - <b>{html.escape(_nm(st, durak))}</b> 🤡")
+            + f"\nИграли: {names}")
     try:
         post = await bot.send_message(channel, text)
         await mark_own(db, post.message_id)

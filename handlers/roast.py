@@ -778,6 +778,9 @@ def _media_kind(message: Message) -> str:
             "файл" if message.document else "")
 
 
+OWN_POST_WAIT = 2.5  # сек: дать боту записать id своего поста в канале, прежде чем решать, чей он
+
+
 def _is_father_channel_post(message: Message) -> bool:
     sc = message.sender_chat
     if sc is None or sc.type != "channel":
@@ -808,9 +811,14 @@ async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
     if src and src[1] not in (None, message.sender_chat.id) and not _forwarded_from_father_channel(message):
         repost_from = src[0]
     fo = message.forward_origin
-    if fo is not None and fo.type == "channel" and getattr(fo, "message_id", None):
+    own_id = fo.message_id if fo is not None and fo.type == "channel" and getattr(fo, "message_id", None) else None
+    if own_id:
         from handlers.channel_posts import own_posts
-        if fo.message_id in await own_posts(db):
+        # Копия поста в обсуждении приходит раньше, чем бот узнаёт id своего поста (ответ на sendPhoto с картинкой
+        # идёт дольше) — без паузы свои посты игр выглядели «постом бати», и Пиздюк их комментировал (владелец 09.11:
+        # «отключить комментарии Пиздюка под играми»).
+        await asyncio.sleep(OWN_POST_WAIT)
+        if own_id in await own_posts(db):
             # Это пост самого бота: запоминаем как его реплику (не как пост бати — иначе он потом
             # берёт себя же за образец «как пишет батя») и не комментирует сам себя
             if text:
@@ -863,6 +871,10 @@ async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
         await bot.send_chat_action(chat_id, "typing")
         await _remember_lines(db, chat_id)
         ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)  # пост бати: иногда и нагрубить
+        if own_id:  # ещё раз: вдруг бот пометил пост своим уже после паузы
+            from handlers.channel_posts import own_posts
+            if own_id in await own_posts(db):
+                return
         spoken = _channel_post_id(message) is not None and bool(ai.eleven_key()) and not ai.eleven_geo_blocked()
         answer = await ai.channel_comment(channel, text, media, image, await db.style_sample(chat_id),
                                           repost_from=repost_from, speech=speech, spoken=spoken)

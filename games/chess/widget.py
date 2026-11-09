@@ -54,7 +54,7 @@ CARD_KEY = "wchess_card"  # её file_id после первой отправк�
 SQ = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/"  # клетка a1…h8 → знак (как в widget.html)
 MAX_DATA = 1024          # chat_data и ответ на запрос — не больше (байт)
 NAME_LEN = 18
-CAPTION = "♟ Шахматы Пиздюка · не видно доску - обнови Telegram"
+CAPTION = "♟ Шахматы"  # старые клиенты сами пишут «обновите Telegram»
 GLYPH = {"k": "♚", "q": "♛", "r": "♜", "b": "♝", "n": "♞", "p": "♟"}
 DRAWS = {"stalemate": "пат", "material": "не хватает фигур для мата", "repeat": "позиция повторилась трижды",
          "fifty": "50 ходов без взятий и ходов пешкой", "agreed": "по согласию"}
@@ -274,7 +274,7 @@ async def _note(bot: Bot, st: dict, uid: int, text: str) -> None:
 
 
 def _side(st: dict, uid: int) -> str:
-    return "белыми - твой ход" if _color(st, uid) == "w" else "чёрными, первым ходит соперник"
+    return "белыми - твой ход" if _color(st, uid) == "w" else "чёрными"
 
 
 # ---------- вызов и вход ----------
@@ -322,10 +322,8 @@ async def create(bot: Bot, db: Database, uid: int, name: str = "") -> None:
     await db.set_setting(OPEN, gid)
     me = await bot.me()
     link = f"https://t.me/{me.username}?start={START}{gid}"
-    text = (f"♟ <b>{html.escape(name)} ищет соперника</b>\n\n"
-            "Кто первым нажмёт «Сыграть» - тот и играет. Партия - в личке у Пиздюка, доска прямо в сообщении "
-            "(нужен свежий Telegram).\n\n"
-            f'👉 <a href="{link}">Сыграть</a>')  # ссылка и в тексте, и кнопкой
+    # коротко и без ссылки в тексте — кнопка под постом и так есть (владелец 09.11: «убери, сократи лишнее»)
+    text = f"♟ <b>{html.escape(name)} ищет соперника в шахматы</b>\nКто первый нажмёт - тот и играет."
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="♟ Сыграть", url=link)]])
     # сразу в канал (09.11 владелец: «не надо мне это в бот кидать» — раньше шло в личку и пересылалось оттуда)
     channel, post, problem = await channel_id(bot, db), None, ""
@@ -354,29 +352,27 @@ async def join(bot: Bot, db: Database, user, gid: str) -> None:
     async with _lock(gid):
         st = await _load(db, gid)
         if not st:
-            await bot.send_message(uid, "♟ Такой партии нет - жди новый вызов в канале.")
+            await bot.send_message(uid, "♟ Такой партии нет.")
             return
         if _color(st, uid):  # свой же игрок — прислать доску заново (потерял)
             await _send_board(bot, st, uid)
             await _save(db, gid, st)
             return
         if st.get("end"):
-            await bot.send_message(uid, "♟ Эта партия уже сыграна - жди новый вызов в канале.")
+            await bot.send_message(uid, "♟ Партия уже сыграна.")
             return
         if st.get("w"):
-            await bot.send_message(uid, "♟ Соперник уже нашёлся, партия идёт. Жди следующий вызов в канале.")
+            await bot.send_message(uid, "♟ Соперник уже нашёлся.")
             return
         host = st["host"]
         if uid == host[0]:
-            await bot.send_message(uid, "♟ Это твой вызов - ждём соперника, ссылка в канале.")
+            await bot.send_message(uid, "♟ Это твой вызов - ждём соперника.")
             return
         guest = [uid, _name(user)]
         pair = [host, guest]
         random.shuffle(pair)
         st["w"], st["b"] = pair
         st["start"] = time.time()
-        await bot.send_message(uid, f"♟ Партия началась! Соперник: {html.escape(host[1])}. Ты {_side(st, uid)}.\n"
-                                    "Доска ниже: нажми свою фигуру, потом клетку. Не видно доску - обнови Telegram.")
         try:
             await _send_board(bot, st, uid)
         except TelegramBadRequest as e:
@@ -450,8 +446,7 @@ def _apply(st: dict | None, uid: int, kind: str, arg: str, chat, mid) -> tuple[d
             return {"err": "Ты уже предложил - ждём ответа"}, ev
         else:
             st["draw"] = uid
-            ev["note"][oid] = (f"🤝 {html.escape(my_name)} предлагает ничью - жми «🤝 Согласен» под доской "
-                               "или просто ходи.")
+            ev["note"][oid] = f"🤝 {html.escape(my_name)} предлагает ничью."
     elif kind == "n":
         if not end or end.get("why") == "cancel":
             return {"err": "Партия ещё идёт"}, ev
@@ -464,7 +459,7 @@ def _apply(st: dict | None, uid: int, kind: str, arg: str, chat, mid) -> tuple[d
             ev["rematch"] = True
         else:
             st["rematch"] = uid
-            ev["note"][oid] = f"🔁 {html.escape(my_name)} хочет реванш - жми «🔁 Принять реванш» под доской."
+            ev["note"][oid] = f"🔁 {html.escape(my_name)} хочет реванш."
     else:
         return {"err": "Непонятный запрос"}, ev
     ev["changed"] = True
@@ -576,9 +571,7 @@ async def _replay(bot: Bot, db: Database, st: dict) -> None:
     file_id = None
     for chat in targets + ([channel] if channel else []):
         try:
-            text = caption if chat != channel else (f"♟ <b>Шахматы в личке у Пиздюка</b>\n{html.escape(w)} - "
-                                                    f"{html.escape(b)}: {html.escape(end_line(st))}. "
-                                                    f"Ходов: {(len(moves) + 1) // 2}")
+            text = caption if chat != channel else f"♟ {html.escape(w)} - {html.escape(b)}: {html.escape(end_line(st))}"
             msg = await bot.send_animation(chat, file_id or media, caption=text)
             if chat == channel:
                 await mark_own(db, msg.message_id)
