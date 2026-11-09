@@ -212,15 +212,12 @@ def attack(st: dict, uid: int, card: str, notes: dict) -> str | None:
             return "Подкинуть можно только того же достоинства, что на столе"
         if _room(st) <= 0:
             return "Больше подкидывать нельзя"
-    was_beaten = not _unbeaten(st)
     hand.remove(card)
     st["table"].append([card, None])
     st["last"] = None  # табличка «бито / берёт» прошлого отбоя гаснет
     if uid in st["passed"]:
         st["passed"].remove(uid)
-    if not st["taking"] and (first or was_beaten):
-        notes[st["dfd"]] = "🛡 Отбивайся"  # только «твой ход», без чужих карт (владелец 09.11)
-    return None
+    return None  # уведомлений о ходе нет (владелец 09.11: «уведомления, когда ход твой, — не надо»)
 
 
 def defend(st: dict, uid: int, card: str, i: int, notes: dict) -> str | None:
@@ -294,7 +291,6 @@ def _end_bout(st: dict, notes: dict) -> None:
     nxt = _next(st, dfd) if took or dfd in st["out"] else dfd
     st["att"], st["dfd"] = nxt, _next(st, nxt)
     st["bout"] += 1
-    notes[nxt] = "🃏 Твой ход"
 
 
 def settle(st: dict, now: float, notes: dict) -> None:
@@ -508,8 +504,8 @@ async def _close_host_tables(bot: Bot, db: Database, uid: int, why: str) -> None
 
 
 def _deal_notes(st: dict) -> dict:
-    """Раздали — уведомление только тому, кто заходит (о чужих ходах не пишем — владелец 09.11)."""
-    return {st["att"]: "🃏 Твой ход"}
+    """Раздали — никому не пишем: уведомлений о ходе нет (владелец 09.11), всё видно на столе."""
+    return {}
 
 
 async def create(bot: Bot, db: Database, uid: int, name: str = "", where: int | None = None) -> None:

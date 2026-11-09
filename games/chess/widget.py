@@ -437,9 +437,7 @@ def _apply(st: dict | None, uid: int, kind: str, arg: str, chat, mid) -> tuple[d
         if why:
             st["end"] = {"why": why, "win": uid if why == "mate" else 0}
             ev["done"] = True
-        else:
-            ev["note"][oid] = "♟ Твой ход"  # без хода соперника — он и так виден на доске (владелец 09.11)
-        ev["unnote"].append(uid)
+        ev["unnote"].append(uid)  # уведомлений о ходе нет (владелец 09.11) — прошлое служебное убираем
     elif kind == "r":
         st["end"] = {"why": "resign", "win": oid}
         ev["done"] = True
