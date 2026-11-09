@@ -646,3 +646,314 @@ def render_news(date: str, issue: int, headline: str, ticker: list[str]) -> byte
     d.text((w3 + 20, tick_top + 31), _wrap(d, run, _bold(26), w - w3 - 40, 1)[0], font=_bold(26), fill=dark,
            anchor="lm")
     return _png(img)
+
+
+# ---------- «Письма Волгограда»: обложка-улика к выпуску ----------
+# Идея владельца №19 (09.11): к голосовому в канале — картинка-улика по формату выпуска: конверт со штемпелем,
+# страница дневника в клетку, кассета от диктофона или бланк объяснения. Рисуем сами (Pillow), без ИИ и бесплатно.
+
+_BONE, _BLOOD, _INK, _PENCIL = (226, 218, 200), (150, 22, 26), (28, 38, 92), (60, 60, 66)
+
+
+def _paper(w: int, h: int, color: tuple, seed: int) -> Image.Image:
+    """Лист бумаги: цвет, зерно, потемневшие края и пара пятен."""
+    import random
+
+    from PIL import ImageFilter
+
+    rnd = random.Random(seed)
+    img = Image.new("RGB", (w, h), color)
+    img = Image.blend(img, Image.effect_noise((w, h), 40).convert("RGB"), 0.06)
+    edge = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(edge).rectangle([18, 18, w - 18, h - 18], fill=255)
+    edge = edge.filter(ImageFilter.GaussianBlur(26))
+    dark = Image.new("RGB", (w, h), tuple(int(c * 0.72) for c in color))
+    img = Image.composite(img, dark, edge)
+    stains = Image.new("L", (w, h), 0)
+    sd = ImageDraw.Draw(stains)
+    for _ in range(3):
+        x, y, r = rnd.randrange(w), rnd.randrange(h), rnd.randrange(30, 90)
+        sd.ellipse([x - r, y - r * 0.7, x + r, y + r * 0.7], outline=70, width=3)
+        sd.ellipse([x - r + 6, y - r * 0.7 + 5, x + r - 6, y + r * 0.7 - 5], fill=18)
+    stains = stains.filter(ImageFilter.GaussianBlur(3))
+    return Image.composite(Image.new("RGB", (w, h), tuple(int(c * 0.8) for c in color)), img, stains)
+
+
+def _hand(text: str, size: int, color: tuple, shear: float = 0.22, bold: bool = False) -> Image.Image:
+    """Надпись «от руки»: засечный шрифт с наклоном (рукописного шрифта нет, курсив делаем сдвигом)."""
+    f = _serif(size, bold)
+    tmp = ImageDraw.Draw(Image.new("RGBA", (4, 4)))
+    w = int(tmp.textlength(text, font=f)) + size
+    h = int(size * 1.5)
+    im = Image.new("RGBA", (w + int(h * shear), h), (0, 0, 0, 0))
+    ImageDraw.Draw(im).text((int(h * shear), size * 0.15), text, font=f, fill=color + (235,))
+    return im.transform(im.size, Image.AFFINE, (1, shear, -h * shear * 0.5, 0, 1, 0), resample=Image.BICUBIC)
+
+
+def _hand_lines(img: Image.Image, text: str, x: int, y: int, width: int, size: int, color: tuple, max_lines: int,
+                step: float = 1.45, shear: float = 0.22) -> int:
+    """Несколько строк «от руки» в ширину width; возвращает y под последней строкой."""
+    d = ImageDraw.Draw(img)
+    for line in _wrap(d, text, _serif(size), int(width * 0.93), max_lines):
+        layer = _hand(line, size, color, shear)
+        img.paste(layer, (x, y), layer)
+        y += int(size * step)
+    return y
+
+
+def _scribble(d: ImageDraw.ImageDraw, x0: int, y: int, x1: int, color: tuple, seed: int, width: int = 3) -> None:
+    """Строка «почерка», которую не разобрать: слова-петли прописью (удлинённая циклоида) с пробелами."""
+    import math
+    import random
+
+    rnd = random.Random(seed)
+    x = x0
+    while x < x1 - 30:
+        length = min(rnd.uniform(28, 95), x1 - x)
+        k, r = rnd.uniform(3.2, 4.2), rnd.uniform(7.0, 10.5)
+        pts, t = [], 0.0
+        while t < length:
+            amp = r * (1.4 if rnd.random() < 0.06 else 1.0)  # редкая «высокая» буква
+            pts.append((x + t - r * 0.75 * math.sin(t / k), y - amp * (1 - math.cos(t / k)) * 0.8))
+            t += 1.2
+        if len(pts) > 2:
+            d.line(pts, fill=color, width=width, joint="curve")
+        x += length + rnd.uniform(10, 18)
+
+
+def _fingerprint(size: int, color: tuple, seed: int) -> Image.Image:
+    """Бурый отпечаток пальца: вложенные дуги-гребни, неровно пропечатанные."""
+    import random
+
+    rnd = random.Random(seed)
+    im = Image.new("RGBA", (size, int(size * 1.3)), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    cx, cy = size / 2, size * 0.7
+    for i in range(1, 14):
+        rx, ry = i * size / 30, i * size / 24
+        a0 = rnd.uniform(-20, 20)
+        d.arc([cx - rx, cy - ry, cx + rx, cy + ry], 180 + a0, 360 + a0 + rnd.uniform(-30, 10),
+              fill=color + (rnd.randrange(50, 110),), width=3)
+    return im.rotate(rnd.uniform(-30, 30), expand=True, resample=Image.BICUBIC)
+
+
+def _postmark(size: int, date: str, color: tuple) -> Image.Image:
+    """Почтовый штемпель: двойной круг, «ВОЛГОГРАД», дата, волнистые линии гашения."""
+    import math
+
+    im = Image.new("RGBA", (size * 2, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    c = color + (200,)
+    r = size // 2 - 4
+    d.ellipse([4, 4, 4 + 2 * r, 4 + 2 * r], outline=c, width=5)
+    d.ellipse([22, 22, 2 * r - 14, 2 * r - 14], outline=c, width=3)
+    d.text((4 + r, 4 + r * 0.62), "ВОЛГОГРАД", font=_bold(int(size * 0.12)), fill=c, anchor="mm")
+    d.text((4 + r, 4 + r * 1.05), date, font=_mono(int(size * 0.15)), fill=c, anchor="mm")
+    d.text((4 + r, 4 + r * 1.42), "400000", font=_mono(int(size * 0.1)), fill=c, anchor="mm")
+    for k in range(4):  # волны гашения справа от круга
+        yy = size * (0.3 + 0.13 * k)
+        d.line([(2 * r + 12 + t, yy + math.sin(t / 14) * 7) for t in range(0, size - 10, 4)], fill=c, width=4)
+    return im.rotate(-14, expand=True, resample=Image.BICUBIC)
+
+
+def _stamp_art(w: int, h: int) -> Image.Image:
+    """Марка: зубчатый край, ночной двор — дома, одно горящее окно, луна."""
+    im = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    d.rectangle([0, 0, w, h], fill=(244, 238, 222, 255))
+    for x in range(0, w + 1, 14):  # зубцы
+        d.ellipse([x - 5, -5, x + 5, 5], fill=(0, 0, 0, 0))
+        d.ellipse([x - 5, h - 5, x + 5, h + 5], fill=(0, 0, 0, 0))
+    for y in range(0, h + 1, 14):
+        d.ellipse([-5, y - 5, 5, y + 5], fill=(0, 0, 0, 0))
+        d.ellipse([w - 5, y - 5, w + 5, y + 5], fill=(0, 0, 0, 0))
+    m = 14
+    d.rectangle([m, m, w - m, h - m], fill=(32, 40, 66, 255))
+    d.ellipse([w * 0.6, h * 0.16, w * 0.6 + w * 0.2, h * 0.16 + w * 0.2], fill=(236, 226, 190, 255))
+    base = h - m
+    for x0, x1, top in ((m, w * 0.42, h * 0.45), (w * 0.38, w * 0.7, h * 0.58), (w * 0.66, w - m, h * 0.5)):
+        d.rectangle([x0, top, x1, base], fill=(14, 16, 24, 255))
+    d.rectangle([w * 0.24, h * 0.56, w * 0.3, h * 0.62], fill=(236, 196, 90, 255))  # горящее окно
+    d.text((w / 2, h - m - 12), "ПОЧТА", font=_bold(13), fill=(200, 200, 210, 255), anchor="mm")
+    return im
+
+
+def _envelope(subject: str, sender: str, date: str, seed: int) -> Image.Image:
+    w, h = 860, 600
+    img = _paper(w, h, (206, 190, 156), seed)
+    d = ImageDraw.Draw(img)
+    stamp = _stamp_art(150, 180)
+    img.paste(stamp, (w - 190, 36), stamp)
+    pm = _postmark(170, date, (40, 40, 60))
+    img.paste(pm, (w - 330, 70), pm)
+    d.text((48, 56), "От кого:", font=_serif(24), fill=(70, 60, 50))
+    layer = _hand(sender[:28], 34, _INK)
+    img.paste(layer, (160, 44), layer)
+    d.line([(160, 92), (min(w - 360, 160 + layer.width), 92)], fill=(120, 105, 90), width=2)
+    d.text((48, 250), "Куда:", font=_serif(24), fill=(70, 60, 50))
+    y = 236
+    for line in ("Радио Волгограда,", "рубрика «Письма Волгограда»"):
+        layer = _hand(line, 38, _INK)
+        img.paste(layer, (140, y), layer)
+        d.line([(140, y + 58), (w - 60, y + 58)], fill=(120, 105, 90), width=2)
+        y += 70
+    d.text((48, 420), "Тема:", font=_serif(24), fill=(70, 60, 50))
+    _hand_lines(img, f"«{subject}»", 140, 404, w - 200, 38, _BLOOD, 2, shear=0.28)
+    for k in range(6):  # индекс: клетки внизу слева
+        x = 48 + k * 36
+        d.rectangle([x, h - 62, x + 26, h - 22], outline=(120, 105, 90), width=2)
+    for k, ch in enumerate("400"):
+        d.text((48 + k * 36 + 13, h - 42), ch, font=_mono(26), fill=_INK, anchor="mm")
+    fp = _fingerprint(110, (92, 30, 24), seed)
+    img.paste(fp, (w - 210, h - 190), fp)
+    return img
+
+
+# Строки дневника — общие, без сюжета выпуска (и без рода: «проверила/проверил»)
+_DIARY_LINES = ["Опять этот звук в три часа ночи.", "Соседи ничего не слышали.", "Замок проверен. Четыре раза.",
+                "Свет в подъезде снова не горит.", "Никому не открывать.", "В глазок смотреть нельзя.",
+                "Телефон опять был тёплый.", "Завтра сходить к участковому.", "Это было не во сне."]
+
+
+def _diary(subject: str, date_words: str, seed: int) -> Image.Image:
+    import random
+
+    rnd = random.Random(seed)
+    w, h = 800, 720
+    img = _paper(w, h, (236, 232, 218), seed)
+    d = ImageDraw.Draw(img)
+    for x in range(0, w, 30):
+        d.line([(x, 0), (x, h)], fill=(176, 196, 222), width=1)
+    for y in range(0, h, 30):
+        d.line([(0, y), (w, y)], fill=(176, 196, 222), width=1)
+    d.line([(96, 0), (96, h)], fill=(214, 90, 90), width=3)
+    y = _hand_lines(img, date_words[:1].upper() + date_words[1:] + ".", 120, 50, w - 160, 38, _INK, 1)
+    y = _hand_lines(img, subject[:1].upper() + subject[1:] + ".", 120, y + 14, w - 160, 44, _INK, 3)
+    lines = rnd.sample(_DIARY_LINES, 3)
+    for k in range(6):
+        yy = y + 46 + k * 60
+        if yy > h - 70:
+            break
+        if k in (0, 2, 4):  # строка, которую можно прочесть, и строка «почерком»
+            layer = _hand(lines[k // 2], 32, _INK, 0.24)
+            img.paste(layer, (120, yy - 34), layer)
+            if k == 2:  # зачёркнута
+                d.line([(118, yy - 12), (120 + layer.width - 20, yy - 8)], fill=_INK, width=4)
+        else:
+            _scribble(d, 124, yy, w - 80 - (k % 3) * 110, _INK, seed + k)
+    fp = _fingerprint(100, (92, 30, 24), seed + 1)
+    img.paste(fp, (w - 170, h - 200), fp)
+    return img
+
+
+def _cassette(subject: str, n: int, seed: int) -> Image.Image:
+    w, h = 860, 540
+    img = Image.new("RGB", (w, h), (0, 0, 0))
+    img = Image.blend(img, Image.effect_noise((w, h), 30).convert("RGB"), 0.05)
+    mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=36, fill=255)
+    body = Image.new("RGB", (w, h), (34, 34, 38))
+    body = Image.blend(body, Image.effect_noise((w, h), 50).convert("RGB"), 0.05)
+    d = ImageDraw.Draw(body)
+    for cx, cy in ((26, 26), (w - 26, 26), (26, h - 26), (w - 26, h - 26), (w / 2, h - 30)):
+        d.ellipse([cx - 9, cy - 9, cx + 9, cy + 9], fill=(90, 90, 96))
+        d.line([(cx - 6, cy), (cx + 6, cy)], fill=(40, 40, 44), width=3)
+    label = _paper(w - 120, 300, (232, 224, 200), seed)
+    ld = ImageDraw.Draw(label)
+    ld.rectangle([0, 0, w - 120, 46], fill=(150, 22, 26))
+    ld.text((24, 23), f"ЗАПИСЬ №{n}", font=_bold(28), fill=(240, 232, 214), anchor="lm")
+    ld.text((w - 144, 23), "A", font=_bold(30), fill=(240, 232, 214), anchor="rm")
+    _hand_lines(label, subject[:1].upper() + subject[1:], 24, 60, w - 170, 36, _INK, 2, shear=0.25)
+    win_y = 170
+    ld.rounded_rectangle([150, win_y, w - 270, win_y + 100], radius=46, fill=(30, 26, 24))
+    ld.rectangle([260, win_y + 30, w - 380, win_y + 70], fill=(70, 46, 30))  # лента в окошке
+    for cx in (200, w - 320):  # катушки
+        ld.ellipse([cx - 42, win_y + 8, cx + 42, win_y + 92], fill=(226, 222, 214))
+        ld.ellipse([cx - 18, win_y + 32, cx + 18, win_y + 68], fill=(30, 26, 24))
+        for k in range(6):
+            import math
+
+            a = k * math.pi / 3
+            ld.line([(cx + 18 * math.cos(a), win_y + 50 + 18 * math.sin(a)),
+                     (cx + 26 * math.cos(a), win_y + 50 + 26 * math.sin(a))], fill=(226, 222, 214), width=5)
+    body.paste(label, (60, 40))
+    d.polygon([(150, h), (200, h - 110), (w - 200, h - 110), (w - 150, h)], fill=(26, 26, 30))
+    for x in (300, w - 300):
+        d.ellipse([x - 14, h - 70, x + 14, h - 42], fill=(12, 12, 14))
+    img.paste(body, (0, 0), mask)
+    out = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    out.paste(img, (0, 0), mask)
+    return out
+
+
+def _statement(subject: str, date: str, seed: int) -> Image.Image:
+    w, h = 760, 860
+    img = _paper(w, h, (238, 236, 228), seed)
+    d = ImageDraw.Draw(img)
+    d.text((w / 2, 70), "ОБЪЯСНЕНИЕ", font=_bold(40), fill=(30, 30, 34), anchor="mm")
+    d.text((60, 130), "г. Волгоград", font=_mono(22), fill=(40, 40, 44))
+    d.text((w - 60, 130), date, font=_mono(22), fill=(40, 40, 44), anchor="ra")
+    y = 190
+    for line in ("Я, ________________________, по существу", "заданных мне вопросов поясняю следующее:"):
+        d.text((60, y), line, font=_mono(22), fill=(40, 40, 44))
+        y += 36
+    y += 14
+    for line in _wrap(d, subject[:1].upper() + subject[1:] + ".", _mono(26), w - 120, 3):
+        d.text((60, y), line, font=_mono(26), fill=(20, 20, 24))
+        y += 40
+    for k in range(7):
+        yy = y + 30 + k * 52
+        d.line([(60, yy + 14), (w - 60, yy + 14)], fill=(170, 170, 176), width=1)
+        _scribble(d, 66, yy, w - 70 - (k * 37 % 160), _INK, seed + 10 + k, 2)
+    d.text((60, h - 130), "С моих слов записано верно, мною прочитано.", font=_mono(20), fill=(40, 40, 44))
+    _scribble(d, w - 300, h - 80, w - 90, _INK, seed + 99, 3)
+    stamp = _stamp("КОПИЯ", 54, (150, 22, 26), 12)
+    img.paste(stamp, (w - stamp.width - 40, h - 330), stamp)
+    return img
+
+
+def render_horror_cover(fmt: str, n: int, subject: str, date: str, date_words: str = "", sender: str = "",
+                        seed: int = 0) -> bytes:
+    """Обложка выпуска «Писем Волгограда» 1080×1080 (JPEG): улика по формату — «письмо» конверт со штемпелем,
+    «дневник» страница в клетку, «диктофон» кассета, «показания» бланк объяснения; сверху — рубрика и номер выпуска,
+    снизу — радио и дата. date — «09.11.26», date_words — «девятое ноября», sender — от кого (письмо)."""
+    import random
+
+    from PIL import ImageFilter
+
+    side = 1080
+    rnd = random.Random(seed or n)
+    subject = _plain(subject or "без темы")[:70]
+    img = Image.new("RGB", (side, side), (20, 16, 14))
+    grain = Image.effect_noise((side, side), 70).convert("RGB")
+    img = Image.blend(img, grain, 0.05)
+    light = Image.new("L", (side, side), 0)
+    ImageDraw.Draw(light).ellipse([-200, -260, side * 0.95, side * 0.9], fill=90)
+    light = light.filter(ImageFilter.GaussianBlur(160))
+    img = Image.composite(Image.new("RGB", (side, side), (64, 54, 46)), img, light)
+    if fmt == "дневник":
+        obj = _diary(subject, date_words or date, rnd.randrange(999)).convert("RGBA")
+    elif fmt == "диктофон":
+        obj = _cassette(subject, n, rnd.randrange(999))
+    elif fmt == "показания":
+        obj = _statement(subject, date, rnd.randrange(999)).convert("RGBA")
+    else:
+        obj = _envelope(subject, sender or "без обратного адреса", date, rnd.randrange(999)).convert("RGBA")
+    angle = rnd.uniform(-5, 5)
+    obj = obj.rotate(angle, expand=True, resample=Image.BICUBIC)
+    scale = min(900 / obj.width, 800 / obj.height, 1.0)
+    if scale < 1:
+        obj = obj.resize((int(obj.width * scale), int(obj.height * scale)), Image.LANCZOS)
+    x, y = (side - obj.width) // 2, 150 + (800 - obj.height) // 2
+    shadow = Image.new("L", (side, side), 0)
+    shadow.paste(obj.getchannel("A").point(lambda a: 170 if a > 10 else 0), (x + 18, y + 26))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(22))
+    img = Image.composite(Image.new("RGB", (side, side), (4, 3, 3)), img, shadow)
+    img.paste(obj, (x, y), obj)
+    d = ImageDraw.Draw(img)
+    d.text((side / 2, 62), "ПИСЬМА ВОЛГОГРАДА", font=_serif(64, True), fill=_BONE, anchor="mm")
+    d.text((side / 2, 118), f"ВЫПУСК №{n}", font=_bold(30), fill=(196, 40, 44), anchor="mm")
+    d.text((side / 2, side - 46), f"РАДИО ВОЛГОГРАДА · {date}", font=_bold(26), fill=(150, 140, 126), anchor="mm")
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=90)
+    return out.getvalue()

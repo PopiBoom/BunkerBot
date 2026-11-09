@@ -47,6 +47,8 @@ FIRST_KEY = "night_first_sent"
 HORROR_FIRST_KEY = "horror_first_sent"
 HORROR_KEY = "horror_titles"
 MOTIFS_KEY = "horror_motifs"     # ключевые детали прошлых выпусков — не повторять (владелец: «ключи и т.д.»)
+LORE_KEY = "horror_lore"         # сквозные персонажи рубрики (идея №7): [{"name", "what", "no", "where", "seen"}] —
+#                                   пополняется только при публикации, чтобы «выпуск №N» в эфире был настоящим
 TOPICS_KEY = "night_topics"
 TOPICS = [
     "обычные дни, которые не запоминаются", "люди за соседними окнами", "дорога домой ночью",
@@ -219,6 +221,41 @@ async def _noop(_text: str) -> None:
     return None
 
 
+def _short(text: str, n: int) -> str:
+    """Не длиннее n знаков и не посреди слова."""
+    return text if len(text) <= n else text[:n].rsplit(" ", 1)[0].rstrip(",;:-— ")
+
+
+def _lore_pick(entries: list, n_next: int, used: list[str]) -> dict | None:
+    """Сквозной персонаж для нового выпуска (идея владельца №7): изредка (`ai.LORE_CHANCE`), не два выпуска подряд,
+    из выпусков не новее позапрошлого и не чаще `ai.LORE_MAX` раз на одного. None — в этот раз без него."""
+    if not entries or random.random() >= ai.LORE_CHANCE or any(f"| {ai.LORE_MARK} |" in a for a in used[-1:]):
+        return None
+    pool = [e for e in entries if isinstance(e, dict) and e.get("name") and int(e.get("no") or 0) <= n_next - 2
+            and int(e.get("seen") or 1) < ai.LORE_MAX]
+    if not pool:
+        return None
+    return dict(random.choices(pool, weights=[1 / int(e.get("seen") or 1) for e in pool])[0])
+
+
+async def _lore_commit(db: Database, draft: dict) -> None:
+    """Выпуск опубликован: сквозной персонаж, который в нём мелькал, — «видели ещё раз», новый — в список."""
+    try:
+        entries = list(json.loads(await db.get_setting(LORE_KEY, "[]") or "[]"))
+    except (ValueError, TypeError):
+        entries = []
+    used = str(draft.get("lore_used") or "").strip().lower()
+    for e in entries:
+        if used and str(e.get("name", "")).strip().lower() == used:
+            e["seen"] = int(e.get("seen") or 1) + 1
+    new = draft.get("lore_new") or {}
+    name = str(new.get("name") or "").strip()
+    if name and name.lower() != used and all(str(e.get("name", "")).strip().lower() != name.lower() for e in entries):
+        entries.append({"name": name, "what": new.get("what", ""), "no": new.get("no"), "where": new.get("where", ""),
+                        "seen": 1})
+    await db.set_setting(LORE_KEY, json.dumps(entries[-30:], ensure_ascii=False))
+
+
 async def make_episode(db: Database, horror: bool = False, progress=_noop, letter: dict | None = None,
                        bot_username: str = "") -> dict:
     """{"ogg": bytes | None, "paragraphs": [...], "caption": str, "n": int}. Без голоса — без звука (текстом).
@@ -247,7 +284,14 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
             motifs = list(json.loads(await db.get_setting(MOTIFS_KEY, "[]") or "[]"))
         except (ValueError, TypeError):
             motifs = []
-        story = await ai.horror_story(used[-10:], facts, now.date(), listener=letter, comments=coms, motifs=motifs)
+        n_next = int(await db.get_setting(HORROR_COUNT_KEY, "0") or 0) + 1
+        try:
+            lore_all = list(json.loads(await db.get_setting(LORE_KEY, "[]") or "[]"))
+        except (ValueError, TypeError):
+            lore_all = []
+        lore = None if letter else _lore_pick(lore_all, n_next, used)
+        story = await ai.horror_story(used[-10:], facts, now.date(), listener=letter, comments=coms, motifs=motifs,
+                                      lore=lore)
         if not story["paragraphs"]:
             raise RuntimeError("ИИ не написал историю")
         if story.get("motifs"):
@@ -293,7 +337,8 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
         if call:
             chunks += [call["host_in"], call["text"], call["host_back"]]
             roles += ["host", f"call_{call['gender']}", "host"]
-        await db.set_setting(HORROR_KEY, json.dumps((used + [story["premise"][:160]])[-30:], ensure_ascii=False))
+        # 240 знаков: пометки (манера, концовка, обрыв, лор) и приём должны влезть — по ним код не повторяется
+        await db.set_setting(HORROR_KEY, json.dumps((used + [story["premise"][:240]])[-30:], ensure_ascii=False))
     else:
         try:
             used = json.loads(await db.get_setting(TOPICS_KEY, "[]") or "[]")
@@ -310,6 +355,21 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
     n = int(await db.get_setting(HORROR_COUNT_KEY if horror else COUNT_KEY, "0") or 0) + 1
     caption = _caption(horror, n, topic, now, cond["caption"], bot_username, story.get("format", "письмо"),
                        author=((letter.get("sign") or "").strip() if letter else None))
+    cover = None
+    if horror:  # обложка-улика (идея №19): конверт / дневник / кассета / бланк — по формату выпуска
+        import cards
+
+        sender = ((letter.get("sign") or "").strip() or "аноним") if letter else "без обратного адреса"
+        try:
+            cover = await asyncio.to_thread(cards.render_horror_cover, story.get("format", "письмо"), n, topic,
+                                            now.strftime("%d.%m.%y"), ai.date_words(now.date()), sender,
+                                            int(time.time()))
+        except Exception:  # noqa: BLE001 — без обложки выпуск всё равно выходит
+            logger.exception("horror: обложка не нарисовалась")
+    lore_new = story.get("lore")
+    lore_info = {"lore_used": story.get("lore_used"),
+                 "lore_new": ({**lore_new, "no": n, "where": _short(str(story.get("place", "")), 80)}
+                              if lore_new else None)}
     async def step(i: int, total: int, who: str) -> None:
         await progress(f"🎙 Озвучиваю: {i} из {total} · {who}")
 
@@ -321,7 +381,7 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
             if t:
                 t.cancel()
         return {"ogg": None, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic,
-                "voice": ai.voice_trouble[0]}
+                "voice": ai.voice_trouble[0], "cover": cover}
     await progress("🎚 Свожу эфир…")
     if horror:  # страшная рубрика — как настоящий FM-эфир из студии
         events, music = [], None
@@ -348,7 +408,11 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
                   f"{len(story.get('sfx') or [])}, музыка {'ElevenLabs' if music is not None else 'своя'}, звонок "
                   + (f"посреди письма ({interrupt[0]:.0f} с из {letter_secs:.0f}"
                      + (", обрыв и гудки)" if call.get("drop") else ", без обрыва)") if interrupt else "нет")
-                  + (", метки времени" if ai.letter_alignment[0] else ""))
+                  + (", метки времени" if ai.letter_alignment[0] else "")
+                  + (f", манера «{story['style']}»" if story.get("style") else "")
+                  + (f", концовка «{story['ending']}»" if story.get("ending") else "")
+                  + (f", понятность {story['check']['clear']}/5" if (story.get("check") or {}).get("clear") else "")
+                  + (f", сквозное «{story['lore_used']}»" if story.get("lore_used") else ""))
         logger.info("horror: %s", extras)
         who = f"{who} · {extras}" if who else extras
         mix = await asyncio.to_thread(radio.studio, voice[:3], styles, ai.SPEAK_RATE, int(time.time()), events, music,
@@ -361,7 +425,7 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
     logger.info("ночной эфир №%s%s: «%s», %.0f сек, голос %s", n, " (страшная история)" if horror else "", topic,
                 len(mix) / radio.SR, who or "?")
     return {"ogg": ogg, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic, "voice": who,
-            "letter": (letter or {}).get("id"), "secs": secs}
+            "letter": (letter or {}).get("id"), "secs": secs, "cover": cover, **(lore_info if horror else {})}
 
 
 def _kb() -> InlineKeyboardMarkup:
@@ -414,7 +478,14 @@ async def _send_draft(bot: Bot, db: Database, chat_id: int, horror: bool, progre
                                         f"ключа (/setkey yandex или OpenRouter) или сбой озвучки{why}. Это текст.</i>")
         return False
     # какой голос читал (и кто до него не справился) — видно только в черновике, в канал не идёт
-    who = f"<i>Голос: {html.escape(ep.get('voice', '')[:150])}</i>\n" if ep.get("voice") else ""
+    who = f"<i>Голос: {html.escape(ep.get('voice', '')[:300])}</i>\n" if ep.get("voice") else ""
+    cover_id = None
+    if ep.get("cover"):  # обложка-улика — над голосовым, как будет в канале
+        try:
+            ph = await bot.send_photo(chat_id, BufferedInputFile(ep["cover"], "cover.jpg"))
+            cover_id = ph.photo[-1].file_id
+        except Exception as e:  # noqa: BLE001
+            logger.info("horror: обложку в черновик не отправил: %s", e)
     msg = await bot.send_voice(chat_id, BufferedInputFile(ep["ogg"], "night.ogg"), reply_markup=_kb(),
                                duration=ep.get("secs") or None,
                                caption=f"{ep['caption']}\n\n{who}<i>Черновик. Текст:</i>\n"
@@ -422,7 +493,9 @@ async def _send_draft(bot: Bot, db: Database, chat_id: int, horror: bool, progre
     await db.set_setting(DRAFT_KEY, json.dumps({"file_id": msg.voice.file_id, "caption": ep["caption"],
                                                 "n": ep["n"], "msg": msg.message_id, "chat": chat_id,
                                                 "horror": horror, "letter": ep.get("letter"),
-                                                "secs": ep.get("secs")}, ensure_ascii=False))
+                                                "secs": ep.get("secs"), "cover": cover_id,
+                                                "lore_used": ep.get("lore_used"), "lore_new": ep.get("lore_new")},
+                                               ensure_ascii=False))
     return True
 
 
@@ -533,6 +606,12 @@ async def cb_night(call: CallbackQuery, bot: Bot, db: Database, config: Config) 
         if not channel:
             await call.answer("Не нашёл канал.", show_alert=True)
             return
+        if draft.get("cover"):  # обложка-улика — отдельным постом над голосовым
+            try:
+                ph = await bot.send_photo(channel, draft["cover"])
+                await mark_own(db, ph.message_id)
+            except Exception as e:  # noqa: BLE001 — без обложки выпуск всё равно выходит
+                logger.info("horror: обложку в канал не отправил: %s", e)
         sent = await bot.send_voice(channel, draft["file_id"], caption=draft["caption"],
                                     duration=draft.get("secs") or None)
         await mark_own(db, sent.message_id)
@@ -541,6 +620,7 @@ async def cb_night(call: CallbackQuery, bot: Bot, db: Database, config: Config) 
             from handlers import letters
 
             await letters.on_published(db, channel, sent.message_id, draft["n"])  # копим комментарии под ним
+            await _lore_commit(db, draft)  # сквозные персонажи — только из вышедших выпусков
             if draft.get("letter"):
                 try:
                     ch = await bot.get_chat(channel)
