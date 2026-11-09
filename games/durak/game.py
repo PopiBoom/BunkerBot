@@ -1,8 +1,8 @@
 """Дурак (подкидной) в личке у бота — HTML-виджет, как шахматы (09.11, владелец: «а дурака возможно будет создать?»
 → подкидной, 2-6 игроков, без игры против Пиздюка).
 
-/durak (админ; личка или группа): вызвавшему в личку — стол-виджет (`widget.html`) и ОТДЕЛЬНЫМ сообщением картинка
-со ссылкой `t.me/<бот>?start=dur_<id>` («Сесть за стол»), её бот пересылает в канал бати. Кто открыл ссылку — за
+/durak (админ; личка или группа): вызвавшему в личку — стол-виджет (`widget.html`), в канал бати — картинка со
+ссылкой `t.me/<бот>?start=dur_<id>` («Сесть за стол»; в личку не шлём — просьба владельца, как у шахмат). Кто открыл ссылку — за
 столом (до 6), ему в личку свой стол. Хозяин стола жмёт «▶️ Начать» (от 2 игроков; сел шестой — начинается само).
 
 Правила (классика): колода 36, по 6 карт, козырь — нижняя карта колоды (её видно под колодой). Первым заходит тот,
@@ -460,7 +460,7 @@ def _deal_notes(st: dict) -> dict:
 
 
 async def create(bot: Bot, db: Database, uid: int, name: str = "") -> None:
-    """Новый стол: стол-виджет хозяину, отдельным сообщением картинка со ссылкой, её пересылка в канал."""
+    """Новый стол: стол-виджет хозяину, картинка со ссылкой — сразу в канал."""
     from handlers.channel_posts import channel_id, mark_own
 
     old = await db.get_setting(OPEN, "")
@@ -491,25 +491,23 @@ async def create(bot: Bot, db: Database, uid: int, name: str = "") -> None:
             "Последний с картами - дурак.\n\n"
             f'👉 <a href="{link}">Сесть за стол</a>')
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🃏 Сесть за стол", url=link)]])
-    invite = await _send_card(bot, db, uid, text, kb, CARD, CARD_KEY)
-    channel, post = await channel_id(bot, db), None
+    # сразу в канал (09.11 владелец: «не надо мне это в бот кидать» — раньше шло в личку и пересылалось оттуда)
+    channel, post, problem = await channel_id(bot, db), None, ""
     if channel:
         try:
-            post = await bot.forward_message(channel, uid, invite.message_id)
+            post = await _send_card(bot, db, channel, text, kb, CARD, CARD_KEY)
             await mark_own(db, post.message_id)  # стёб-бот не обсуждает свой же пост
-            report = "✅ Переслал в канал. Кто сядет - напишу; начнёшь кнопкой «▶️ Начать» на столе."
         except Exception as e:  # noqa: BLE001
-            logger.warning("дурак: в канал не переслалось: %s", e)
-            report = f"⚠️ В канал не переслалось ({html.escape(str(e)[:150])}) - перешли ссылку сам."
+            logger.warning("дурак: в канал не ушло: %s", e)
+            problem = f"В канал не ушло ({html.escape(str(e)[:150])})"
     else:
-        report = "⚠️ Канал не нашёл (бот должен быть админом канала) - перешли ссылку сам."
+        problem = "Канал не нашёл (бот должен быть админом канала)"
     async with _lock(gid):
         st = await _load(db, gid) or st
-        st["invite"] = invite.message_id
         if post:
             st["post"] = [channel, post.message_id]
-        if st["phase"] == "lobby" and len(st["players"]) < 2:
-            await _note(bot, st, uid, report)
+        if problem and st["phase"] == "lobby" and len(st["players"]) < 2:  # в личку — только если не вышло
+            await _note(bot, st, uid, f"⚠️ {problem} - перешли ссылку сам: {link}")
         await _save(db, gid, st)
     logger.info("дурак %s: стол от %s, пост %s", gid, name, st.get("post"))
 

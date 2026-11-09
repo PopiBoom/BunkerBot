@@ -9,8 +9,6 @@ body{margin:0;padding:6px 8px 10px}
 .cp b{margin-left:6px;letter-spacing:0}
 .tn{flex:none;padding:3px 9px;border-radius:99px;font-weight:600;font-size:12px;background:var(--tg-theme-secondary-bg-color);color:var(--h)}
 .tn.y{background:var(--a);color:var(--tg-theme-button-text-color)}
-.tn i{display:inline-block;width:6px;height:6px;margin-right:5px;border-radius:50%;background:currentColor;vertical-align:1px;animation:pu 1.2s infinite}
-@keyframes pu{50%{transform:scale(.3)}}
 #w{position:relative;max-width:440px;margin:2px auto}
 #bd{display:grid;grid-template-columns:repeat(8,1fr);border-radius:10px;overflow:hidden;box-shadow:0 2px 12px #0005}
 #bd i{position:relative;aspect-ratio:1}
@@ -20,7 +18,7 @@ body{margin:0;padding:6px 8px 10px}
 .t:after,.x:after{content:"";position:absolute;inset:0;z-index:2}
 .t:after{background:radial-gradient(#14551e80 19%,#0000 21%)}.x:after{background:radial-gradient(#0000 76%,#14551e66 78%)}
 #bd svg{position:absolute;inset:0;width:100%;height:100%;z-index:1}
-text{font-style:normal;font-size:33px;text-anchor:middle;dominant-baseline:central;stroke-width:1.6px;paint-order:stroke;stroke-linejoin:round}
+text{font-style:normal;font-size:33px;text-anchor:middle;stroke-width:1.6px;paint-order:stroke;stroke-linejoin:round}
 .pw{fill:#fff;stroke:#222}.pb{fill:#222;stroke:#eee}
 .an{z-index:3!important;animation:sl .22s ease-out}
 @keyframes sl{from{transform:translate(var(--x),var(--y))}}
@@ -56,18 +54,19 @@ brd=f=>{let b=[],r=7,c=0;for(const h of f||'')h=='/'?(r--,c=0):h>'0'&&h<'9'?c+=+
 fl=()=>S.c=='b',
 pos=v=>{let r=fl()?v>>3:7-(v>>3),c=fl()?7-(v&7):v&7;return r*8+c},
 rc=i=>fl()?[i>>3,7-(i&7)]:[7-(i>>3),i&7];
-let S=J(T.chatData),sel=-1,busy=0,ob=0,om='',tm,rs=0,anm=S.m,hid=0;
+let S=J(T.chatData),sel=-1,busy=0,ob=0,om='',tm,rs=0,anm=S.m,hid=0,O={};
+try{let x=document.createElement('canvas').getContext('2d');x.font='33px system-ui,sans-serif';for(const g in G){let m=x.measureText(G[g]+V),y=20+(m.actualBoundingBoxAscent-m.actualBoundingBoxDescent)/2;if(y>23&&y<39)O[g]=y}}catch(e){}
 function tg(){let t={},l=S.l||'';if(sel>=0)for(let i=0;i<l.length;i+=2)if(ix(l[i])==sel)t[ix(l[i+1])]=1;return t}
 function toast(m,er){let t=$('ts');t.textContent=m;t.className=er?'e':'';clearTimeout(tm);tm=setTimeout(()=>t.className='x0',2400);if(er)hp('notificationOccurred','error')}
 function cap(b,me){let n={},s='',v=0;for(const p of b)if(p&&(p<'a')!=(me=='w'))n[p.toLowerCase()]=(n[p.toLowerCase()]||0)+1;
 for(const k in N){let c=Math.max(0,N[k][0]-(n[k]||0));v+=c*N[k][1];s+=(G[k]+V).repeat(c)}return[s,v]}
-function bar(id,nm,av,c,cp,d,on,me){$(id).innerHTML='<span class="av a'+c+'">'+es(av)+'</span><span class="nm">'+es(nm)+'</span><span class="cp">'+cp+(d>0?'<b>+'+d+'</b>':'')+'</span>'+(on?'<span class="tn'+(me?' y':'')+'"><i></i>'+(me?'Твой ход':'Ходит')+'</span>':'')}
+function bar(id,nm,av,c,cp,d,on,me){$(id).innerHTML='<span class="av a'+c+'">'+es(av)+'</span><span class="nm">'+es(nm)+'</span><span class="cp">'+cp+(d>0?'<b>+'+d+'</b>':'')+'</span>'+(on?'<span class="tn'+(me?' y':'')+'">'+(me?'Твой ход':'Ходит')+'</span>':'')}
 function draw(){
 let s=S,b=ob||brd(s.f),t=tg(),h='',k,i,p,v,m=ob?om:s.m,me=s.c||'w',op=me=='w'?'b':'w',live=!s.e&&s.o,
 a=m&&m!=anm?[rc(ix(m[0])),rc(ix(m[1]))]:0;
 for(v=0;v<64;v++){i=pos(v);p=b[i];k=((i>>3)+(i&7))&1?'L':'D';
 if(m&&(ix(m[0])==i||ix(m[1])==i))k+=' m';if(i==sel)k+=' s';if(s.k&&ix(s.k)==i&&!ob)k+=' k';if(t[i])k+=p?' x':' t';
-h+='<i class="'+k+'">'+(p?'<svg viewBox="0 0 40 40" class="'+(p<'a'?'pw':'pb')+(a&&ix(m[1])==i?' an" style="--x:'+(a[0][1]-a[1][1])*100+'%;--y:'+(a[0][0]-a[1][0])*100+'%':'')+'"><text x="20" y="21">'+G[p.toLowerCase()]+V+'</text></svg>':'')
+h+='<i class="'+k+'">'+(p?'<svg viewBox="0 0 40 40" class="'+(p<'a'?'pw':'pb')+(a&&ix(m[1])==i?' an" style="--x:'+(a[0][1]-a[1][1])*100+'%;--y:'+(a[0][0]-a[1][0])*100+'%':'')+'"><text x="20" y="'+(O[k=p.toLowerCase()]||31)+'">'+G[k]+V+'</text></svg>':'')
 +(v>55?'<em class="f">'+A[i&7]+'</em>':'')+(v%8?'':'<em class="r">'+((i>>3)+1)+'</em>')+'</i>'}
 bd.innerHTML=h;if(m)anm=m;
 let x=cap(b,me),y=cap(b,op),vw=T.viewer||{};

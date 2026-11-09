@@ -3,8 +3,9 @@
 на вопрос «кто играет» — «я против первого»).
 
 /chess_widget (админ; в личке или в группе): вызвавшему в личку — доска-виджет (`widget.html`, HTML-виджет Telegram
-13.2) и ОТДЕЛЬНЫМ сообщением ссылка `t.me/<бот>?start=wch_<id>` с кнопкой «♟ Сыграть»; это сообщение бот пересылает
-в канал бати (forward_message, пост — в `channel_posts.mark_own`). Кто первым откроет ссылку (не сам вызвавший), тот
+13.2), а в канал бати — картинка-вызов со ссылкой `t.me/<бот>?start=wch_<id>` и кнопкой «♟ Сыграть» (пост — в
+`channel_posts.mark_own`). Сначала вызов шёл владельцу в личку и пересылался оттуда — 09.11 он попросил «не надо мне
+это в бот кидать»: теперь сразу в канал, в личку — только «не вышло, перешли сам: ссылка». Кто первым откроет ссылку (не сам вызвавший), тот
 соперник, цвета жребием; ему в личку — своя доска. Каждый играет в своей личке с ботом: нажал свою фигуру — точки,
 куда можно (ходы считает бот: `l` в состоянии), нажал клетку — ход (запрос виджета `m:<id>:<откуда><куда>`, пешка —
 в ферзя). Правила — python-chess. 🏳 — двумя нажатиями, 🤝 — предложить / согласиться, после партии «🔁 Реванш»
@@ -279,13 +280,13 @@ def _side(st: dict, uid: int) -> str:
 # ---------- вызов и вход ----------
 
 
-async def _send_card(bot: Bot, db: Database, uid: int, text: str, kb: InlineKeyboardMarkup, card: Path = CARD,
+async def _send_card(bot: Bot, db: Database, chat_id: int, text: str, kb: InlineKeyboardMarkup, card: Path = CARD,
                      key: str = CARD_KEY) -> Message:
-    """Вызов картинкой (assets/lobby/chess.jpg, потом по file_id; дурак — своя); не вышло — тем же текстом."""
+    """Вызов картинкой в канал (assets/lobby/chess.jpg, потом по file_id; дурак — своя); не вышло — тем же текстом."""
     cached = await db.get_setting(key, "")
     for photo in ([cached] if cached else []) + [FSInputFile(card)]:  # нет файла — отправка упадёт, дальше текст
         try:
-            msg = await bot.send_photo(uid, photo, caption=text, reply_markup=kb)
+            msg = await bot.send_photo(chat_id, photo, caption=text, reply_markup=kb)
             if not isinstance(photo, str) and msg.photo:
                 await db.set_setting(key, msg.photo[-1].file_id)
             return msg
@@ -293,11 +294,11 @@ async def _send_card(bot: Bot, db: Database, uid: int, text: str, kb: InlineKeyb
             logger.info("шахматы-виджет: картинка вызова не ушла (%s)", e)
             if isinstance(photo, str):
                 await db.set_setting(key, "")
-    return await bot.send_message(uid, text, reply_markup=kb, disable_web_page_preview=True)
+    return await bot.send_message(chat_id, text, reply_markup=kb, disable_web_page_preview=True)
 
 
 async def create(bot: Bot, db: Database, uid: int, name: str = "") -> None:
-    """Новый вызов: доска вызвавшему, отдельным сообщением ссылка, её пересылка в канал."""
+    """Новый вызов: доска вызвавшему в личку, картинка со ссылкой — сразу в канал."""
     from handlers.channel_posts import channel_id, mark_own
 
     old = await db.get_setting(OPEN, "")
@@ -317,34 +318,32 @@ async def create(bot: Bot, db: Database, uid: int, name: str = "") -> None:
     except TelegramBadRequest as e:
         await bot.send_message(uid, f"❌ Telegram не принял доску-виджет: <code>{html.escape(str(e)[:200])}</code>")
         return
-    await _save(db, gid, st)  # до ссылки: кто-то может нажать её через секунду после пересылки
+    await _save(db, gid, st)  # до ссылки: кто-то может нажать её через секунду после поста
     await db.set_setting(OPEN, gid)
     me = await bot.me()
     link = f"https://t.me/{me.username}?start={START}{gid}"
     text = (f"♟ <b>{html.escape(name)} ищет соперника</b>\n\n"
             "Кто первым нажмёт «Сыграть» - тот и играет. Партия - в личке у Пиздюка, доска прямо в сообщении "
             "(нужен свежий Telegram).\n\n"
-            f'👉 <a href="{link}">Сыграть</a>')  # ссылка и в тексте: вдруг кнопку при пересылке не покажут
+            f'👉 <a href="{link}">Сыграть</a>')  # ссылка и в тексте, и кнопкой
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="♟ Сыграть", url=link)]])
-    invite = await _send_card(bot, db, uid, text, kb)
-    channel, post = await channel_id(bot, db), None
+    # сразу в канал (09.11 владелец: «не надо мне это в бот кидать» — раньше шло в личку и пересылалось оттуда)
+    channel, post, problem = await channel_id(bot, db), None, ""
     if channel:
         try:
-            post = await bot.forward_message(channel, uid, invite.message_id)
+            post = await _send_card(bot, db, channel, text, kb)
             await mark_own(db, post.message_id)  # стёб-бот не обсуждает свой же пост
-            report = "✅ Переслал в канал. Как кто-то нажмёт - напишу, доска выше оживёт."
         except Exception as e:  # noqa: BLE001
-            logger.warning("шахматы-виджет: в канал не переслалось: %s", e)
-            report = f"⚠️ В канал не переслалось ({html.escape(str(e)[:150])}) - перешли ссылку сам."
+            logger.warning("шахматы-виджет: в канал не ушло: %s", e)
+            problem = f"В канал не ушло ({html.escape(str(e)[:150])})"
     else:
-        report = "⚠️ Канал не нашёл (бот должен быть админом канала) - перешли ссылку сам."
+        problem = "Канал не нашёл (бот должен быть админом канала)"
     async with _lock(gid):
         st = await _load(db, gid) or st
-        st["invite"] = invite.message_id
         if post:
             st["post"] = [channel, post.message_id]
-        if not st.get("w"):  # соперник мог успеть раньше — тогда ему уже не до отчёта
-            await _note(bot, st, uid, report)
+        if problem and not st.get("w"):  # в личку — только если не вышло
+            await _note(bot, st, uid, f"⚠️ {problem} - перешли ссылку сам: {link}")
         await _save(db, gid, st)
     logger.info("шахматы-виджет %s: вызов от %s, пост %s", gid, name, st.get("post"))
 
