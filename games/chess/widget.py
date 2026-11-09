@@ -316,7 +316,7 @@ async def create(bot: Bot, db: Database, uid: int, name: str = "", where: int | 
     gid = secrets.token_urlsafe(6)
     name = name or ("Батя" if uid == _owner() else "Игрок")
     st = {"id": gid, "host": [uid, name], "w": None, "b": None, "moves": [], "created": time.time(),
-          "msgs": {}, "notes": {}}
+          "msgs": {}, "notes": {}, "where": where}
     try:
         await _send_board(bot, st, uid)
     except TelegramBadRequest as e:
@@ -528,7 +528,7 @@ async def _rematch(bot: Bot, db: Database, gid: str) -> None:
             return
         new = secrets.token_urlsafe(6)
         st = {"id": new, "host": old["host"], "w": old["b"], "b": old["w"], "moves": [], "created": time.time(),
-              "start": time.time(), "msgs": {}, "notes": {}}
+              "start": time.time(), "msgs": {}, "notes": {}, "where": old.get("where")}
         old["next"] = new
         await _save(db, gid, old)
         for p in (st["w"], st["b"]):
@@ -569,13 +569,14 @@ async def _replay(bot: Bot, db: Database, st: dict) -> None:
             return
     caption = f"🎞 Повтор: {html.escape(w)} - {html.escape(b)}. {html.escape(end_line(st))}"
     targets = [st["w"][0], st["b"][0]]
-    channel = await channel_id(bot, db)
+    where = st.get("where")  # звали в чат (/chess_chat) — и итог с повтором туда же (владелец 09.11)
+    channel = where or await channel_id(bot, db)
     file_id = None
     for chat in targets + ([channel] if channel else []):
         try:
             text = caption if chat != channel else f"♟ {html.escape(w)} - {html.escape(b)}: {html.escape(end_line(st))}"
             msg = await bot.send_animation(chat, file_id or media, caption=text)
-            if chat == channel:
+            if chat == channel and not where:
                 await mark_own(db, msg.message_id)
             if not file_id:
                 anim = msg.animation or msg.document

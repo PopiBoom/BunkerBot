@@ -526,7 +526,7 @@ async def create(bot: Bot, db: Database, uid: int, name: str = "", where: int | 
     gid = secrets.token_urlsafe(6)
     name = name or "Игрок"
     st = {"id": gid, "host": uid, "players": [[uid, name]], "phase": "lobby", "created": time.time(),
-          "out": [], "hands": {}, "table": [], "passed": [], "msgs": {}, "notes": {}}
+          "out": [], "hands": {}, "table": [], "passed": [], "msgs": {}, "notes": {}, "where": where}
     try:
         await _send_table(bot, st, uid)
     except TelegramBadRequest as e:
@@ -721,7 +721,8 @@ async def _finish(bot: Bot, db: Database, st: dict) -> None:
                 else f"🎉 Ты не дурак! Дурак - {html.escape(_nm(st, durak))}.")
         await _note(bot, st, u, text)
     logger.info("дурак %s: конец, дурак %s", st["id"], _nm(st, durak) if durak else "-")
-    channel = await channel_id(bot, db)
+    where = st.get("where")  # звали в чат (/durak_chat) — и итог туда же (владелец 09.11)
+    channel = where or await channel_id(bot, db)
     if not channel:
         return
     names = ", ".join(html.escape(n) for _u, n in st["players"])
@@ -729,9 +730,10 @@ async def _finish(bot: Bot, db: Database, st: dict) -> None:
             + f"\nИграли: {names}")
     try:
         post = await bot.send_message(channel, text)
-        await mark_own(db, post.message_id)
+        if not where:
+            await mark_own(db, post.message_id)
     except Exception as e:  # noqa: BLE001
-        logger.info("дурак: итог в канал не ушёл: %s", e)
+        logger.info("дурак: итог в %s не ушёл: %s", channel, e)
 
 
 async def _rematch(bot: Bot, db: Database, gid: str) -> None:
@@ -746,7 +748,8 @@ async def _rematch(bot: Bot, db: Database, gid: str) -> None:
             await _unnote(bot, old, u)
         await _save(db, gid, old)
     st = {"id": new, "host": old["host"], "players": old["players"], "phase": "lobby", "created": time.time(),
-          "out": [], "hands": {}, "table": [], "passed": [], "msgs": dict(old.get("msgs") or {}), "notes": {}}
+          "out": [], "hands": {}, "table": [], "passed": [], "msgs": dict(old.get("msgs") or {}), "notes": {},
+          "where": old.get("where")}
     async with _lock(new):
         notes: dict = {}
         deal(st, random.Random())

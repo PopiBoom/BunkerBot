@@ -30,8 +30,7 @@ body{margin:0;padding:6px 4px 8px}
 .p .c+.c{position:absolute;left:17px;top:19px;transform:rotate(8deg)}
 .g .c{box-shadow:0 0 0 3px #ffd54a}
 .lb{font:800 16px system-ui;text-align:center}
-#ev{position:absolute;left:50%;top:50%;z-index:3;padding:8px 16px;border-radius:14px;background:#0000008c;font:800 19px system-ui;white-space:nowrap;transform:translate(-50%,-50%);animation:pp .4s}
-@keyframes pp{from{transform:translate(-50%,-50%) scale(.4)}}
+.ev{padding:8px 16px;border-radius:14px;background:#0000008c;font:800 19px system-ui;white-space:nowrap}
 .w{animation:po .25s}
 @keyframes po{from{transform:scale(.5)}}
 #ft{display:flex;align-items:center;gap:6px;margin:10px 2px 0}
@@ -51,7 +50,7 @@ button{padding:10px 18px;border-radius:12px;font:800 14px system-ui;color:#fff}
 .x0{display:none!important}
 </style>
 <div id="op"></div>
-<div id="tb"><div id="dk"></div><div id="pr"></div><div id="ds"></div><div id="ev" class="x0"></div><div id="ov" class="x0"><div id="cd"><b id="ce"></b><p id="ct"></p><button id="rm" class="ac">🔁 Ещё раз</button></div></div><div id="ts" class="x0"></div></div>
+<div id="tb"><div id="dk"></div><div id="pr"></div><div id="ds"></div><div id="ov" class="x0"><div id="cd"><b id="ce"></b><p id="ct"></p><button id="rm" class="ac">🔁 Ещё раз</button></div></div><div id="ts" class="x0"></div></div>
 <div id="ft"><span id="st"></span><button id="bt">Беру</button><button id="bb"></button><button id="bs" class="ac">▶️ Начать</button></div>
 <div id="hd"></div>
 <script>
@@ -77,8 +76,7 @@ $('op').innerHTML=(s.o||[]).map((o,j)=>{let f=o[2];return'<div class="o'+(f.incl
 if(s.p=='l'){$('dk').innerHTML=$('ds').innerHTML='';$('pr').innerHTML='<div class="lb">За столом '+(s.o||[]).length+' из 6</div>'}
 else{$('dk').innerHTML=s.d?(cd(s.k,' t')+(s.d>1?bk+bk:'')+'<em>'+s.d+'</em>'):s.k?'<em class="ks">'+SU[s.k[1]]+V+'</em>':'';
 $('ds').innerHTML=s.b?bk+bk+'<em>бито</em>':'';
-$('pr').innerHTML=p.map((q,i)=>'<span class="p'+(sel>=0&&s.r=='d'&&!q[1]&&bt(h[sel],q[0])?' g':'')+'">'+cd(q[0],x.substr(i*4,2)!=q[0]?' w':'')+(q[1]?cd(q[1],x.substr(i*4+2,2)!=q[1]?' w':''):'')+'</span>').join('')}
-k=$('ev');k.className=g&&!p.length&&s.lv?'':'x0';if(s.lv)k.textContent=s.lv[0]=='b'?'✓ БИТО':s.lv[1]+' берёт +'+s.lv[2];
+$('pr').innerHTML=p.length?p.map((q,i)=>'<span class="p'+(sel>=0&&s.r=='d'&&!q[1]&&bt(h[sel],q[0])?' g':'')+'">'+cd(q[0],x.substr(i*4,2)!=q[0]?' w':'')+(q[1]?cd(q[1],x.substr(i*4+2,2)!=q[1]?' w':''):'')+'</span>').join(''):g&&s.lv?'<div class="ev">'+(s.lv[0]=='b'?'✓ БИТО':es(s.lv[1])+' берёт +'+s.lv[2])+'</div>':''}
 $('hd').innerHTML=h.map((c,i)=>{let a=(i-(n-1)/2)*Math.min(5,30/n);return cd(c,(i==sel?' s':'')+(dim(c)?' n':''),'--r:'+a+'deg;--y:'+a*a/6+'px;margin-left:'+(i?st-50:0)+'px')}).join('');
 k=$('st');k.textContent=busy?'…':s.s||'';k.className=bb||bt2||g&&s.r=='a'&&!p.length?'y':'';
 k=$('bb');k.className=bb?'':'x0';k.textContent=s.tk?'Пас':'Бито';
