@@ -919,7 +919,7 @@ async def cmd_durak(message: Message, bot: Bot, db: Database, config: Config) ->
         if not where:
             await bot.send_message(user.id, "🃏 Не нашёл чат - вызови /durak_chat прямо в группе.")
             return
-    if not tgbeta.active():
+    if not await tgbeta.widgets_ready():  # с Bot API 10.4 обычный сервер умеет сам — бета не нужна
         from handlers.admin import _restart_when_free
 
         await tgbeta.enable(db, {"kind": "durak", "user": user.id, "name": player_name(user), "where": where})

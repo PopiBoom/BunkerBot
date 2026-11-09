@@ -211,7 +211,8 @@ async def main() -> None:
     await db.init()
     config, proxy_problem = await _pick_proxy(config, db)
 
-    # Бета Bot API 10.4 (виджеты: шахматы в личке) — если включена и отвечает; нет — обычный Bot API (tgbeta.py)
+    # Бета Bot API (виджеты) — только если включена и нужна: с 09.11 Bot API 10.4 вышел, виджеты есть и на обычном
+    # сервере — `pick` это проверяет и сам уходит с беты (tgbeta.py); не включена или не отвечает — обычный Bot API
     import tgbeta
     session, beta_problem = await tgbeta.pick(config, db)
     # Прокси — из .env (BOT_PROXY) или из /setproxy (база); проверен в _pick_proxy, мёртвый — работаем напрямую
@@ -243,7 +244,7 @@ async def main() -> None:
 
     # Команды — только админам (кроме /start); проверка до всех роутеров
     dp.message.outer_middleware(AdminOnlyCommands())
-    # Запросы HTML-виджетов (widget_query, только на бете) — до разбора типа обновления: aiogram их не знает
+    # Запросы HTML-виджетов (widget_query, Bot API 10.4) — до разбора типа обновления: aiogram их не знает
     dp.update.outer_middleware(tgbeta.WidgetQueries())
     # admin_router раньше user_router: состояния FSM админа имеют приоритет
     dp.include_router(admin_router)
@@ -297,7 +298,7 @@ async def main() -> None:
     ]
     try:
         # message_reaction Telegram по умолчанию не присылает — просим все типы, что ловят обработчики
-        # на бете — ещё и запросы виджетов (widget_query)
+        # и запросы виджетов (widget_query)
         await dp.start_polling(bot, allowed_updates=tgbeta.allowed_updates(dp.resolve_used_update_types()))
     finally:
         for task in background:

@@ -192,7 +192,8 @@ async def probe_loop(bot: Bot, db: Database) -> None:
 
 @router.message(Command("beta"))
 async def cmd_beta(message: Message, bot: Bot, db: Database) -> None:
-    """/beta — через какой Bot API работает бот; /beta on / off — перейти на бету 10.4 (виджеты) или обратно.
+    """/beta — через какой Bot API работает бот; /beta on / off — перейти на бету или обратно. С 09.11 (вышел Bot API
+    10.4) бета не нужна: виджеты есть и на обычном сервере; /beta on — запасной путь, если там что-то сломается.
     Переход — перезапуском (не посреди игр); страховка — в tgbeta.py."""
     import tgbeta
     from handlers.admin import _restart_when_free
@@ -206,9 +207,9 @@ async def cmd_beta(message: Message, bot: Bot, db: Database) -> None:
         if on:
             await temp_reply(message, "🧪 Уже на бете Bot API 10.4 - виджеты работают.")
             return
-        await tgbeta.enable(db)
-        await temp_reply(message, "🧪 Перехожу на бету Bot API 10.4 и перезапускаюсь (если идёт игра - после неё). "
-                                  "Не ответит бета - останусь на обычном и напишу.")
+        await tgbeta.enable(db, force=True)
+        await temp_reply(message, "🧪 Перехожу на бету Bot API и перезапускаюсь (если идёт игра - после неё). "
+                                  "Сам с неё не уйду - обратно /beta off. Не ответит бета - останусь на обычном и напишу.")
         _restart_when_free()
         return
     if arg in ("off", "выкл", "нет"):
@@ -216,10 +217,12 @@ async def cmd_beta(message: Message, bot: Bot, db: Database) -> None:
         if not on:
             await temp_reply(message, "🧪 Бета и так выключена - работаю через обычный Bot API.")
             return
-        await temp_reply(message, "🧪 Возвращаюсь на обычный Bot API и перезапускаюсь. Шахматы-виджет без беты не "
-                                  "работают.")
+        await temp_reply(message, "🧪 Возвращаюсь на обычный Bot API и перезапускаюсь." + (
+            "" if tgbeta.prod_widgets() else " Обычный сервер виджетов пока не знает - шахматы и дурак виджетом "
+                                             "заработают, когда сам включу бету (/chess_widget, /durak)."))
         _restart_when_free()
         return
-    await temp_reply(message, "🧪 Сейчас: " + ("<b>бета Bot API 10.4</b> - виджеты (шахматы в личке) работают."
-                                               if on else "<b>обычный Bot API</b> - виджетов нет.")
-                     + "\n\n/beta on - на бету (перезапуск)\n/beta off - обратно")
+    now = ("<b>бета Bot API</b> - виджеты (шахматы, дурак в личке) работают." if on else
+           "<b>обычный Bot API 10.4</b> - виджеты (шахматы, дурак в личке) работают." if tgbeta.prod_widgets() else
+           "<b>обычный Bot API</b> - виджетов на нём пока нет (или не смог проверить).")
+    await temp_reply(message, "🧪 Сейчас: " + now + "\n\n/beta on - на бету (перезапуск)\n/beta off - обратно")

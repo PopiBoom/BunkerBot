@@ -18,6 +18,12 @@ widget-sandbox: `TW_BOT_API=https://api.telegram.org/beta`).
 - файлы (фото, голосовые, кружки — бот их скачивает) сначала берутся с беты, не отдала — с обычного сервера.
 Чего страховка не поймает: бета отвечает, но теряет часть обновлений. Если после включения бот «не слышит» —
 /beta off.
+
+09.11 вышел Bot API 10.4 (владелец: «проверь, вышла ли» → «да, переводи»): виджеты есть и на обычном сервере (там —
+только в личку, без пересылки; методы и поля — те же, что на бете). Теперь при запуске `pick` проверяет обычный сервер
+(`_check_prod`: `answerWidgetQuery` с несуществующим id — 400 = метод есть, 404 = нет). Есть — бета, включённая
+автоматически (`1`), выключается, владельцу записка; /chess_widget и /durak бету больше не включают. Бета остаётся
+только по /beta on (значение `force` — тогда обычный сервер не проверяем). `widget_query` в allowed_updates — всегда.
 """
 from __future__ import annotations
 
@@ -37,14 +43,16 @@ logger = logging.getLogger("tgbeta")
 
 BASE = "https://api.telegram.org/beta"
 MAIN = "https://api.telegram.org"
-KEY = "bot_api_beta"        # «1» — весь бот через бету
+KEY = "bot_api_beta"        # «1» — весь бот через бету (включили /chess_widget, /durak), «force» — /beta on
 PENDING = "beta_pending"    # что сделать после перезапуска на бете (JSON: kind, user, chat, name)
 NOTE = "beta_note"          # что сказать владельцу после перезапуска (бета отвалилась)
 FAIL_COUNT = 5              # getUpdates упал столько раз подряд…
 FAIL_SECS = 120             # …и дольше стольких секунд — уходим с беты
-UPDATES = ["widget_query"]  # обновления, которые бывают только на бете
+UPDATES = ["widget_query"]  # запросы виджетов: aiogram их не знает, просим явно (Bot API 10.4 — и обычный сервер)
 
 _active = False             # бот сейчас работает через бету
+_prod: bool | None = None   # обычный сервер умеет виджеты (Bot API 10.4): True / False / None — не понять
+_config = None
 _db = None
 _fails: list[float] = []    # время подряд идущих сбоев getUpdates
 _leaving = False
@@ -115,8 +123,8 @@ async def _leave(why: str) -> None:
     try:
         if _db is not None:
             await _db.set_setting(KEY, "")
-            await _db.set_setting(NOTE, f"⚠️ Бета Telegram перестала отвечать - вернулся на обычный Bot API, "
-                                        f"шахматы-виджет пока не работают.\n<code>{_clean(why)}</code>\n\n"
+            await _db.set_setting(NOTE, f"⚠️ Бета Telegram перестала отвечать - вернулся на обычный Bot API "
+                                        f"(виджеты там тоже есть с 10.4).\n<code>{_clean(why)}</code>\n\n"
                                         "/beta on - попробовать снова.")
     finally:
         os._exit(0)  # systemd поднимет через 5 сек
@@ -134,9 +142,17 @@ def _clean(text: str) -> str:
 
 async def pick(config, db) -> tuple[AiohttpSession | None, str]:
     """При запуске: включена бета — проверить её. (сессия на бете, "") или (None, почему не вышло)."""
-    global _active, _db
-    _db = db
-    if await db.get_setting(KEY, "") != "1":
+    global _active, _db, _config, _prod
+    _db, _config = db, config
+    mode = await db.get_setting(KEY, "")
+    _prod = await _check_prod(config)
+    if mode not in ("1", "force"):
+        return None, ""
+    if mode == "1" and _prod:
+        await db.set_setting(KEY, "")
+        await db.set_setting(NOTE, "🧪 Вышел Bot API 10.4 - ушёл с беты на обычный сервер Telegram. Шахматы и дурак "
+                                   "виджетом работают как раньше.\n\nЕсли вдруг ходы перестанут доходить - /beta on.")
+        logger.info("обычный сервер Telegram умеет виджеты (Bot API 10.4) — бета больше не нужна, ушёл с неё")
         return None, ""
     session = BetaSession(api=server(), proxy=config.proxy) if config.proxy else BetaSession(api=server())
     try:
@@ -151,13 +167,50 @@ async def pick(config, db) -> tuple[AiohttpSession | None, str]:
     return session, ""
 
 
+async def _check_prod(config) -> bool | None:
+    """Есть ли виджеты на обычном сервере: answerWidgetQuery с несуществующим id. 400 («неверный запрос») — метод
+    есть, 404 — метода нет (Bot API ниже 10.4), что-то другое (сеть) — None."""
+    from aiogram.exceptions import TelegramBadRequest, TelegramNotFound
+
+    api = TelegramAPIServer.from_base(MAIN)
+    session = AiohttpSession(api=api, proxy=config.proxy) if config.proxy else AiohttpSession(api=api)
+    try:
+        await asyncio.wait_for(Bot(token=config.token, session=session)(AnswerWidgetQuery(widget_query_id="0")), 20)
+        return True
+    except TelegramBadRequest:
+        return True
+    except TelegramNotFound:
+        logger.info("обычный сервер Telegram виджетов не знает (нет Bot API 10.4)")
+        return False
+    except Exception as e:  # noqa: BLE001 — сеть, прокси: не понять
+        logger.info("не понял, есть ли виджеты на обычном сервере: %s", _clean(f"{type(e).__name__}: {e}"))
+        return None
+    finally:
+        await session.close()
+
+
+async def widgets_ready() -> bool:
+    """Виджеты работают прямо сейчас: бот на бете или обычный сервер их умеет (при запуске не поняли — ещё раз)."""
+    global _prod
+    if _active or _prod:
+        return True
+    if _prod is None and _config is not None:
+        _prod = await _check_prod(_config)
+    return bool(_prod)
+
+
+def prod_widgets() -> bool:
+    return bool(_prod)
+
+
 def allowed_updates(used: list[str]) -> list[str]:
-    """Типы обновлений для getUpdates: на бете — ещё и запросы виджетов."""
-    return list(dict.fromkeys(list(used) + (UPDATES if _active else [])))
+    """Типы обновлений для getUpdates: ещё и запросы виджетов (Bot API 10.4 — и на бете, и на обычном сервере)."""
+    return list(dict.fromkeys(list(used) + UPDATES))
 
 
-async def enable(db, pending: dict | None = None) -> None:
-    await db.set_setting(KEY, "1")
+async def enable(db, pending: dict | None = None, force: bool = False) -> None:
+    """Включить бету: `force` — руками (/beta on), тогда она не выключается сама, даже если обычный сервер умеет."""
+    await db.set_setting(KEY, "force" if force else "1")
     if pending:
         await db.set_setting(PENDING, json.dumps(pending, ensure_ascii=False))
 
@@ -185,7 +238,7 @@ async def after_start(bot: Bot, db, config, problem: str) -> None:
         except ValueError:
             return
         user = int(job.get("user") or owner or 0)
-        if not _active:
+        if not _active and not _prod:
             if user:
                 await bot.send_message(user, "⚠️ Бета Telegram не отвечает - без неё виджеты не работают, остался на "
                                              f"обычном Bot API.\n<code>{_clean(problem)}</code>\n\nПопробуй позже: "
@@ -231,11 +284,12 @@ class WidgetQueries(BaseMiddleware):
         return None
 
 
-# ---------- методы Bot API 10.4, которых нет в aiogram ----------
+# ---------- методы Bot API 10.4, которых нет в aiogram (3.31) ----------
 
 
 class SendWidget(TelegramMethod[Any]):
-    """sendWidget: HTML-виджет сообщением (только бета). Ответ — сообщение (dict) с полем widget."""
+    """sendWidget: HTML-виджет сообщением (на обычном сервере — только в личку). Ответ — сообщение (dict) с полем
+    widget."""
 
     __returning__ = Any
     __api_method__ = "sendWidget"

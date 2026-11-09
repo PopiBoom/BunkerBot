@@ -18,8 +18,8 @@
 Партия — настройка `wchess:<id>` (ходы, игроки, сообщения с досками), перезапуски её не обрывают. Ждущий вызов —
 `wchess_open`: новый /chess_widget отменяет старый, если соперника так и не нашлось.
 
-Виджеты и `widget_query` есть только на бете Bot API 10.4 — бот переходит на неё (tgbeta.py); /chess_widget на
-обычном сервере включает бету, перезапускает бота и после перезапуска сам присылает вызов.
+Виджеты и `widget_query` — Bot API 10.4: с 09.11 он вышел, на обычном сервере виджеты есть (только в личку). Бету
+(tgbeta.py) /chess_widget включает, только если обычный сервер их не умеет, — тогда перезапуск и вызов после него.
 """
 from __future__ import annotations
 
@@ -626,7 +626,7 @@ async def cmd_chess_widget(message: Message, bot: Bot, db: Database, config: Con
         if not where:
             await bot.send_message(user.id, "♟ Не нашёл чат - вызови /chess_chat прямо в группе.")
             return
-    if not tgbeta.active():
+    if not await tgbeta.widgets_ready():  # с Bot API 10.4 обычный сервер умеет сам — бета не нужна
         from handlers.admin import _restart_when_free
 
         await tgbeta.enable(db, {"kind": "wchess", "user": user.id, "name": _name(user), "where": where})
