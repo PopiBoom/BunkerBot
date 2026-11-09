@@ -1,6 +1,6 @@
 """Рисует постоянные картинки бота — один раз, бот потом шлёт готовые файлы:
   * assets/menu/*.jpg — /menu: главная и по одной на каждый раздел (из SECTIONS в handlers/menu.py);
-  * assets/lobby/*.jpg — карточки лобби Бункера и Мафии;
+  * assets/lobby/*.jpg — карточки лобби Бункера и Мафии, вызов в шахматы-виджет;
   * assets/mafia/*.jpg — фазы Мафии: night_N, morning_kill_N / morning_safe_N, day_N, vote_N (N = 1..10).
 
 Запускать вручную, когда что-то из этого меняется:  python tools/static_images.py
@@ -186,6 +186,44 @@ def lobby_mafia() -> Image.Image:
     return img
 
 
+def lobby_chess() -> Image.Image:
+    """Вызов в шахматы-виджет (/chess_widget): уходит в канал пересылкой — лицо игры. Цвета — как у доски."""
+    from games.bunker.render import _noise as b_noise
+    from games.chess.icons import piece_image
+
+    light, dark, gold = (240, 217, 181), (181, 136, 99), (226, 178, 92)
+    img = b_noise(Image.new("RGB", (LW, LH), BG), 64)
+    d = ImageDraw.Draw(img)
+    for y0 in (0, LH - 34):  # клетки доски полосой сверху и снизу
+        for k, x in enumerate(range(0, LW, 34)):
+            d.rectangle([x, y0, x + 33, y0 + 33], fill=light if (k + (y0 > 0)) % 2 else dark)
+    cx, cy, r = LW - 64 - 170, 270, 170
+    layer = Image.new("RGB", (LW, LH), PANEL)
+    dl = ImageDraw.Draw(layer)
+    for i in range(6):  # уголок доски под фигурами — только внутри круга
+        for j in range(3):
+            x, y = cx - 180 + i * 60, cy + 30 + j * 60
+            dl.rectangle([x, y, x + 59, y + 59], fill=light if (i + j) % 2 else dark)
+    mask = Image.new("L", (LW, LH), 0)
+    ImageDraw.Draw(mask).ellipse([cx - r, cy - r, cx + r, cy + r], fill=255)
+    img.paste(layer, (0, 0), mask)
+    d = ImageDraw.Draw(img)
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=gold, width=8)
+    king = piece_image("K", 240)
+    img.paste(king, (cx - 150, cy - 170), king)
+    pawn = piece_image("p", 130)
+    img.paste(pawn, (cx + 30, cy - 50), pawn)
+    d = ImageDraw.Draw(img)
+    d.text((64, 84), "ВЫЗОВ · ПАРТИЯ В ЛИЧКЕ", font=_mono(30), fill=gold)
+    font, _size = _fit(d, "ШАХМАТЫ", 132, cx - r - 40 - 58)
+    d.text((58, 120), "ШАХМАТЫ", font=font, fill=TEXT)
+    for k, line in enumerate(_wrap(d, "Кто первым нажмёт «Сыграть» - тот и соперник. Доска прямо в сообщении.",
+                                   _regular(34), cx - r - 40 - 64, 2)):
+        d.text((64, 290 + k * 46), line, font=_regular(34), fill=MUTED)
+    _chips(img, ["ЖМИ «СЫГРАТЬ»", "ДОСКА В ЛИЧКЕ", "ПОСТАВЬ МАТ"], gold, 470)
+    return img
+
+
 # ---------- фазы Мафии: ночь / утро (убили или все живы) / день / голосование, с номером ----------
 
 PHASES = ROOT / "assets" / "mafia"
@@ -348,6 +386,7 @@ if __name__ == "__main__":
         save(section_image(key), key)
     save(lobby_bunker(), "bunker", LOBBY)
     save(lobby_mafia(), "mafia", LOBBY)
+    save(lobby_chess(), "chess", LOBBY)
     for n in range(1, PHASE_MAX + 1):
         save(phase_night(n), f"night_{n}", PHASES)
         save(phase_morning(n, True), f"morning_kill_{n}", PHASES)

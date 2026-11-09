@@ -1,61 +1,97 @@
-<!-- Шахматы Пиздюка: доска-виджет в личке у бота (games/chess/widget.py). Состояние — chatData (JSON от бота), ход — запрос m:<партия>:<с><на> -->
 <style>
-body{margin:0;padding:10px 10px 12px;font:15px system-ui;color:var(--tg-theme-text-color);-webkit-user-select:none;user-select:none}
-#h,#ft{display:flex;align-items:center;gap:8px;min-height:24px}
-#h b,#st{flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-#n{color:var(--tg-theme-hint-color);font-size:13px}
-#bd{display:grid;grid-template-columns:repeat(8,1fr);max-width:420px;margin:8px auto;border-radius:6px;overflow:hidden}
-#bd i{position:relative;display:grid;place-items:center;aspect-ratio:1;line-height:1;font-style:normal}
-#bd i>*{grid-area:1/1;font-weight:400;text-decoration:none;position:relative;z-index:1}
-#bd u{color:#fff}#bd b{color:#000}
+:root{--a:var(--tg-theme-button-color);--h:var(--tg-theme-hint-color)}
+body{margin:0;padding:6px 8px 10px}
+.pl{display:flex;align-items:center;gap:8px;height:36px;padding:0 2px}
+.av{flex:none;width:26px;height:26px;border-radius:50%;display:grid;place-items:center;font-weight:700;font-size:13px}
+.aw{background:#f4f1ea;color:#222;box-shadow:inset 0 0 0 1px #0003}.ab{background:#2a2a2a;color:#fff;box-shadow:inset 0 0 0 1px #fff4}
+.nm{font-weight:600;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;max-width:45%}
+.cp{flex:1;min-width:0;overflow:hidden;white-space:nowrap;color:var(--h);font-size:14px;letter-spacing:-3px}
+.cp b{margin-left:6px;letter-spacing:0}
+.tn{flex:none;padding:3px 9px;border-radius:99px;font-weight:600;font-size:12px;background:var(--tg-theme-secondary-bg-color);color:var(--h)}
+.tn.y{background:var(--a);color:var(--tg-theme-button-text-color)}
+.tn i{display:inline-block;width:6px;height:6px;margin-right:5px;border-radius:50%;background:currentColor;vertical-align:1px;animation:pu 1.2s infinite}
+@keyframes pu{50%{transform:scale(.3)}}
+#w{position:relative;max-width:440px;margin:2px auto}
+#bd{display:grid;grid-template-columns:repeat(8,1fr);border-radius:10px;overflow:hidden;box-shadow:0 2px 12px #0005}
+#bd i{position:relative;aspect-ratio:1}
 .L{background:#f0d9b5}.D{background:#b58863}
-.m:before,.s:before,.k:before{content:"";position:absolute;inset:0}
-.m:before{background:#f6e05a80}.s:before{background:#1e7a3c99}.k:before{background:radial-gradient(#ff2020,#ff202000 72%)}
-.t:after,.x:after{content:"";position:absolute;z-index:2;border-radius:50%}
-.t:after{inset:36%;background:#0004}.x:after{inset:4%;border:4px solid #0004}
-#st.a{color:var(--tg-theme-button-color);font-weight:600}#st.e{color:var(--tg-theme-destructive-text-color)}
-button{padding:7px 11px;border:0;border-radius:10px;font:600 14px system-ui;background:var(--tg-theme-secondary-bg-color);color:var(--tg-theme-text-color)}
-#rm{background:var(--tg-theme-button-color);color:var(--tg-theme-button-text-color)}
-.x0{display:none}
+.m{background-image:linear-gradient(#9bc70069,#9bc70069)}.s{background-image:linear-gradient(#14551e80,#14551e80)}
+.k{background-image:radial-gradient(#f00,#e70000 25%,#a9000000 89%)}
+.t:after,.x:after{content:"";position:absolute;inset:0;z-index:2}
+.t:after{background:radial-gradient(#14551e80 19%,#0000 21%)}.x:after{background:radial-gradient(#0000 76%,#14551e66 78%)}
+#bd svg{position:absolute;inset:0;width:100%;height:100%;z-index:1}
+text{font-size:33px;text-anchor:middle;dominant-baseline:central;stroke-width:1.6px;paint-order:stroke;stroke-linejoin:round}
+.pw{fill:#fff;stroke:#222}.pb{fill:#222;stroke:#eee}
+.an{z-index:3!important;animation:sl .22s ease-out}
+@keyframes sl{from{transform:translate(var(--x),var(--y))}}
+em{position:absolute;z-index:2;font:normal 700 9px system-ui}
+.f{right:3px;bottom:1px}.r{left:3px;top:1px}.L em{color:#b58863}.D em{color:#f0d9b5}
+#ov{position:absolute;inset:0;z-index:4;display:grid;place-items:center;border-radius:10px;background:#0000006b}
+#cd{max-width:76%;padding:14px 18px;border-radius:16px;text-align:center;background:var(--tg-theme-bg-color,#fff);box-shadow:0 6px 24px #0007;animation:po .3s}
+@keyframes po{from{transform:scale(.7)}}
+#ce{display:block;font-size:34px;line-height:1.2}
+#ct{margin:4px 0 0}
+#ts{position:absolute;left:50%;bottom:10px;z-index:5;padding:6px 12px;border-radius:99px;background:#000000cc;color:#fff;font-size:13px;white-space:nowrap;transform:translateX(-50%)}
+#ts.e{background:#d63a2fee}
+#ft{display:flex;align-items:center;gap:6px;margin-top:6px}
+#mv{flex:1;min-width:0;color:var(--h);font-size:13px}
+button{font-weight:600;font-size:13px}
+#rm{margin-top:10px}.ac{background:var(--a);color:var(--tg-theme-button-text-color)}
+.x0{display:none!important}
 </style>
-<div id="h"><b id="op">♟ Шахматы</b><span id="n"></span></div>
-<div id="bd"></div>
-<div id="ft"><span id="st"></span><button id="dr" class="x0"></button><button id="rg" class="x0">🏳</button><button id="rm" class="x0"></button></div>
+<div class="pl" id="po"></div>
+<div id="w"><div id="bd"></div><div id="ov" class="x0"><div id="cd"><b id="ce"></b><p id="ct"></p><button id="rm" class="ac"></button></div></div><div id="ts" class="x0"></div></div>
+<div class="pl" id="pm"></div>
+<div id="ft"><span id="mv"></span><button id="dr"></button><button id="rg"></button></div>
 <script>
 const T=window.TelegramWidget||0,$=i=>document.getElementById(i),A='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/',
-F='♚♛♜♝♞♟',W='♔♕♖♗♘♙',K='kqrbnp',V='︎',bd=$('bd'),
-E={NOT_ALLOWED:'Тут ходить нельзя',BUSY:'Секунду…',RATE_LIMITED:'Слишком быстро',TIMEOUT:'Бот не ответил',FAILED:'Нет связи с ботом',INVALID_ANSWER:'Бот ответил непонятно'},
+G={k:'♚',q:'♛',r:'♜',b:'♝',n:'♞',p:'♟'},N={q:[1,9],r:[2,5],b:[2,3],n:[2,3],p:[8,1]},V='︎',bd=$('bd'),
+E={BUSY:'Секунду…',RATE_LIMITED:'Слишком быстро',TIMEOUT:'Бот не ответил'},
+R={w:'🏆',l:'😵',d:'🤝',c:'✖️'},
 J=s=>{try{return JSON.parse(s)||{}}catch(e){return{}}},
 hp=(k,v)=>{try{T.HapticFeedback[k](v)}catch(e){}},
 ix=c=>A.indexOf(c),
+es=s=>(s||'').replace(/[&<>"]/g,c=>'&#'+c.charCodeAt(0)+';'),
 brd=f=>{let b=[],r=7,c=0;for(const h of f||'')h=='/'?(r--,c=0):h>'0'&&h<'9'?c+=+h:b[r*8+c++]=h;return b},
-pos=v=>{let fl=S.c=='b',r=fl?v>>3:7-(v>>3),c=fl?7-(v&7):v&7;return r*8+c};
-let S=J(T.chatData),sel=-1,busy=0,ob=0,fm='',fe=0,tm,rs=0,mv0=S.m;
+fl=()=>S.c=='b',
+pos=v=>{let r=fl()?v>>3:7-(v>>3),c=fl()?7-(v&7):v&7;return r*8+c},
+rc=i=>fl()?[i>>3,7-(i&7)]:[7-(i>>3),i&7];
+let S=J(T.chatData),sel=-1,busy=0,ob=0,om='',tm,rs=0,anm=S.m,hid=0;
 function tg(){let t={},l=S.l||'';if(sel>=0)for(let i=0;i<l.length;i+=2)if(ix(l[i])==sel)t[ix(l[i+1])]=1;return t}
-function fl(m,ok){fm=m;fe=!ok;clearTimeout(tm);tm=setTimeout(()=>{fm='';draw()},2600);if(!ok)hp('notificationOccurred','error');draw()}
+function toast(m,er){let t=$('ts');t.textContent=m;t.className=er?'e':'';clearTimeout(tm);tm=setTimeout(()=>t.className='x0',2400);if(er)hp('notificationOccurred','error')}
+function cap(b,me){let n={},s='',v=0;for(const p of b)if(p&&(p<'a')!=(me=='w'))n[p.toLowerCase()]=(n[p.toLowerCase()]||0)+1;
+for(const k in N){let c=Math.max(0,N[k][0]-(n[k]||0));v+=c*N[k][1];s+=(G[k]+V).repeat(c)}return[s,v]}
+function bar(id,nm,av,c,cp,d,on,me){$(id).innerHTML='<span class="av a'+c+'">'+es(av)+'</span><span class="nm">'+es(nm)+'</span><span class="cp">'+cp+(d>0?'<b>+'+d+'</b>':'')+'</span>'+(on?'<span class="tn'+(me?' y':'')+'"><i></i>'+(me?'Твой ход':'Ходит')+'</span>':'')}
 function draw(){
-let s=S,b=ob||brd(s.f),t=tg(),h='',k,i,p,on=!s.e&&s.o&&!busy;
-for(let v=0;v<64;v++){i=pos(v);p=b[i];k=((i>>3)+(i&7))&1?'L':'D';
-if(s.m&&(ix(s.m[0])==i||ix(s.m[1])==i))k+=' m';if(i==sel)k+=' s';if(s.k&&ix(s.k)==i)k+=' k';if(t[i])k+=p?' x':' t';
-h+='<i class="'+k+'">'+(p?p<'a'?'<u>'+F[K.indexOf(p.toLowerCase())]+V+'</u><b>'+W[K.indexOf(p.toLowerCase())]+V+'</b>':'<b>'+F[K.indexOf(p)]+V+'</b>':'')+'</i>'}
-bd.innerHTML=h;bd.style.fontSize=bd.clientWidth/8*.8+'px';
-$('op').textContent=s.o?'Ты '+(s.c=='b'?'⚫':'⚪')+' · соперник: '+s.o:'♟ Шахматы Пиздюка';
-$('n').textContent=s.n>1?'ход '+s.n:'';
-k=$('st');k.textContent=busy?'…':fm||s.s||'';k.className=fm?fe?'e':'':!s.e&&s.t==s.c&&s.o?'a':'';
-k=$('dr');k.className=on?'':'x0';k.textContent=s.d==1?'🤝 Согласен':s.d==2?'🤝 Ждём':'🤝';
-k=$('rg');k.className=on?'':'x0';k.textContent=rs?'🏳 Точно?':'🏳';
-k=$('rm');k.className=s.e&&s.o&&s.g?'':'x0';k.textContent=s.r==1?'🔁 Принять реванш':s.r==2?'🔁 Ждём':'🔁 Реванш'}
-function req(d){if(busy)return fl(E.BUSY);let r;try{r=T.request(d+'')}catch(e){r=Promise.reject(e)}
-hp('impactOccurred','light');busy=1;draw();
-r.then(a=>{let j=J(a&&a.result);if(j.err)throw{code:j.err};if(j.s)S=j.s;busy=0;ob=0;sel=-1;draw()}).catch(e=>{busy=0;ob=0;fl(E[e.code]||e.code||E.FAILED)})}
-bd.addEventListener('click',e=>{let c=e.target.closest('i'),s=S;if(!c||!T||busy)return;
+let s=S,b=ob||brd(s.f),t=tg(),h='',k,i,p,v,m=ob?om:s.m,me=s.c||'w',op=me=='w'?'b':'w',live=!s.e&&s.o,
+a=m&&m!=anm?[rc(ix(m[0])),rc(ix(m[1]))]:0;
+for(v=0;v<64;v++){i=pos(v);p=b[i];k=((i>>3)+(i&7))&1?'L':'D';
+if(m&&(ix(m[0])==i||ix(m[1])==i))k+=' m';if(i==sel)k+=' s';if(s.k&&ix(s.k)==i&&!ob)k+=' k';if(t[i])k+=p?' x':' t';
+h+='<i class="'+k+'">'+(p?'<svg viewBox="0 0 40 40" class="'+(p<'a'?'pw':'pb')+(a&&ix(m[1])==i?' an" style="--x:'+(a[0][1]-a[1][1])*100+'%;--y:'+(a[0][0]-a[1][0])*100+'%':'')+'"><text x="20" y="21">'+G[p.toLowerCase()]+V+'</text></svg>':'')
++(v>55?'<em class="f">'+A[i&7]+'</em>':'')+(v%8?'':'<em class="r">'+((i>>3)+1)+'</em>')+'</i>'}
+bd.innerHTML=h;if(m)anm=m;
+let x=cap(b,me),y=cap(b,op),vw=T.viewer||{};
+bar('po',s.o||'Ждём соперника…',s.o?s.o[0]:'?',op,y[0],y[1]-x[1],live&&s.t!=me);
+bar('pm','Ты',(vw.first_name||'Я')[0],me,x[0],x[1]-y[1],live&&s.t==me&&!ob,1);
+$('ov').className=live||hid?'x0':'';
+if(!live){$('ce').textContent=s.e?R[s.x]||'🏁':'⏳';$('ct').textContent=s.s||'';
+k=$('rm');k.className=s.e&&s.o&&s.r!=3?'ac':'x0';k.textContent=s.r==1?'🔁 Принять реванш':s.r==2?'Ждём соперника…':'🔁 Реванш'}
+$('mv').textContent=s.d==1?(s.o||'')+' предлагает ничью':s.n>1?'Ход '+s.n:'';
+k=$('dr');k.className=live?s.d==1?'ac':'':'x0';k.textContent=s.d==1?'🤝 Принять':s.d==2?'🤝 Предложено':'🤝 Ничья';
+k=$('rg');k.className=live?rs?'ac':'':'x0';k.textContent=rs?'Точно сдаться?':'🏳 Сдаться'}
+function req(d){if(busy)return toast(E.BUSY);let r;try{r=T.request(d+'')}catch(e){r=Promise.reject(e)}
+hp('impactOccurred','light');busy=1;
+r.then(a=>{let j=J(a&&a.result);if(j.err)throw{code:j.err};if(j.s)S=j.s;busy=0;ob=0;sel=-1;draw()}).catch(e=>{busy=0;ob=0;anm=S.m;draw();toast(E[e.code]||e.code||'Нет связи с ботом',1)})}
+bd.addEventListener('click',e=>{let c=e.target.closest('#bd>i'),s=S;if(!c||!T||busy)return;
 let i=pos([...bd.children].indexOf(c)),b=brd(s.f),p=b[i];
-if(s.e)return fl('Партия окончена',1);if(!s.o)return fl('Ждём соперника',1);if(s.t!=s.c)return fl('Сейчас ходит '+s.o,1);
-if(tg()[i]){b[i]=b[sel];b[sel]=0;ob=b;let a=sel;sel=-1;return req('m:'+s.g+':'+A[a]+A[i])}
-if(p&&(p<'a')==(s.c=='w')){sel=sel==i?-1:i;hp('selectionChanged')}else if(sel>=0)sel=-1;else return fl('Это не твоя фигура');draw()});
+if(s.e||!s.o){hid=0;return draw()}
+if(s.t!=s.c)return toast('Сейчас ходит '+s.o);
+if(tg()[i]){b[i]=b[sel];b[sel]=0;ob=b;om=A[sel]+A[i];let f=sel;sel=-1;draw();return req('m:'+s.g+':'+A[f]+A[i])}
+if(p&&(p<'a')==(s.c=='w')){sel=sel==i?-1:i;hp('selectionChanged')}else if(sel>=0)sel=-1;else return toast('Это не твоя фигура',1);draw()});
+$('ov').onclick=e=>{if(e.target.id=='ov'&&S.e){hid=1;draw()}};
 $('rg').onclick=()=>{if(!rs){rs=1;draw();setTimeout(()=>{rs=0;draw()},3e3)}else{rs=0;req('r:'+S.g)}};
 $('dr').onclick=()=>S.d!=2&&req('d:'+S.g);
 $('rm').onclick=()=>S.r!=2&&req('n:'+S.g);
-if(T){T.onEvent('chatDataChanged',()=>{S=J(T.chatData);fm='';if(S.m!=mv0){sel=-1;mv0=S.m;if(S.t==S.c&&!S.e)hp('notificationOccurred','success')}draw()})}
-addEventListener('resize',draw);draw();T.ready&&T.ready();
+if(T){T.onEvent('chatDataChanged',()=>{let o=S.m;S=J(T.chatData);$('ts').className='x0';if(S.m!=o){sel=-1;if(S.t==S.c&&!S.e)hp('notificationOccurred','success')}if(!S.e)hid=0;draw()})}
+draw();T.ready&&T.ready();
 </script>

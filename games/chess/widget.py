@@ -34,7 +34,8 @@ from pathlib import Path
 from aiogram import BaseMiddleware, Bot, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from aiogram.types import (BufferedInputFile, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+                           Update)
 
 from config import Config
 from database import Database
@@ -47,6 +48,8 @@ KEY = "wchess:"         # настройка: партия
 OPEN = "wchess_open"    # id вызова, который ждёт соперника
 START = "wch_"          # /start wch_<id> — ссылка-приглашение
 HTML = Path(__file__).with_name("widget.html").read_text("utf-8")
+CARD = Path(__file__).resolve().parents[2] / "assets" / "lobby" / "chess.jpg"  # картинка вызова (tools/static_images.py)
+CARD_KEY = "wchess_card"  # её file_id после первой отправки
 SQ = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/"  # клетка a1…h8 → знак (как в widget.html)
 MAX_DATA = 1024          # chat_data и ответ на запрос — не больше (байт)
 NAME_LEN = 18
@@ -173,7 +176,7 @@ def _end_for(st: dict, uid: int) -> str:
     if why in ("mate", "resign"):
         winner, loser = _players(st, end)
         if end.get("win") == uid:
-            return ("Мат! Ты победил 🏆" if why == "mate" else f"{loser} сдался - ты победил 🏆")
+            return "Мат! Ты победил" if why == "mate" else f"{loser} сдался - ты победил"
         return f"Мат. Победил {winner}" if why == "mate" else "Ты сдался"
     return end_line(st)
 
@@ -196,6 +199,8 @@ def _view(st: dict, uid: int) -> str:
     if st.get("end"):
         v["e"] = 1
         v["s"] = _end_for(st, uid)
+        why, win = st["end"].get("why"), st["end"].get("win")
+        v["x"] = "c" if why == "cancel" else "d" if why in DRAWS else "w" if win == uid else "l"  # значок итога
         if st.get("next") or st["end"].get("why") == "cancel":
             v["r"] = 3  # реванш уже идёт / вызов отменён — кнопки нет
         elif st.get("rematch"):
@@ -274,6 +279,22 @@ def _side(st: dict, uid: int) -> str:
 # ---------- вызов и вход ----------
 
 
+async def _send_card(bot: Bot, db: Database, uid: int, text: str, kb: InlineKeyboardMarkup) -> Message:
+    """Вызов картинкой (assets/lobby/chess.jpg, потом по file_id); не вышло — тем же текстом."""
+    cached = await db.get_setting(CARD_KEY, "")
+    for photo in ([cached] if cached else []) + ([FSInputFile(CARD)] if CARD.exists() else []):
+        try:
+            msg = await bot.send_photo(uid, photo, caption=text, reply_markup=kb)
+            if not isinstance(photo, str) and msg.photo:
+                await db.set_setting(CARD_KEY, msg.photo[-1].file_id)
+            return msg
+        except Exception as e:  # noqa: BLE001 — протухший file_id, нет файла: дальше
+            logger.info("шахматы-виджет: картинка вызова не ушла (%s)", e)
+            if isinstance(photo, str):
+                await db.set_setting(CARD_KEY, "")
+    return await bot.send_message(uid, text, reply_markup=kb, disable_web_page_preview=True)
+
+
 async def create(bot: Bot, db: Database, uid: int, name: str = "") -> None:
     """Новый вызов: доска вызвавшему, отдельным сообщением ссылка, её пересылка в канал."""
     from handlers.channel_posts import channel_id, mark_own
@@ -299,12 +320,12 @@ async def create(bot: Bot, db: Database, uid: int, name: str = "") -> None:
     await db.set_setting(OPEN, gid)
     me = await bot.me()
     link = f"https://t.me/{me.username}?start={START}{gid}"
-    text = (f"♟ <b>{html.escape(name)} ищет соперника в шахматы</b>\n\n"
-            "Кто первым нажмёт - тот и играет. Партия - в личке у Пиздюка: доска прямо в сообщении, ходишь "
-            "нажатием (нужен свежий Telegram).\n\n"
-            f"👉 {link}")
+    text = (f"♟ <b>{html.escape(name)} ищет соперника</b>\n\n"
+            "Кто первым нажмёт «Сыграть» - тот и играет. Партия - в личке у Пиздюка, доска прямо в сообщении "
+            "(нужен свежий Telegram).\n\n"
+            f'👉 <a href="{link}">Сыграть</a>')  # ссылка и в тексте: вдруг кнопку при пересылке не покажут
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="♟ Сыграть", url=link)]])
-    invite = await bot.send_message(uid, text, reply_markup=kb, disable_web_page_preview=True)
+    invite = await _send_card(bot, db, uid, text, kb)
     channel, post = await channel_id(bot, db), None
     if channel:
         try:
@@ -492,7 +513,8 @@ async def on_query(bot: Bot, db: Database, q: dict) -> None:
         if ev["done"]:
             for who in (st["w"][0], st["b"][0]):
                 await _unnote(bot, st, who)
-                await _note(bot, st, who, "🏁 " + html.escape(_end_for(st, who)))
+                won = (st.get("end") or {}).get("win") == who
+                await _note(bot, st, who, ("🏆 " if won else "🏁 ") + html.escape(_end_for(st, who)))
             logger.info("шахматы-виджет %s: %s", gid, end_line(st))
         await _save(db, gid, st)
     if ev["done"]:
