@@ -26,7 +26,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -219,6 +219,20 @@ def _caption(horror: bool, n: int, topic: str, now: datetime, weather: str, bot_
 
 async def _noop(_text: str) -> None:
     return None
+
+
+async def tg_retry(fn, *args, **kwargs):
+    """Запрос к Telegram с повтором при «Flood control exceeded… Retry in N seconds»: подождать и ещё раз (до трёх
+    раз). 09.11: «Выпуск не собрался: Flood control exceeded on method 'SendVoice'… Retry in 8 seconds» — собранный и
+    озвученный выпуск пропадал из-за 8 секунд ожидания."""
+    for attempt in range(4):
+        try:
+            return await fn(*args, **kwargs)
+        except TelegramRetryAfter as e:
+            if attempt == 3 or e.retry_after > 120:
+                raise
+            logger.info("telegram: флуд-контроль, жду %s с и повторяю", e.retry_after)
+            await asyncio.sleep(e.retry_after + 1)
 
 
 CAPTION_MAX = 1024  # лимит подписи Telegram: видимые знаки после разметки, в UTF-16
@@ -493,20 +507,20 @@ async def _send_draft(bot: Bot, db: Database, chat_id: int, horror: bool, progre
     text = "\n\n".join(ep["paragraphs"])
     if not ep["ogg"]:
         why = f" ({html.escape(ep['voice'][:300])})" if ep.get("voice") else ""
-        await bot.send_message(chat_id, f"{ep['caption']}\n\n{html.escape(text[:3200])}\n\n<i>Озвучить не вышло: нет "
+        await tg_retry(bot.send_message, chat_id, f"{ep['caption']}\n\n{html.escape(text[:3200])}\n\n<i>Озвучить не вышло: нет "
                                         f"ключа (/setkey yandex или OpenRouter) или сбой озвучки{why}. Это текст.</i>")
         return False
     # какой голос читал (и кто до него не справился) — видно только в черновике, в канал не идёт
     voice = BufferedInputFile(ep["ogg"], "night.ogg")
     try:
-        msg = await bot.send_voice(chat_id, voice, reply_markup=_kb(), duration=ep.get("secs") or None,
-                                   caption=_draft_caption(ep["caption"], ep.get("voice") or "", text))
+        msg = await tg_retry(bot.send_voice, chat_id, voice, reply_markup=_kb(), duration=ep.get("secs") or None,
+                             caption=_draft_caption(ep["caption"], ep.get("voice") or "", text))
     except TelegramBadRequest as e:  # подпись всё равно не пустили — голосовое дороже подписи, шлём без текста
         if "caption" not in str(e).lower():
             raise
         logger.warning("night: подпись черновика не принята (%s) — без текста", e)
-        msg = await bot.send_voice(chat_id, voice, reply_markup=_kb(), duration=ep.get("secs") or None,
-                                   caption=_cut_vis(re.sub(r"<[^>]+>", "", ep["caption"]), 900))
+        msg = await tg_retry(bot.send_voice, chat_id, voice, reply_markup=_kb(), duration=ep.get("secs") or None,
+                             caption=_cut_vis(re.sub(r"<[^>]+>", "", ep["caption"]), 900))
     await db.set_setting(DRAFT_KEY, json.dumps({"file_id": msg.voice.file_id, "caption": ep["caption"],
                                                 "n": ep["n"], "msg": msg.message_id, "chat": chat_id,
                                                 "horror": horror, "letter": ep.get("letter"),
@@ -623,8 +637,8 @@ async def cb_night(call: CallbackQuery, bot: Bot, db: Database, config: Config) 
         if not channel:
             await call.answer("Не нашёл канал.", show_alert=True)
             return
-        sent = await bot.send_voice(channel, draft["file_id"], caption=draft["caption"],
-                                    duration=draft.get("secs") or None)
+        sent = await tg_retry(bot.send_voice, channel, draft["file_id"], caption=draft["caption"],
+                              duration=draft.get("secs") or None)
         await mark_own(db, sent.message_id)
         await db.set_setting(HORROR_COUNT_KEY if draft.get("horror") else COUNT_KEY, str(draft["n"]))
         if draft.get("horror"):
@@ -659,11 +673,17 @@ async def cb_night(call: CallbackQuery, bot: Bot, db: Database, config: Config) 
             await bot.send_message(call.message.chat.id, f"Эфир не собрался: {html.escape(str(e))[:200]}")
 
 
+PROGRESS_GAP = 3.0  # сек: «Пишу… / Озвучиваю N из M» правим не чаще
+
+
 def _progress(bot: Bot, status: Message, first: str):
     """Правит сообщение «Пишу…»: какой шаг сейчас и сколько прошло — видно, что бот жив."""
-    started = time.time()
+    started, last = time.time(), [0.0]
 
     async def show(step: str) -> None:
+        if time.time() - last[0] < PROGRESS_GAP:  # правки тоже считаются во флуд-контроле Telegram
+            return
+        last[0] = time.time()
         try:
             await bot.edit_message_text(f"{first}\n\n{step} · {int(time.time() - started)} с", chat_id=status.chat.id,
                                         message_id=status.message_id)

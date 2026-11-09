@@ -37,6 +37,10 @@ DRAFT_KEY = "gossip_draft"
 COUNT_KEY = "gossip_no"
 HIST_KEY = "gossip_titles"   # прошлые выпуски: «тема:… | о чём слух | где» — не повторять
 NUM_ICONS = ["1️⃣", "2️⃣", "3️⃣"]
+# Музыка под выпуск (идея №9) — ElevenLabs /music без голоса, весёлая и «шпионско-комедийная»; нет ключа — синтезатор
+GOSSIP_MUSIC = ("playful comedic gossip talk-show background music, sneaky pizzicato strings, light brushed percussion "
+                "and finger snaps, bouncy upright bass, mischievous spy-comedy vibe, upbeat, bright major key, "
+                "loopable, stays in the background under talking")
 _tasks: set[asyncio.Task] = set()  # сборка идёт в фоне — держим ссылку, чтобы задачу не собрал сборщик мусора
 
 
@@ -87,8 +91,15 @@ async def make_episode(db: Database, progress=night._noop, letter: dict | None =
     topic = story["subject"] or story["title"] or "без темы"
     await db.set_setting(HIST_KEY, json.dumps(
         (used + [f"тема:{story['theme'][:40]} | {topic} | {story.get('place', '')}"])[-30:], ensure_ascii=False))
-    chunks = ai.gossip_chunks(story)
-    paragraphs = [ai.strip_tags(c) for c in chunks]
+    seq = ai.gossip_chunks(story)
+    chunks, roles, parts = [t for _, t, _ in seq], [r for r, _, _ in seq], [p for _, _, p in seq]
+    call = story.get("call") or {}
+    names = {"host": "Ведущий", "cohost": ai.GOSSIP_COHOST, "call_f": f"📞 {call.get('name', 'Звонок')}",
+             "call_m": f"📞 {call.get('name', 'Звонок')}"}
+    paragraphs = [f"{names.get(r, r)}: {ai.strip_tags(t)}" for r, t, _ in seq]  # текст черновика — кто что говорит
+    music_task = None
+    if ai.eleven_key() and not ai.eleven_geo_blocked():  # музыка (идея №9) — пока озвучиваются голоса
+        music_task = asyncio.create_task(ai.eleven_ambient(GOSSIP_MUSIC, strict=False))
     n = int(await db.get_setting(COUNT_KEY, "0") or 0) + 1
     author = ((letter.get("sign") or "").strip() if letter else None)
     caption = _caption(n, story, now, cond["caption"], bot_username, author)
@@ -96,19 +107,26 @@ async def make_episode(db: Database, progress=night._noop, letter: dict | None =
     async def step(i: int, total: int, who: str) -> None:
         await progress(f"🎙 Озвучиваю: {i} из {total} · {who}")
 
-    voice = await ai.narrate_all(chunks, ["host"] * len(chunks), horror=True, progress=step)
+    voice = await ai.narrate_all(chunks, roles, horror=True, progress=step)
     who = ai.last_voice[0] + (f" (не вышло: {ai.voice_trouble[0]})" if ai.voice_trouble[0] else "")
     base = {"paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic,
             "letter": (letter or {}).get("id")}
     if not voice:
+        if music_task:
+            music_task.cancel()
         return {**base, "ogg": None, "voice": ai.voice_trouble[0]}
     await progress("🎚 Свожу эфир…")
-    mix = await asyncio.to_thread(radio.gossip, voice, ai.SPEAK_RATE, int(time.time()))
+    music = None
+    if music_task:
+        data = await music_task
+        music = await asyncio.to_thread(radio.decode, data) if data else None
+    mix = await asyncio.to_thread(radio.gossip, voice, ai.SPEAK_RATE, int(time.time()), roles, parts, music)
+    who = (f"{who} · {story['theme'][:50]} · звонок {'есть' if call else 'нет'} · музыка "
+           f"{'ElevenLabs' if music is not None else 'своя'}")
     ogg = await asyncio.to_thread(radio.to_ogg, mix)
     secs = max(1, int(round(len(mix) / radio.SR)))
     logger.info("сплетни №%s: «%s», %.0f сек, голос %s", n, topic, len(mix) / radio.SR, who or "?")
-    return {**base, "ogg": ogg, "voice": f"{who} · {story['theme'][:60]}" if who else story["theme"][:60],
-            "secs": secs}
+    return {**base, "ogg": ogg, "voice": who, "secs": secs}
 
 
 def _kb() -> InlineKeyboardMarkup:
@@ -144,18 +162,20 @@ async def _send_draft(bot: Bot, db: Database, chat_id: int, progress, letter_id:
     text = "\n\n".join(ep["paragraphs"])
     if not ep["ogg"]:
         why = f" ({html.escape(ep['voice'][:300])})" if ep.get("voice") else ""
-        await bot.send_message(chat_id, f"{ep['caption']}\n\n{html.escape(text[:2800])}\n\n<i>Озвучить не вышло{why}. "
-                                        "Это текст.</i>", disable_web_page_preview=True)
+        await night.tg_retry(bot.send_message, chat_id, f"{ep['caption']}\n\n{html.escape(text[:2800])}\n\n"
+                             f"<i>Озвучить не вышло{why}. Это текст.</i>", disable_web_page_preview=True)
         return False
     voice = BufferedInputFile(ep["ogg"], "gossip.ogg")
     try:
-        msg = await bot.send_voice(chat_id, voice, reply_markup=_kb(), duration=ep.get("secs") or None,
+        msg = await night.tg_retry(bot.send_voice, chat_id, voice, reply_markup=_kb(),
+                                   duration=ep.get("secs") or None,
                                    caption=night._draft_caption(ep["caption"], ep.get("voice") or "", text))
     except TelegramBadRequest as e:  # подпись не пустили — голосовое дороже подписи
         if "caption" not in str(e).lower():
             raise
         logger.warning("gossip: подпись черновика не принята (%s) — без текста", e)
-        msg = await bot.send_voice(chat_id, voice, reply_markup=_kb(), duration=ep.get("secs") or None,
+        msg = await night.tg_retry(bot.send_voice, chat_id, voice, reply_markup=_kb(),
+                                   duration=ep.get("secs") or None,
                                    caption=night._cut_vis(re.sub(r"<[^>]+>", "", ep["caption"]), 900))
     await db.set_setting(DRAFT_KEY, json.dumps({"file_id": msg.voice.file_id, "caption": ep["caption"], "n": ep["n"],
                                                 "msg": msg.message_id, "chat": chat_id, "letter": ep.get("letter"),
@@ -272,7 +292,7 @@ async def cb_draft(call: CallbackQuery, bot: Bot, db: Database, config: Config) 
             await call.answer("Не нашёл канал.", show_alert=True)
             return
         await db.set_setting(DRAFT_KEY, "")  # сразу: второе нажатие не опубликует второй раз
-        sent = await bot.send_voice(channel, draft["file_id"], caption=draft["caption"],
+        sent = await night.tg_retry(bot.send_voice, channel, draft["file_id"], caption=draft["caption"],
                                     duration=draft.get("secs") or None)
         await mark_own(db, sent.message_id)
         await db.set_setting(COUNT_KEY, str(draft["n"]))

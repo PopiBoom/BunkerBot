@@ -1348,29 +1348,63 @@ def _sting() -> np.ndarray:
     return out / (np.abs(out).max() or 1)
 
 
-def gossip(voice_chunks: list[bytes], rate: int = 24000, seed: int = 0) -> np.ndarray:
-    """«Сплетни Волгограда» (float32, 48 кГц, пик ≈ -1 дБ): позывной, ведущий «как на FM» поверх весёлой подложки,
-    между кусками голоса — «дзынь», в конце позывной вниз. Без помех эфира."""
+GOSSIP_MUSIC_DB = -19.0  # музыка ElevenLabs под ведущими — она плотнее синтезатора, чуть тише (полоса телефона)
+CALLER_DB = -1.0        # звонящий в студию — чуть тише ведущих (телефон и так режет полосу)
+TURN_GAP = 0.28         # пауза между репликами ведущих — живой разговор, без «радио-тишины»
+
+
+def gossip(voice_chunks: list[bytes], rate: int = 24000, seed: int = 0, roles: list[str] | None = None,
+           parts: list[str] | None = None, music: np.ndarray | None = None) -> np.ndarray:
+    """«Сплетни Волгограда» (float32, 48 кГц, пик ≈ -1 дБ): позывной, ведущий и соведущая «как на FM» поверх весёлой
+    подложки (music — ElevenLabs, нет — синтезатор), звонящий в студию — телефоном (перед звонком звенит телефон,
+    после — щелчок положенной трубки), между частями выпуска (parts) — «дзынь», в конце позывной вниз. Без помех.
+    roles — host / cohost / call_f|call_m для каждого куска; parts — к какой части он относится."""
     rng = np.random.default_rng(seed)
-    parts = [_on_air(_band(v, 70, 11000)) for v in (_resample(p, rate) for p in voice_chunks) if len(v)]
-    if not parts:
+    roles = list(roles or ["host"] * len(voice_chunks))
+    parts = list(parts or [str(i) for i in range(len(voice_chunks))])
+    items = []
+    for pcm, role, part in zip(voice_chunks, roles, parts, strict=False):
+        v = _resample(pcm, rate)
+        if len(v):
+            v = _band(v, 70, 11000)
+            items.append(((_phone(v) if role.startswith("call") else _on_air(v)), role, part))
+    if not items:
         return np.zeros(SR, dtype=np.float32)
-    ref = _speech_db(parts[0])
-    for v in parts:  # все куски — одной громкости
-        v *= np.float32(_db(ref - _speech_db(v)))
-    sting = _sting()
-    gap_in, gap_out = int(0.35 * SR), int(0.55 * SR)  # тишина до «дзынь» и от его начала до голоса
-    total = sum(len(v) for v in parts) + (len(parts) - 1) * (gap_in + gap_out)
-    voice = np.zeros(total, dtype=np.float32)
-    stings, pos = [], 0
-    for i, v in enumerate(parts):
+    host_lv = [_speech_db(v) for v, r, _ in items if not r.startswith("call")]
+    ref = host_lv[0] if host_lv else _speech_db(items[0][0])
+    for v, r, _ in items:  # ведущие — одной громкости, звонящий чуть тише
+        v *= np.float32(_db(ref + (CALLER_DB if r.startswith("call") else 0.0) - _speech_db(v)))
+    sting, ring = _sting(), _ring()
+    click = _line_drop()[-int(0.02 * SR):]
+    layout, events, pos = [], [], 0   # events: (позиция в дорожке голоса, что, уровень)
+    for i, (v, role, part) in enumerate(items):
         if i:
-            stings.append(pos + gap_in)
-            pos += gap_in + gap_out
-        voice[pos:pos + len(v)] = v
+            prev_role, prev_part = items[i - 1][1], items[i - 1][2]
+            if prev_role.startswith("call") and not role.startswith("call"):   # звонящий положил трубку
+                events.append((pos + int(0.15 * SR), "click"))
+                pos += int(0.35 * SR)
+            if part != prev_part:
+                if part == "call":                                               # звонок: телефон звенит в тишине
+                    pos += int(0.4 * SR)
+                    events.append((pos, "ring"))
+                    pos += len(ring) + int(0.3 * SR)
+                else:
+                    pos += int(0.35 * SR)
+                    events.append((pos, "sting"))
+                    pos += int(0.55 * SR)
+            else:
+                pos += int((0.45 if role.startswith("call") or prev_role.startswith("call") else TURN_GAP) * SR)
+        layout.append((pos, v))
         pos += len(v)
+    if items[-1][1].startswith("call"):
+        events.append((pos + int(0.15 * SR), "click"))
+        pos += int(0.35 * SR)
+    voice = np.zeros(pos, dtype=np.float32)
+    for p0, v in layout:
+        voice[p0:p0 + len(v)] += v
+    del layout, items
     voice = _peak1(voice)
-    ref_hp = _speech_db(_band(voice, *PHONE_BAND))      # громкость ведущего в полосе телефона
+    ref_hp = _speech_db(_band(voice, *PHONE_BAND))      # громкость ведущих в полосе телефона
 
     def to_level(x: np.ndarray, rel: float) -> np.ndarray:
         r = float(np.sqrt(np.mean(np.square(_band(x, *PHONE_BAND), dtype=np.float64)))) or 1.0
@@ -1385,12 +1419,17 @@ def gossip(voice_chunks: list[bytes], rate: int = 24000, seed: int = 0) -> np.nd
     mix[:len(head)] += head
     mix[start:start + len(voice)] += voice
     mix[end:end + len(tail)] += tail
-    st = to_level(sting, STING_DB)
-    for at in stings:
-        p = start + at
-        mix[p:p + len(st)] += st[:max(0, min(len(st), n - p))]
+    sounds = {"sting": to_level(sting, STING_DB), "ring": ring * np.float32(_db(ref_hp + RING_DB) / 0.35),
+              "click": click * np.float32(_db(ref_hp + CALLER_DB) / 0.35 * 0.5)}
+    for at, kind in events:
+        snd, p = sounds[kind], start + at
+        k = max(0, min(len(snd), n - p))
+        mix[p:p + k] += snd[:k]
     a, b = max(0, start - int(0.6 * SR)), min(n, end + int(0.8 * SR))   # подложка — под всем голосом
-    bed = to_level(_talk_bed(b - a, rng, _GOSSIP_CHORDS, GOSSIP_BPM), GOSSIP_BED_DB)
+    if music is not None and len(music) > 5 * SR:  # настоящая музыка (ElevenLabs) вместо синтезатора
+        bed = to_level(_band(_loop(music, b - a), 40, 12000), GOSSIP_MUSIC_DB)
+    else:
+        bed = to_level(_talk_bed(b - a, rng, _GOSSIP_CHORDS, GOSSIP_BPM), GOSSIP_BED_DB)
     fi, fo = min(int(0.5 * SR), (b - a) // 3), min(int(1.5 * SR), (b - a) // 3)
     bed[:fi] *= np.linspace(0, 1, fi, dtype=np.float32)
     bed[-fo:] *= np.linspace(1, 0, fo, dtype=np.float32)
