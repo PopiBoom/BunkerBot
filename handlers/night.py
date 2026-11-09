@@ -193,9 +193,10 @@ def _conditions(w: dict | None, now: datetime) -> dict:
 
 
 def _caption(horror: bool, n: int, topic: str, now: datetime, weather: str, bot_username: str = "",
-             fmt: str = "письмо") -> str:
-    """Подпись к голосовому (и в канале): рубрика, номер выпуска, тема письма, время и погода; у рубрики — как
-    прислать свою историю (ссылка открывает бота сразу на письме)."""
+             fmt: str = "письмо", author: str | None = None) -> str:
+    """Подпись к голосовому (и в канале): рубрика, номер выпуска, тема письма, автор (если историю прислал подписчик:
+    имя — если разрешил «именем», иначе «попросил не называть имя»; 09.11 владелец: «указывать имя того, кто
+    отправил»), время и погода; у рубрики — как прислать свою историю (ссылка открывает бота сразу на письме)."""
     when = f"{now:%H:%M}" + (f" · {html.escape(weather)}" if weather else "")
     if horror:
         from handlers.letters import deep_link
@@ -205,7 +206,9 @@ def _caption(horror: bool, n: int, topic: str, now: datetime, weather: str, bot_
         link = deep_link(bot_username)
         icon, name = next(((f[2], f[1]) for f in ai.HORROR_FORMATS if f[0] == fmt), ("✉️", "письмо"))
         return (f"🩸 <b>{ai.HORROR_RUBRIC.upper()}</b> · выпуск №{n}\n"
-                f"{icon} <i>«{html.escape(subject)}»</i>" + ("" if fmt == "письмо" else f" · {name}") + "\n\n"
+                f"{icon} <i>«{html.escape(subject)}»</i>" + ("" if fmt == "письмо" else f" · {name}") + "\n"
+                + ("" if author is None else f"👤 Автор: {html.escape(author[:30])}\n" if author else
+                   "👤 Автор попросил не называть имя\n") + "\n"
                 f"📻 Радио Волгограда · {when}"
                 + (f"\n\n📨 Свою историю можно оставить в этом боте: <a href=\"{link}\">@{html.escape(bot_username)}</a>"
                    if link else ""))
@@ -303,7 +306,8 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
         roles = [False] * len(paragraphs)
         await db.set_setting(TOPICS_KEY, json.dumps((used + [topic])[-30:], ensure_ascii=False))
     n = int(await db.get_setting(HORROR_COUNT_KEY if horror else COUNT_KEY, "0") or 0) + 1
-    caption = _caption(horror, n, topic, now, cond["caption"], bot_username, story.get("format", "письмо"))
+    caption = _caption(horror, n, topic, now, cond["caption"], bot_username, story.get("format", "письмо"),
+                       author=((letter.get("sign") or "").strip() if letter else None))
     async def step(i: int, total: int, who: str) -> None:
         await progress(f"🎙 Озвучиваю: {i} из {total} · {who}")
 
