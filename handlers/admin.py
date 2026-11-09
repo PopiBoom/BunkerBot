@@ -273,7 +273,7 @@ def _restart_when_free() -> None:
             if not _busy():
                 break
             await asyncio.sleep(30)
-        logger.info("перезапуск по /setproxy")
+        logger.info("перезапуск: поменялась сеть (/setproxy, бета Bot API)")
         os._exit(0)
 
     _restart_task.append(asyncio.create_task(run()))

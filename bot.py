@@ -28,6 +28,8 @@ from games import bunker_router, flag_loop, hush, mafia_router, note_channel_pos
 from games.blackjack import router as blackjack_router
 from games.chess import router as chess_router
 from games.chess.game import note_forward as note_chess_forward
+from games.chess.widget import WidgetQueries
+from games.chess.widget import router as chess_widget_router
 from handlers import (admin_router, compare_router, fun_router, help_router, menu_router, quotes_router,
                       roast_router, stats_router, user_router)
 from handlers.admin import auto_backup_loop, spend_report_loop
@@ -207,8 +209,12 @@ async def main() -> None:
     await db.init()
     config, proxy_problem = await _pick_proxy(config, db)
 
+    # Бета Bot API 10.4 (виджеты: шахматы в личке) — если включена и отвечает; нет — обычный Bot API (tgbeta.py)
+    import tgbeta
+    session, beta_problem = await tgbeta.pick(config, db)
     # Прокси — из .env (BOT_PROXY) или из /setproxy (база); проверен в _pick_proxy, мёртвый — работаем напрямую
-    session = AiohttpSession(proxy=config.proxy) if config.proxy else None
+    if session is None:
+        session = AiohttpSession(proxy=config.proxy) if config.proxy else None
     bot = Bot(
         token=config.token,
         session=session,
@@ -235,12 +241,15 @@ async def main() -> None:
 
     # Команды — только админам (кроме /start); проверка до всех роутеров
     dp.message.outer_middleware(AdminOnlyCommands())
+    # Запросы HTML-виджетов (widget_query, только на бете) — до разбора типа обновления: aiogram их не знает
+    dp.update.outer_middleware(WidgetQueries())
     # admin_router раньше user_router: состояния FSM админа имеют приоритет
     dp.include_router(admin_router)
     dp.include_router(compare_router)
     dp.include_router(bunker_router)
     dp.include_router(mafia_router)
     dp.include_router(chess_router)  # шахматы: инлайн «@бот» в любом чате и /chess
+    dp.include_router(chess_widget_router)  # /chess_widget — шахматы-виджет в личке, вызов через канал
     dp.include_router(blackjack_router)  # блэкджек: /bj — стол в канал
     dp.include_router(user_router)
     dp.include_router(letters_router)   # письма подписчиков в «Письма Волгограда»
@@ -279,10 +288,12 @@ async def main() -> None:
         asyncio.create_task(watchdog.loop()),  # сторож: прокси раз в 5 мин, досылка «не работает / снова работает»
         asyncio.create_task(spend_report_loop(bot, db, config)),  # отчёт о тратах владельцу раз в неделю
         asyncio.create_task(widgets_probe(bot, db)),  # раз в день: пустил ли Telegram виджеты (HTMLBubbles)
+        asyncio.create_task(tgbeta.after_start(bot, db, config, beta_problem)),  # бета: отложенный вызов, сбои
     ]
     try:
         # message_reaction Telegram по умолчанию не присылает — просим все типы, что ловят обработчики
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        # на бете — ещё и запросы виджетов (widget_query)
+        await dp.start_polling(bot, allowed_updates=tgbeta.allowed_updates(dp.resolve_used_update_types()))
     finally:
         for task in background:
             task.cancel()

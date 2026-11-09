@@ -70,7 +70,13 @@ async def cmd_start(message: Message, command: CommandObject, bot: Bot, db: Data
     if user is None:
         return
     await db.add_user(user.id, user.username, user.first_name)
-    if (command.args or "").strip() == "letter":  # ссылка из подписи выпуска «Писем Волгограда»
+    arg = (command.args or "").strip()
+    if arg.startswith("wch_"):  # ссылка-вызов в шахматы-виджет (/chess_widget): первый открывший — соперник
+        from games.chess.widget import join
+
+        await join(bot, db, user, arg[4:])
+        return
+    if arg == "letter":  # ссылка из подписи выпуска «Писем Волгограда»
         from handlers.letters import ask
 
         await ask(bot, user.id)

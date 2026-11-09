@@ -188,3 +188,38 @@ async def probe_loop(bot: Bot, db: Database) -> None:
         except Exception as e:
             logger.warning("widgets probe: %s", e)
         await asyncio.sleep(PROBE_EVERY)
+
+
+@router.message(Command("beta"))
+async def cmd_beta(message: Message, bot: Bot, db: Database) -> None:
+    """/beta — через какой Bot API работает бот; /beta on / off — перейти на бету 10.4 (виджеты) или обратно.
+    Переход — перезапуском (не посреди игр); страховка — в tgbeta.py."""
+    import tgbeta
+    from handlers.admin import _restart_when_free
+
+    if message.from_user is None:
+        return
+    arg = (message.text or "").split(maxsplit=1)[1:]
+    arg = arg[0].strip().lower() if arg else ""
+    on = tgbeta.active()
+    if arg in ("on", "вкл", "да"):
+        if on:
+            await temp_reply(message, "🧪 Уже на бете Bot API 10.4 - виджеты работают.")
+            return
+        await tgbeta.enable(db)
+        await temp_reply(message, "🧪 Перехожу на бету Bot API 10.4 и перезапускаюсь (если идёт игра - после неё). "
+                                  "Не ответит бета - останусь на обычном и напишу.")
+        _restart_when_free()
+        return
+    if arg in ("off", "выкл", "нет"):
+        await tgbeta.disable(db)
+        if not on:
+            await temp_reply(message, "🧪 Бета и так выключена - работаю через обычный Bot API.")
+            return
+        await temp_reply(message, "🧪 Возвращаюсь на обычный Bot API и перезапускаюсь. Шахматы-виджет без беты не "
+                                  "работают.")
+        _restart_when_free()
+        return
+    await temp_reply(message, "🧪 Сейчас: " + ("<b>бета Bot API 10.4</b> - виджеты (шахматы в личке) работают."
+                                               if on else "<b>обычный Bot API</b> - виджетов нет.")
+                     + "\n\n/beta on - на бету (перезапуск)\n/beta off - обратно")
