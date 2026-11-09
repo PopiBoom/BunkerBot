@@ -3898,6 +3898,12 @@ AUTHOR_JOBS = ["кассир в сетевом магазине", "курьер 
                "официант в кафе на Мира", "водитель маршрутки", "мерчендайзер", "ночной продавец в круглосуточном"]
 WATER_EVERY = 6        # примерно один выпуск из шести — у воды
 WATER_MARK = "у воды"  # пометка в истории тем (avoid): прошлый выпуск был у воды — этот нет
+# Звонок в студию: связь обрывается не всегда (владелец 09.11: «чтобы связь не всегда обрывалась; если оборвалась —
+# звук гудка»). Раньше в задании ИИ было «и связь обрывается» — в каждом выпуске. Теперь концовку выбирает код:
+# обрыв — примерно в каждом третьем выпуске и не два подряд (пометка в истории тем); после обрыва в эфире — хрип
+# линии и короткие гудки (radio._busy), без обрыва звонящий договаривает и прощается.
+CALL_DROP = 0.35
+CALL_DROP_MARK = "звонок:обрыв"
 WATER_MAX = 4          # слов про воду в письме не у воды больше этого — одна переделка «без воды»
 _WATER = re.compile(r"\b(?:вод[аеуыо]\w*|мокр\w*|тин[аеуыо]\b|тиной|сырост\w*|сыр(?:ой|ая|ое|ые|ом|ую)\b|волг(?:а|и|у|ой|е)\b|"
                     r"утоп\w*|утон\w*|луж\w*|капл\w*|капа[еюл]\w*|ерик\w*|реки|реку|речк\w*|ила\b|плесен\w*|"
@@ -4082,7 +4088,7 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
                        comments: list[dict] | None = None, motifs: list[str] | None = None) -> dict:
     """Выпуск «Писем Волгограда»: {"title", "subject", "premise", "intro", "paragraphs", "outro", "call", "sfx",
     "music"} (paragraphs — письмо, с пометками интонации для ElevenLabs; call — звонок в студию после письма
-    {"gender", "host_in", "text"}; sfx — звуки по сюжету [{"after", "sound", "secs"}]; music — какую музыку под
+    {"gender", "host_in", "text", "host_back", "after", "drop"} — drop: связь обрывается, в эфире гудки; sfx — звуки по сюжету [{"after", "sound", "secs"}]; music — какую музыку под
     письмо). listener — письмо настоящего подписчика {"text", "sign"} (из него история); comments — комментарии к
     прошлому выпуску [{"name", "text"}] (ведущий зачитывает 1-2); motifs — ключевые детали прошлых выпусков (не
     повторять). Ещё в ответе: "kind" (тема), "format" (письмо / диктофон / дневник / показания), "motifs".
@@ -4110,6 +4116,16 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
               f"({'он' if g == 'm' else 'она'})")
     age = int(re.search(r", (\d+),", author).group(1))
     caller = _random.choice([n for n in AUTHOR_NAMES[cg] if n not in author])
+    call_drop = _random.random() < CALL_DROP and not any(CALL_DROP_MARK in a for a in avoid[-1:])
+    call_end = (
+        "и посреди последней фразы связь обрывается: text кончается на полуслове длинным тире («…он стоит прямо за "
+        "ва—»), без прощания; host_back — ведущий после обрыва, 1-2 фразы: окликает («Алло? Алло…»), понимает, что "
+        "связь пропала, приходит в себя и возвращается к чтению («Сорвалось… Ладно, я дочитаю.»)"
+        if call_drop else
+        "связь НЕ обрывается: звонящий договаривает мысль до конца и сам прощается или кладёт трубку («Всё, мне "
+        "пора. Просто дочитайте до конца.»), последняя фраза законченная; host_back — ведущий после звонка, 1-2 "
+        "фразы: благодарит звонящего, приходит в себя и возвращается к чтению («Спасибо, что позвонили… Ладно, я "
+        "дочитаю.»), без «алло» и «связь пропала»")
     place_facts = await _place_facts(place if not listener else f"{place}; {marks[0]}")
     route = (f"Маршрут автора по городу: живёт — {place}; по ходу истории бывает — {marks[0]}, {marks[1]}. "
              "Называй места так, как говорят местные, по ходу действия («после смены пошёл в торгушку на "
@@ -4178,8 +4194,7 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
         "фразы («Так, стоп, у нас звонок… Алло, вы в эфире?»); text — звонящий, 3-5 фраз, 35-60 слов, живая "
         f"разговорная речь с запинками, как по телефону: его зовут {caller} (gender — {'f' if cg == 'f' else 'm'}); "
         "он знает это место, человека или вещь из истории и говорит что-то жуткое, что меняет её (предупреждает, "
-        "добавляет деталь, которой не было в письме), и связь обрывается; host_back — ведущий после звонка, 1-2 "
-        "фразы, приходит в себя и возвращается к чтению («Ладно… Я дочитаю.»); в host_outro можно вспомнить звонок.\n"
+        "добавляет деталь, которой не было в письме), " + call_end + "; в host_outro можно вспомнить звонок.\n"
         "motifs — 3-5 ключевых деталей и приёмов этой истории (предметы, существа, ходы сюжета), по 1-3 слова.\n"
         "sfx — 2-3 звука по сюжету письма в самых жутких местах: after — ТОЧНО последние 4-7 слов фразы из letter, "
         "после которой звучит звук (фраза про сам звук: стук, домофон, шаги, скрип двери, лифт, звонок телефона, "
@@ -4243,6 +4258,11 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
             if (_HORROR_BAN.search(call_text + " " + call_in + " " + call_back)
                     or len(strip_tags(call_text).split()) < 12):
                 call_text = call_in = ""
+            if call_text and call_drop:  # обрыв — на полуслове: в конце тире (ElevenLabs тогда не «закрывает» фразу)
+                call_text = re.sub(r"[\s.!?…,;:—-]+$", "", call_text) + "—"
+            elif call_text:                # без обрыва — фраза законченная
+                call_text = re.sub(r"\s*[—-]+$", "", call_text)
+                call_text += "" if re.search(r"[.!?…]$", call_text) else "."
             if not call_after or len(paras) > 2 and call_after[-25:].lower() in strip_tags(paras[-1]).lower():
                 # звонок не после последнего абзаца: тогда — после середины письма
                 call_after = " ".join(strip_tags(paras[max(0, len(paras) // 2)]).split()[-6:]) if paras else ""
@@ -4258,12 +4278,16 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
                                 "secs": max(1.0, min(4.0, secs))})
             return {"title": scrub(str(data.get("title", "")).strip())[:60], "subject": subject,
                     "premise": f"{place[:30]} | {marks[0][:25]} | тема:{kind if not listener else 'слушатель'} | "
-                               f"формат:{fkey} | {engine[:40] if not listener else 'письмо слушателя'}"
+                               f"формат:{fkey}"  # пометка обрыва — до приёма: историю тем режут до 160 знаков
+                               f"{' | ' + CALL_DROP_MARK if call_drop and call_text and call_in else ''}"
+                               f" | {engine[:40] if not listener else 'письмо слушателя'}"
                                f"{' | ' + WATER_MARK if wet else ''} | {data.get('premise', '')}", "intro": intro,
                     "outro": outro, "paragraphs": [p for p in paras if not _garbled(p)][:16],
                     "call": {"gender": "f" if str(call.get("gender", "")).lower().startswith("f") else "m",
-                             "host_in": call_in, "text": call_text, "host_back": call_back or "Ладно… Я дочитаю.",
-                             "after": call_after} if call_text and call_in else None,
+                             "host_in": call_in, "text": call_text,
+                             "host_back": call_back or ("Алло? Алло… Сорвалось. Ладно, я дочитаю." if call_drop
+                                                        else "Спасибо, что позвонили… Ладно, я дочитаю."),
+                             "after": call_after, "drop": call_drop} if call_text and call_in else None,
                     "sfx": sfx[:3], "music": scrub(str(data.get("music", "")).strip())[:400],
                     "kind": kind if not listener else "слушатель", "format": fkey, "motifs": motif_list,
                     "author": {"gender": g, "age": age}}

@@ -836,6 +836,7 @@ TUNE_DB = -8.0          # настройка на волну перед пись
 SFX_DB = -4.0        # звук по сюжету — на 4 дБ тише речи письма (полоса телефона), в своей паузе
 MUSIC_DB = -16.0     # музыка ElevenLabs под письмом — в паузах на 16 дБ тише речи (под словами ещё на DUCK_DB)
 RING_DB = -5.0       # звонок студийного телефона — от громкости ведущего
+BUSY_DB = -9.0       # короткие гудки после обрыва связи — от громкости письма (тише звонка: это фон, а не событие)
 CALL_DB = 0.5        # звонящий — чуть громче письма, но тише ведущего
 
 
@@ -913,6 +914,45 @@ def _ring() -> np.ndarray:
     return _peak1(out)
 
 
+def _busy(beeps: int = 4) -> np.ndarray:
+    """Короткие гудки, как после оборванного звонка: 425 Гц (тон российской телефонной сети), 0.35 с гудок /
+    0.35 с тишина, в телефонной полосе и чуть с перегрузом линии."""
+    on, off = int(0.35 * SR), int(0.35 * SR)
+    t = np.arange(on) / SR
+    env = np.minimum(1, t / 0.008) * np.minimum(1, (t[-1] - t) / 0.008)
+    tone = np.tanh(1.6 * np.sin(2 * np.pi * 425 * t)) * env
+    one = np.concatenate([tone, np.zeros(off)]).astype(np.float32)
+    return _peak1(_band(np.tile(one, beeps)[:-off // 2], 300, 3400))
+
+
+def _line_drop(seed: int = 0) -> np.ndarray:
+    """Обрыв связи: голос режется, короткий цифровой хрип линии (рваный шум с щелчками, 0.12 с) и щелчок."""
+    rng = np.random.default_rng(seed + 11)
+    n = int(0.12 * SR)
+    burst = rng.standard_normal(n).astype(np.float32)
+    burst *= (rng.random(n // 240 + 1) > 0.35).repeat(240)[:n]          # рваный: куски шума с дырами
+    burst *= np.exp(-np.arange(n) / (0.06 * SR)).astype(np.float32)
+    burst = _band(burst, 400, 4000)
+    click = np.zeros(int(0.02 * SR), dtype=np.float32)
+    click[:180] = rng.standard_normal(180).astype(np.float32) * np.exp(-np.arange(180) / 30)
+    return _peak1(np.concatenate([_peak1(burst) * np.float32(0.8), click]))
+
+
+def _cut_tail(v: np.ndarray) -> np.ndarray:
+    """Голос без тишины в конце — чтобы обрыв звучал обрывом, а не паузой после фразы."""
+    frame = SR // 100
+    lv = _levels(v, frame)
+    loud = np.nonzero(lv > (lv.max() - 35 if len(lv) else 0))[0]
+    if not len(loud):
+        return v
+    end = min(len(v), (loud[-1] + 1) * frame + int(0.02 * SR))
+    out = v[:end].copy()
+    k = min(len(out), int(0.006 * SR))
+    if k:
+        out[-k:] *= np.linspace(1, 0, k, dtype=np.float32)  # 6 мс — без щелчка цифрового среза, но резко
+    return out
+
+
 def _tape(v: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     """«Расшифровка диктофона»: голос как с карманного диктофона — полоса 180-6500 Гц, лёгкое плавание скорости
     (дрожь ленты), шипение плёнки, мягкий перегруз."""
@@ -945,9 +985,11 @@ def _cut_at(v: np.ndarray, t: float) -> int:
     return (a + min(b - a, int(0.2 * SR / frame))) * frame
 
 
-def _interrupt(chunks: list[np.ndarray], letter_db: float) -> np.ndarray:
+def _interrupt(chunks: list[np.ndarray], letter_db: float, drop: bool = False) -> np.ndarray:
     """Звонок посреди письма (владелец 08.11): тишина, звонок телефона, ведущий прерывается, звонящий (телефон),
-    ведущий возвращается к чтению. chunks — [ведущий, звонящий, ведущий] (48 кГц)."""
+    ведущий возвращается к чтению. chunks — [ведущий, звонящий, ведущий] (48 кГц).
+    drop — связь обрывается (владелец 09.11: «не всегда обрывалась; оборвалась — звук гудка»): голос звонящего
+    режется, хрип линии и короткие гудки, потом ведущий. Без обрыва — звонящий договорил, щелчок положенной трубки."""
     host_in, caller, host_back = (list(chunks) + [np.zeros(0, dtype=np.float32)] * 3)[:3]
     ring = _ring() * np.float32(_db(letter_db + RING_DB) / 0.35)
     out = [np.zeros(int(0.5 * SR), dtype=np.float32), ring, np.zeros(int(0.3 * SR), dtype=np.float32)]
@@ -956,7 +998,19 @@ def _interrupt(chunks: list[np.ndarray], letter_db: float) -> np.ndarray:
             continue
         v = _on_air(_band(v, 70, 11000)) if kind == "host" else _phone(_band(v, 70, 11000))
         v *= np.float32(_db(letter_db + (1.5 if kind == "host" else CALL_DB) - _speech_db(v)))
-        out += [v, np.zeros(int(after * SR), dtype=np.float32)]
+        if kind == "call":
+            level = _db(letter_db + CALL_DB) / 0.35
+            if drop:   # оборвалось: на полуслове — хрип линии — короткие гудки — ведущий
+                out += [_cut_tail(v), _line_drop() * np.float32(level),
+                        np.zeros(int(0.22 * SR), dtype=np.float32),
+                        _busy() * np.float32(_db(letter_db + BUSY_DB) / 0.35),
+                        np.zeros(int(0.45 * SR), dtype=np.float32)]
+                continue
+            click = _line_drop()[-int(0.02 * SR):] * np.float32(level * 0.5)  # трубку положили: только щелчок
+            out += [v, np.zeros(int(0.3 * SR), dtype=np.float32), click]
+        else:
+            out.append(v)
+        out.append(np.zeros(int(after * SR), dtype=np.float32))
     return np.concatenate(out).astype(np.float32)
 
 
@@ -976,12 +1030,14 @@ def _loop(x: np.ndarray, n: int, xf: float = 3.0) -> np.ndarray:
 
 def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed: int = 0,
            sfx: list[tuple[float, np.ndarray]] | None = None, music: np.ndarray | None = None,
-           interrupt: tuple[float, list[bytes]] | None = None, tape: bool = False) -> np.ndarray:
+           interrupt: tuple[float, list[bytes]] | None = None, tape: bool = False,
+           call_drop: bool = False) -> np.ndarray:
     """«Письма Волгограда» как настоящий эфир (float32, 48 кГц, пик ≈ -1 дБ). styles — "host" / "letter" для каждого
     куска голоса ("host_call" — ведущий после звонка телефона, "call" — звонящий в студию, телефонная полоса); sfx —
     звуки по сюжету [(секунда в голосе письма, звук 48 кГц)] — каждый в свою паузу; music — музыка под письмом
     (ElevenLabs; нет — синтезированный фон _pad); interrupt — звонок посреди письма (секунда в голосе письма,
-    [ведущий, звонящий, ведущий]); tape — письмо как с диктофона («расшифровка диктофона»). Ведущий — «эфирный» голос поверх музыкальной подложки; перед письмом — настройка на волну; над
+    [ведущий, звонящий, ведущий]); call_drop — связь со звонящим обрывается (хрип и короткие гудки); tape — письмо
+    как с диктофона («расшифровка диктофона»). Ведущий — «эфирный» голос поверх музыкальной подложки; перед письмом — настройка на волну; над
     письмом — мрачный фон, напряжение и помехи эфира (замирания, шипение, треск, свист, провалы и «чужой голос» в
     паузах), слова не рвутся; перед последней фразой всё стихает — финал в тишине; потом обрыв сигнала и ведущий."""
     rng = np.random.default_rng(seed)
@@ -1007,7 +1063,7 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
             v, placed = _insert_sfx(v, sfx or [])
             if cut_t is not None:
                 cut += sum(len(snd) + int(0.45 * SR) for p, snd in placed if p < cut)  # звуки до звонка сдвинули его
-                ins = _interrupt([_resample(c, rate) for c in interrupt[1]], _speech_db(v))
+                ins = _interrupt([_resample(c, rate) for c in interrupt[1]], _speech_db(v), call_drop)
                 v = np.concatenate([v[:cut], ins, v[cut:]]).astype(np.float32)
                 placed = [(p + (len(ins) if p >= cut else 0), snd) for p, snd in placed]
                 call_span = (cut, cut + len(ins))

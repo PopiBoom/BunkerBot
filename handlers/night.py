@@ -277,7 +277,9 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
         if call:  # в тексте черновика звонок — после того абзаца, где он прозвучит
             key = ai.strip_tags(call["after"]).lower()[-25:]
             at = next((i for i, p in enumerate(body) if key and key in ai.strip_tags(p).lower()), len(body) // 2)
-            body = body[:at + 1] + [f"📞 {call['host_in']}", f"- {call['text']}", f"📞 {call['host_back']}"] + body[at + 1:]
+            body = (body[:at + 1] + [f"📞 {call['host_in']}", f"- {call['text']}"]
+                    + (["📵 связь оборвалась - короткие гудки"] if call.get("drop") else [])
+                    + [f"📞 {call['host_back']}"] + body[at + 1:])
         paragraphs = [ai.strip_tags(p) for p in [intro] + body + [outro]]  # текст черновика — без пометок
         # Озвучка: вступление, письмо ЦЕЛИКОМ, концовка; звонок посреди письма (владелец 08.11) — тремя отдельными
         # кусками (ведущий прерывается, звонящий, ведущий возвращается), radio.studio вклеивает их в паузу письма.
@@ -344,12 +346,14 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
             interrupt = (at if at is not None else letter_secs * 0.55, voice[3:6])
         extras = (f"{story.get('format', 'письмо')}, тема «{story.get('kind', '')}», звуков {len(events)} из "
                   f"{len(story.get('sfx') or [])}, музыка {'ElevenLabs' if music is not None else 'своя'}, звонок "
-                  + (f"посреди письма ({interrupt[0]:.0f} с из {letter_secs:.0f})" if interrupt else "нет")
+                  + (f"посреди письма ({interrupt[0]:.0f} с из {letter_secs:.0f}"
+                     + (", обрыв и гудки)" if call.get("drop") else ", без обрыва)") if interrupt else "нет")
                   + (", метки времени" if ai.letter_alignment[0] else ""))
         logger.info("horror: %s", extras)
         who = f"{who} · {extras}" if who else extras
         mix = await asyncio.to_thread(radio.studio, voice[:3], styles, ai.SPEAK_RATE, int(time.time()), events, music,
-                                      interrupt, story.get("format") == "диктофон")
+                                      interrupt, story.get("format") == "диктофон",
+                                      call_drop=bool(interrupt and call.get("drop")))
     else:       # ночной эфир — «сквозь приёмник», как было
         mix = await asyncio.to_thread(radio.broadcast, voice, ai.SPEAK_RATE, cond["rain"], int(time.time()))
     ogg = await asyncio.to_thread(radio.to_ogg, mix)
