@@ -385,17 +385,6 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
     n = int(await db.get_setting(HORROR_COUNT_KEY if horror else COUNT_KEY, "0") or 0) + 1
     caption = _caption(horror, n, topic, now, cond["caption"], bot_username, story.get("format", "письмо"),
                        author=((letter.get("sign") or "").strip() if letter else None))
-    cover = None
-    if horror:  # обложка-улика (идея №19): конверт / дневник / кассета / бланк — по формату выпуска
-        import cards
-
-        sender = ((letter.get("sign") or "").strip() or "аноним") if letter else "без обратного адреса"
-        try:
-            cover = await asyncio.to_thread(cards.render_horror_cover, story.get("format", "письмо"), n, topic,
-                                            now.strftime("%d.%m.%y"), ai.date_words(now.date()), sender,
-                                            int(time.time()))
-        except Exception:  # noqa: BLE001 — без обложки выпуск всё равно выходит
-            logger.exception("horror: обложка не нарисовалась")
     lore_new = story.get("lore")
     lore_info = {"lore_used": story.get("lore_used"),
                  "lore_new": ({**lore_new, "no": n, "where": _short(str(story.get("place", "")), 80)}
@@ -411,7 +400,7 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
             if t:
                 t.cancel()
         return {"ogg": None, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic,
-                "voice": ai.voice_trouble[0], "cover": cover}
+                "voice": ai.voice_trouble[0]}
     await progress("🎚 Свожу эфир…")
     if horror:  # страшная рубрика — как настоящий FM-эфир из студии
         events, music = [], None
@@ -455,7 +444,7 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
     logger.info("ночной эфир №%s%s: «%s», %.0f сек, голос %s", n, " (страшная история)" if horror else "", topic,
                 len(mix) / radio.SR, who or "?")
     return {"ogg": ogg, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic, "voice": who,
-            "letter": (letter or {}).get("id"), "secs": secs, "cover": cover, **(lore_info if horror else {})}
+            "letter": (letter or {}).get("id"), "secs": secs, **(lore_info if horror else {})}
 
 
 def _kb() -> InlineKeyboardMarkup:
@@ -508,13 +497,6 @@ async def _send_draft(bot: Bot, db: Database, chat_id: int, horror: bool, progre
                                         f"ключа (/setkey yandex или OpenRouter) или сбой озвучки{why}. Это текст.</i>")
         return False
     # какой голос читал (и кто до него не справился) — видно только в черновике, в канал не идёт
-    cover_id = None
-    if ep.get("cover"):  # обложка-улика — над голосовым, как будет в канале
-        try:
-            ph = await bot.send_photo(chat_id, BufferedInputFile(ep["cover"], "cover.jpg"))
-            cover_id = ph.photo[-1].file_id
-        except Exception as e:  # noqa: BLE001
-            logger.info("horror: обложку в черновик не отправил: %s", e)
     voice = BufferedInputFile(ep["ogg"], "night.ogg")
     try:
         msg = await bot.send_voice(chat_id, voice, reply_markup=_kb(), duration=ep.get("secs") or None,
@@ -528,7 +510,7 @@ async def _send_draft(bot: Bot, db: Database, chat_id: int, horror: bool, progre
     await db.set_setting(DRAFT_KEY, json.dumps({"file_id": msg.voice.file_id, "caption": ep["caption"],
                                                 "n": ep["n"], "msg": msg.message_id, "chat": chat_id,
                                                 "horror": horror, "letter": ep.get("letter"),
-                                                "secs": ep.get("secs"), "cover": cover_id,
+                                                "secs": ep.get("secs"),
                                                 "lore_used": ep.get("lore_used"), "lore_new": ep.get("lore_new")},
                                                ensure_ascii=False))
     return True
@@ -641,12 +623,6 @@ async def cb_night(call: CallbackQuery, bot: Bot, db: Database, config: Config) 
         if not channel:
             await call.answer("Не нашёл канал.", show_alert=True)
             return
-        if draft.get("cover"):  # обложка-улика — отдельным постом над голосовым
-            try:
-                ph = await bot.send_photo(channel, draft["cover"])
-                await mark_own(db, ph.message_id)
-            except Exception as e:  # noqa: BLE001 — без обложки выпуск всё равно выходит
-                logger.info("horror: обложку в канал не отправил: %s", e)
         sent = await bot.send_voice(channel, draft["file_id"], caption=draft["caption"],
                                     duration=draft.get("secs") or None)
         await mark_own(db, sent.message_id)

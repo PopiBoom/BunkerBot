@@ -6,7 +6,7 @@ t.me/<бот>?start=gossip (handlers/letters.py, kind="gossip": админ бе�
 голос рубрики, ElevenLabs с пометками интонации; весёлая подложка и «дзынь» между частями — radio.gossip); шансы
 версий в процентах (ai.gossip_story, проценты сводит код к 100). Запуск — /spletni (админ): есть взятые сплетни —
 сначала выбор, из какой делать выпуск; черновик в личку «✅ В канал / 🔄 Переписать / 🗑 Выкинуть»; в канал —
-обложка (жёлтая газета с версиями и процентами, cards.render_gossip_cover) и голосовое с подписью. Собирается под
+голосовое с подписью (картинки к выпускам владелец 09.11 убрал). Собирается под
 тем же замком, что ночной эфир и «Письма» (night._lock): один эфир за раз, и пока собирается — обновление сервера
 ждёт (night.busy() в games._flag_needed).
 """
@@ -68,8 +68,7 @@ def _caption(n: int, story: dict, now: datetime, weather: str, bot_username: str
 
 async def make_episode(db: Database, progress=night._noop, letter: dict | None = None,
                        bot_username: str = "") -> dict:
-    """{"ogg", "paragraphs", "caption", "n", "topic", "voice", "secs", "cover", "letter"}; без голоса — ogg None."""
-    import cards
+    """{"ogg", "paragraphs", "caption", "n", "topic", "voice", "secs", "letter"}; без голоса — ogg None."""
     import radio
 
     await progress("✍️ Собираю сплетни и пишу выпуск…")
@@ -93,19 +92,13 @@ async def make_episode(db: Database, progress=night._noop, letter: dict | None =
     n = int(await db.get_setting(COUNT_KEY, "0") or 0) + 1
     author = ((letter.get("sign") or "").strip() if letter else None)
     caption = _caption(n, story, now, cond["caption"], bot_username, author)
-    cover = None
-    try:
-        cover = await asyncio.to_thread(cards.render_gossip_cover, n, topic,
-                                        [(v["short"], v["chance"]) for v in story["versions"]], now.strftime("%d.%m.%y"))
-    except Exception:  # noqa: BLE001 — без обложки выпуск всё равно выходит
-        logger.exception("gossip: обложка не нарисовалась")
 
     async def step(i: int, total: int, who: str) -> None:
         await progress(f"🎙 Озвучиваю: {i} из {total} · {who}")
 
     voice = await ai.narrate_all(chunks, ["host"] * len(chunks), horror=True, progress=step)
     who = ai.last_voice[0] + (f" (не вышло: {ai.voice_trouble[0]})" if ai.voice_trouble[0] else "")
-    base = {"paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic, "cover": cover,
+    base = {"paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic,
             "letter": (letter or {}).get("id")}
     if not voice:
         return {**base, "ogg": None, "voice": ai.voice_trouble[0]}
@@ -151,13 +144,6 @@ async def _send_draft(bot: Bot, db: Database, chat_id: int, progress, letter_id:
         await bot.send_message(chat_id, f"{ep['caption']}\n\n{html.escape(text[:2800])}\n\n<i>Озвучить не вышло{why}. "
                                         "Это текст.</i>", disable_web_page_preview=True)
         return False
-    cover_id = None
-    if ep.get("cover"):  # обложка — над голосовым, как будет в канале
-        try:
-            ph = await bot.send_photo(chat_id, BufferedInputFile(ep["cover"], "gossip.jpg"))
-            cover_id = ph.photo[-1].file_id
-        except Exception as e:  # noqa: BLE001
-            logger.info("gossip: обложку в черновик не отправил: %s", e)
     voice = BufferedInputFile(ep["ogg"], "gossip.ogg")
     try:
         msg = await bot.send_voice(chat_id, voice, reply_markup=_kb(), duration=ep.get("secs") or None,
@@ -170,7 +156,7 @@ async def _send_draft(bot: Bot, db: Database, chat_id: int, progress, letter_id:
                                    caption=night._cut_vis(re.sub(r"<[^>]+>", "", ep["caption"]), 900))
     await db.set_setting(DRAFT_KEY, json.dumps({"file_id": msg.voice.file_id, "caption": ep["caption"], "n": ep["n"],
                                                 "msg": msg.message_id, "chat": chat_id, "letter": ep.get("letter"),
-                                                "secs": ep.get("secs"), "cover": cover_id}, ensure_ascii=False))
+                                                "secs": ep.get("secs")}, ensure_ascii=False))
     return True
 
 
@@ -272,12 +258,6 @@ async def cb_draft(call: CallbackQuery, bot: Bot, db: Database, config: Config) 
             await call.answer("Не нашёл канал.", show_alert=True)
             return
         await db.set_setting(DRAFT_KEY, "")  # сразу: второе нажатие не опубликует второй раз
-        if draft.get("cover"):  # обложка — отдельным постом над голосовым
-            try:
-                ph = await bot.send_photo(channel, draft["cover"])
-                await mark_own(db, ph.message_id)
-            except Exception as e:  # noqa: BLE001
-                logger.info("gossip: обложку в канал не отправил: %s", e)
         sent = await bot.send_voice(channel, draft["file_id"], caption=draft["caption"],
                                     duration=draft.get("secs") or None)
         await mark_own(db, sent.message_id)
