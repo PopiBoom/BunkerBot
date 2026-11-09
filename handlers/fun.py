@@ -475,7 +475,7 @@ async def cmd_voice(message: Message, bot: Bot, db: Database) -> None:
         return
     # не временное: все в чате должны видеть, что бот в войсе и слушает
     await bot.send_message(chat_id, "🎙 Пиздюк в войсе и всех слышит. Зовите «Пиздюк, …» - отвечу голосом, "
-                                    "иногда встряну сам. Выгнать - /voice_stop.")
+                                    "ответите мне - продолжу разговор, иногда встряну сам. Выгнать - /voice_stop.")
 
 
 @router.message(Command("voice_stop"))

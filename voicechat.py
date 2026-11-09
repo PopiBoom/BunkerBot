@@ -8,9 +8,12 @@
 
 Слух: py-tgcalls отдаёт звук КАЖДОГО участника отдельно (ssrc → user_id по списку участников звонка). Речь режем
 по паузам (громкость кадра 10 мс), кусок → WAV → ai.transcribe (Gemini через OpenRouter) → в память чата
-строкой «[войс: …]» от имени говорившего. Отвечает: позвали по имени («Пиздюк, …») — всегда, иначе изредка
-(REPLY_CHANCE, не чаще REPLY_GAP). Ответ — Claude (ai.voice_reply, характер Пиздюка), озвучка — ai.speak
-(gpt-audio-mini через OpenRouter, PCM 24 кГц) → кадрами по 10 мс в звонок. Озвучить не вышло — текстом в чат.
+строкой «[войс: …]» от имени говорившего. Отвечает: позвали по имени («Пиздюк, …») — всегда; ответили ему сразу
+после его фразы (FOLLOW_WINDOW) — почти всегда, как в живом разговоре (09.11 владелец: «чтобы общался с нами»); иначе
+изредка (REPLY_CHANCE, не чаще REPLY_GAP). Ответ — Claude (ai.voice_reply, характер Пиздюка), озвучка — голосом из
+/golos (ai.roast_speech: ElevenLabs v4 с пометками интонации и настроением, PCM 24 кГц; владелец 09.11: «чтобы в
+войсе был голос, который в /golos»), нет ElevenLabs — ai.speak (gpt-audio-mini через OpenRouter) → кадрами по
+10 мс в звонок. Озвучить не вышло — текстом в чат.
 Звук только в памяти процесса — записи не сохраняются, в базу идёт только текст (как у голосовых).
 
 Тяжёлые библиотеки импортируются лениво: без них (или без настроек) бот работает как раньше, /voice скажет,
@@ -38,8 +41,11 @@ SPEECH_LEVEL = 450           # средняя громкость кадра (0..
 END_SILENCE = 0.8            # сек тишины — фраза кончилась
 MIN_SPEECH = 0.6             # сек речи в куске — короче не слушаем (кашель, «а»)
 MAX_UTTER = 20.0             # сек — длинный монолог режем на куски
-REPLY_CHANCE = 0.2           # сам встревает: 1 из 5 фраз (если не звали)…
-REPLY_GAP = 40.0             # …и не чаще раза в 40 сек
+REPLY_CHANCE = 0.3           # сам встревает: ≈ 1 из 3 фраз (если не звали)…
+REPLY_GAP = 30.0             # …и не чаще раза в 30 сек
+FOLLOW_WINDOW = 20.0         # сек после его фразы: ответ на неё — продолжение разговора с ним
+FOLLOW_CHANCE = 0.85         # тот, кому он ответил, сказал следующее — отвечает почти всегда
+FOLLOW_OTHERS = 0.5          # кто-то другой подхватил сразу после него — через раз
 MAX_SESSION = 3 * 3600       # дольше 3 ч в войсе не сидит (и не держит обновления сервера)
 ALONE_TIMEOUT = 3 * 60       # остался один — через 3 мин выходит
 LEAD = 0.04                  # сек: на сколько озвучка опережает реальное время (запас от рывков)
@@ -77,6 +83,8 @@ class Session:
     who_at: float = 0.0
     alone_since: float = 0.0
     last_spoke: float = 0.0
+    last_end: float = 0.0           # когда договорил последнюю фразу
+    last_to: int = 0                # кому отвечал
     speak_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     hear_sem: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(3))
     tasks: list = field(default_factory=list)
@@ -329,6 +337,9 @@ async def _hear(s: Session, ssrc: int, pcm: bytes) -> None:
     except Exception as e:
         logger.debug("voice memory failed: %s", e)
     addressed = bool(R._BOT_NAME.search(text))
+    if not addressed and time.time() - s.last_end < FOLLOW_WINDOW and not s.speak_lock.locked():
+        # только что говорил сам — ответ ему: разговор продолжается, как вживую
+        addressed = random.random() < (FOLLOW_CHANCE if uid and uid == s.last_to else FOLLOW_OTHERS)
     if not addressed:
         if (random.random() >= REPLY_CHANCE or time.time() - s.last_spoke < REPLY_GAP
                 or len(text.split()) < 4 or s.speak_lock.locked()):
@@ -361,8 +372,12 @@ async def _reply(s: Session, uid: int, name: str, said: str, addressed: bool) ->
         if is_father:
             text = ai.vary_father(text)
         text = ai.scrub(text)
-        pcm = await ai.speak(text)
+        await R._set_voice_mood(s.chat_id, bool(R._RUDE.search(said)), is_father)
+        pcm = await ai.roast_speech(text)  # голос из /golos (ElevenLabs), с интонацией
+        if not pcm:
+            pcm = await ai.speak(text)  # нет ElevenLabs — запасной голос OpenRouter
         s.last_spoke = time.time()
+        s.last_to = uid
         s.lines.append((R.BOT_SELF, text))
         try:
             await s.db.add_chat_message(s.chat_id, 0, 0, R.BOT_SELF, None, f"[войс: {text}]"[:1000])
@@ -370,6 +385,7 @@ async def _reply(s: Session, uid: int, name: str, said: str, addressed: bool) ->
             logger.debug("voice memory failed: %s", e)
         if pcm:
             await _play(s, pcm)
+            s.last_end = time.time()
         else:  # озвучка не вышла — хотя бы текстом, чтобы ответ не пропал
             try:
                 await s.bot.send_message(s.chat_id, f"🎙 {html.escape(text)}")
