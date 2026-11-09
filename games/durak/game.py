@@ -472,7 +472,9 @@ def view(st: dict, uid: int) -> str:
         v["o"] = [[_nm(st, u)[:NAME_LEN], len(_hand(st, u)), _flags(st, u, who)] + ([act[1]] if act and act[0] == u
                                                                                     else []) for u in others]
         if who:
-            v["w"] = [left, full]
+            # + когда записано: виджет пересоздаётся при каждом входе в чат и иначе начинал отсчёт заново (владелец 09.11:
+            # «кружочек времени при выходе и входе становится на прежнее место»)
+            v["w"] = [left, full, int(time.time())]
             if uid in who:
                 v["tw"] = 1
         if act:
