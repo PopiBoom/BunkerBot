@@ -851,17 +851,17 @@ async def on_channel_post(message: Message, bot: Bot, db: Database, config=None)
     owner = _father_id(config or (_cfg_ref[0] if _cfg_ref else None))
     if ctx["post"] and owner:
         # Пост в канале — не отвечаем сами, а спрашиваем владельца в личке (09.11: «надо, чтобы он не всегда отвечал
-        # на мои сообщения в канале; пусть после каждого поста приходит мне в лс — начать генерацию ответа»), и не
-        # про каждый пост, а про каждый ASK_EVERY-й (09.11: «не надо, чтобы он комментировал каждую запись; пусть
-        # каждую 7-ю»); остальные — только в память
-        no = int(await db.get_setting(POST_NO_KEY, "0") or 0) + 1
-        await db.set_setting(POST_NO_KEY, str(no))
-        if no % ASK_EVERY == 0:
-            await _ask_owner(bot, db, ctx, owner)
-        else:
-            logger.info("пост канала %s: №%d — спрошу на каждом %d-м, этот пропускаю", ctx["post"], no, ASK_EVERY)
+        # на мои сообщения в канале; пусть после каждого поста приходит мне в лс — начать генерацию ответа»)
+        await _ask_owner(bot, db, ctx, owner)
         return
-    await asyncio.sleep(random.uniform(3.0, 6.0))  # «прочитал» (сообщение бати от имени канала в комментариях)
+    # Сообщение бати от имени канала в комментариях — отвечаем только на каждое COMMENT_EVERY-е (09.11: «не надо, чтобы
+    # он комментировал каждую запись в комментариях; пусть каждую 7-ю»); остальные — только в память
+    no = int(await db.get_setting(COMMENT_NO_KEY, "0") or 0) + 1
+    await db.set_setting(COMMENT_NO_KEY, str(no))
+    if no % COMMENT_EVERY:
+        logger.info("коммент бати от имени канала: №%d — отвечаю на каждый %d-й, этот пропускаю", no, COMMENT_EVERY)
+        return
+    await asyncio.sleep(random.uniform(3.0, 6.0))  # «прочитал»
     await _post_reply(bot, db, ctx, spoken=False)
 
 
@@ -978,8 +978,8 @@ async def _channel_voice_reply(bot: Bot, db: Database, ctx: dict, text: str) -> 
 # ---------- ответ на пост канала — по кнопке владельца в личке ----------
 
 ASK_KEY = "channel_reply_ask"  # посты, о которых спросили владельца: {"<чат>_<сообщение>": контекст}
-ASK_EVERY = 7                  # спрашиваем про каждый 7-й пост канала (владелец 09.11)
-POST_NO_KEY = "channel_post_no"  # счёт постов канала бати (свои посты бота не считаются)
+COMMENT_EVERY = 7              # на сообщения бати от имени канала в комментариях — отвечаем на каждое 7-е (09.11)
+COMMENT_NO_KEY = "channel_comment_no"  # их счёт
 ASK_KEEP = 20                  # помним последние N постов
 ASK_TTL = 3 * 24 * 3600        # старше — кнопка уже неактуальна
 
