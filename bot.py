@@ -40,6 +40,7 @@ from handlers.letters import router as letters_router
 from handlers.news import router as news_router
 from handlers.rant import observe as rant_observe
 from handlers.rant import router as rant_router
+from handlers.widgets import probe_loop as widgets_probe
 from handlers.widgets import router as widgets_router
 from handlers.night import router as night_router
 from handlers.protocol import router as protocol_router
@@ -277,6 +278,7 @@ async def main() -> None:
         asyncio.create_task(flag_loop()),  # флаг «идёт игра»: пока он свежий, сервер не обновляется
         asyncio.create_task(watchdog.loop()),  # сторож: прокси раз в 5 мин, досылка «не работает / снова работает»
         asyncio.create_task(spend_report_loop(bot, db, config)),  # отчёт о тратах владельцу раз в неделю
+        asyncio.create_task(widgets_probe(bot, db)),  # раз в день: пустил ли Telegram виджеты (HTMLBubbles)
     ]
     try:
         # message_reaction Telegram по умолчанию не присылает — просим все типы, что ловят обработчики

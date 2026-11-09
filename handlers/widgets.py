@@ -8,17 +8,27 @@ CSS и JS (≤ 32 КБ, ≤ 4 КБ сжатого zlib), без сети; бот
 `https://api.telegram.org/beta` в тестовом окружении. Работает ли бета с обычным (не тестовым) ботом — в документации
 не сказано, поэтому /widget просто пробует: сначала обычный Bot API, потом бету, и пишет, что ответил Telegram.
 Заработало — дальше виджеты (шахматы и т.п.) можно слать уже сейчас; нет — ждать 10.4.
+
+Первая живая проверка 09.11 (в группе): обычный Bot API — метода нет, бета — `INPUT_MEDIA_WIDGET_NOT_ALLOWED`. Значит,
+бета с обычным ботом РАБОТАЕТ (запрос дошёл до серверов Telegram), а отказ — по типу чата: какие чаты разрешены, решает
+настройка сервера (tgw-format.md, «Who may send»). Поэтому /widget в группе пробует и группу, и личку того, кто вызвал, и
+пишет ответ по каждому; а `probe_loop` раз в день тихо пробует личку владельца — пустили, и виджет придёт сам вместе с
+сообщением «виджеты заработали» (настройка `widgets_ok`), не пустили — ничего никуда не шлёт.
 """
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
+import os
 import zlib
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
+from database import Database
 from ephemeral import temp_reply
 
 logger = logging.getLogger("widgets")
@@ -27,6 +37,10 @@ router = Router(name="widgets")
 SERVERS = (("обычный Bot API", "https://api.telegram.org"), ("бета Bot API 10.4", "https://api.telegram.org/beta"))
 MAX_HTML = 32768      # байт без сжатия
 MAX_ZLIB = 4096       # байт сжатого (сервер считает как PHP gzcompress($html, 9))
+OK_KEY = "widgets_ok"          # куда уже пустили: «private», «group» (пусто — никуда)
+PROBE_KEY = "widgets_probe"    # день последней тихой проверки
+PROBE_EVERY = 6 * 3600         # как часто фон смотрит, не пора ли проверить
+MSK = timezone(timedelta(hours=3))
 
 # Пробный виджет: счётчик нажатий (хранится на устройстве, у каждого сообщения свой), цвета темы Telegram, отдача
 # вибрацией. Без запросов к боту — их обычный Bot API всё равно не доставит, пока нет 10.4.
@@ -88,23 +102,89 @@ async def send_widget(bot: Bot, chat_id: int, html: str, **fields) -> tuple[str,
     return last
 
 
+def _owner() -> int:
+    raw = os.getenv("BOT_FATHER_ID", "") or os.getenv("ADMIN_IDS", "").replace(";", ",").split(",")[0]
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return 0
+
+
+def _why(data: dict) -> str:
+    return html.escape(str(data.get("description") or "без объяснений"))
+
+
+async def _mark_ok(db: Database, where: str) -> None:
+    have = set(filter(None, (await db.get_setting(OK_KEY, "") or "").split(",")))
+    await db.set_setting(OK_KEY, ",".join(sorted(have | {where})))
+
+
 @router.message(Command("widget"))
-async def cmd_widget(message: Message, bot: Bot) -> None:
-    """/widget — пробный HTML-виджет сюда: проверка, шлёт ли Telegram виджеты от бота уже сейчас."""
+async def cmd_widget(message: Message, bot: Bot, db: Database) -> None:
+    """/widget — пробный HTML-виджет: в этот чат, а из группы — ещё и в личку тому, кто вызвал. Ответ Telegram по
+    каждому — ему в личку."""
     raw, packed = sizes(TEST_HTML)
     if raw > MAX_HTML or packed > MAX_ZLIB:
         await temp_reply(message, f"Пробный виджет великоват: {raw} Б / {packed} Б сжатого.")
         return
-    label, data = await send_widget(bot, message.chat.id, TEST_HTML)
-    if data.get("ok"):
-        text = (f"🫧 Виджет ушёл через {label} ({raw} Б, сжатого {packed} Б). Открылся счётчик с кнопкой «Тыкни» — "
-                "значит, можно делать шахматы и остальное виджетами уже сейчас. Видишь файл или пусто — обнови Telegram "
-                "до 13.2.")
+    private = message.chat.type == "private"
+    targets = [("в личку" if private else "в группу", message.chat.id, "private" if private else "group")]
+    if not private and message.from_user:
+        targets.append(("в личку", message.from_user.id, "private"))
+    lines, worked = [], []
+    for where, chat_id, kind in targets:
+        label, data = await send_widget(bot, chat_id, TEST_HTML)
+        if data.get("ok"):
+            worked.append(where)
+            await _mark_ok(db, kind)
+            lines.append(f"✅ {where} - ушёл ({label})")
+        else:
+            lines.append(f"❌ {where} - {_why(data)}")
+    if worked:
+        head = (f"🫧 Виджеты работают ({', '.join(worked)})! Счётчик «Тыкни» пришёл - можно делать шахматы и остальное "
+                "виджетами. Видишь файл или пусто - обнови Telegram до 13.2.")
+    elif all("NOT_ALLOWED" in ln for ln in lines):
+        head = ("🫧 Бета Bot API 10.4 с нашим ботом работает, но Telegram пока не пускает ботов с виджетами в эти чаты "
+                "(INPUT_MEDIA_WIDGET_NOT_ALLOWED - это настройка на их стороне). Раз в день проверяю сам: как пустят - "
+                "пришлю виджет в личку.")
     else:
-        why = html.escape(str(data.get("description") or "без объяснений"))
-        text = (f"🫧 Telegram пока не даёт боту слать виджеты: {why} (пробовал обычный Bot API и бету 10.4). "
-                "Ждём Bot API 10.4 — как выйдет, /widget покажет.")
+        head = "🫧 Telegram пока не даёт боту слать виджеты. Раз в день проверяю сам: как пустят - пришлю виджет в личку."
+    text = head + "\n\n" + "\n".join(lines)
     try:
         await bot.send_message(message.from_user.id if message.from_user else message.chat.id, text)
     except Exception:
         await temp_reply(message, text)
+
+
+async def probe_once(bot: Bot, db: Database) -> bool:
+    """Тихая проверка: пробный виджет владельцу в личку. True — пустили (виджет у него, плюс сообщение)."""
+    owner = _owner()
+    if not owner:
+        return False
+    label, data = await send_widget(bot, owner, TEST_HTML)
+    if not data.get("ok"):
+        logger.info("виджеты пока нельзя: %s", data.get("description", ""))
+        return False
+    await _mark_ok(db, "private")
+    try:
+        await bot.send_message(owner, f"🫧 Виджеты заработали ({label})! Выше - пробный счётчик «Тыкни». Теперь можно "
+                                      "делать шахматы и остальное виджетами - напиши мне в сессию.")
+    except Exception as e:
+        logger.info("widgets: не смог написать владельцу: %s", e)
+    return True
+
+
+async def probe_loop(bot: Bot, db: Database) -> None:
+    """Из bot.py: раз в день (днём, 12-20 МСК), пока виджеты в личку не пустили, — `probe_once`."""
+    await asyncio.sleep(120)  # дать боту запуститься
+    while True:
+        try:
+            now = datetime.now(MSK)
+            today = now.strftime("%Y-%m-%d")
+            done = "private" in (await db.get_setting(OK_KEY, "") or "")
+            if not done and 12 <= now.hour < 20 and (await db.get_setting(PROBE_KEY, "")) != today:
+                await db.set_setting(PROBE_KEY, today)
+                await probe_once(bot, db)
+        except Exception as e:
+            logger.warning("widgets probe: %s", e)
+        await asyncio.sleep(PROBE_EVERY)
