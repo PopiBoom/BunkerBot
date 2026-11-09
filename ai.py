@@ -3210,10 +3210,24 @@ def _words_kept(a: str, b: str) -> bool:
     return w(a) == w(b)
 
 
+# Настроение голоса по ситуации (владелец 08.11: «настроение по ситуации»): его ставит roast._set_voice_mood перед
+# ответом — срач (орёт), ночь (тише, лениво), батя (по-сыновьи), обычное. Haiku учитывает его вместе со смыслом слов,
+# скорость речи — отсюда же.
+voice_mood: contextvars.ContextVar[str] = contextvars.ContextVar("voice_mood", default="")
+VOICE_MOODS = {
+    "срач": ("в чате срач, все на эмоциях — громче и злее, можно орать: [shouts], [angry], [frustrated]", 1.1),
+    "ночь": ("глубокая ночь — тише, лениво, сонно, но разборчиво и без шёпота: [tired], [lazily], [sighs]", 0.95),
+    "батя": ("отвечает бате — по-сыновьи: дерзко, но тепло, с ухмылкой: [warmly], [chuckles], [mischievously]",
+             1.05),
+}
+
+
 async def voice_tags(text: str) -> str:
     """Реплика с пометками интонации; Haiku поменял слова или не ответил — та же реплика без пометок."""
+    mood = VOICE_MOODS.get(voice_mood.get())
+    user = (f"Настроение ситуации (учти вместе со смыслом слов): {mood[0]}.\nРеплика:\n{text}" if mood else text)
     try:
-        out = (await _complete(ROAST_TAGS_SYSTEM, text, max_tokens=600, fast=True)).strip().strip("«»\"")
+        out = (await _complete(ROAST_TAGS_SYSTEM, user, max_tokens=600, fast=True)).strip().strip("«»\"")
     except AIUnavailable:
         raise
     except Exception as e:
@@ -3255,8 +3269,9 @@ async def roast_speech(text: str, mock_quotes: bool = True) -> bytes:
     tagged = text if _TAG.search(text) else await voice_tags(text)  # пометки уже есть — не трогаем
     if mock_quotes:
         tagged = voice_quotes(tagged)
+    speed = VOICE_MOODS.get(voice_mood.get(), ("", 1.05))[1]
     for vid in roast_voices():
-        pcm = await eleven_speak(tagged, horror=True, voice=vid, speed=1.05)
+        pcm = await eleven_speak(tagged, horror=True, voice=vid, speed=speed)
         if pcm:
             return pcm
         if _eleven_code[0] in _ELEVEN_FINAL or eleven_geo_blocked():

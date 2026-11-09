@@ -534,6 +534,25 @@ async def _voice_said(db: Database, chat_id: int, msg_id: int) -> str:
     return re.sub(r"^\[голосом\]\s*", "", row[1] or "") if row else ""
 
 
+HEATED_MSGS = 10  # столько сообщений людей за 2 минуты — «срач»: голосом орёт
+
+
+async def _set_voice_mood(chat_id: int, rude: bool = False, is_father: bool = False) -> None:
+    """Настроение голоса по ситуации (владелец 08.11): срач или наезд на бота — орёт, батя — по-сыновьи, ночь
+    (0-6 МСК) — тише и лениво; иначе — по смыслу слов (ai.voice_mood, читает ai.roast_speech)."""
+    mood = "срач" if rude else ""
+    if not mood and _db_ref:
+        try:
+            rows = await _db_ref[0].recent_messages(chat_id, limit=HEATED_MSGS, since=int(time.time()) - 120)
+            if len([r for r in rows if r[1] > 0]) >= HEATED_MSGS:
+                mood = "срач"
+        except Exception as e:
+            logger.debug("voice mood: %s", e)
+    if not mood:
+        mood = "батя" if is_father else "ночь" if datetime.now(MSK).hour < 6 else ""
+    ai.voice_mood.set(mood)
+
+
 async def voice_note(text: str, mock_quotes: bool = True) -> tuple[bytes, int] | None:
     """Реплика Пиздюка голосовым сообщением: (OGG/Opus, секунд) или None — нет ElevenLabs / не озвучилось.
     Голос — тот, что в /golos; интонацию расставляет ai.roast_speech. mock_quotes=False — цитаты не передразнивать
@@ -1001,6 +1020,7 @@ async def cmd_golos(message: Message, command: CommandObject, bot: Bot, db: Data
         return
     if is_father:
         answer = ai.vary_father(answer)
+    await _set_voice_mood(chat_id, False, is_father)
     await _say_human(bot, chat_id, answer, reply_to=rt.message_id, voice=True, to_user=who.id)
 
 
@@ -1433,6 +1453,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
                 logger.warning("comeback failed: %s", e)
         if not _why.get():
             _mark("послали - зеркалка")
+        if voice:
+            await _set_voice_mood(chat_id, True, is_father)
         await _say_human(bot, chat_id, ai.vary_father(answer) if is_father else answer,
                          reply_to=last_msg.message_id, voice=voice,
                          to_user=who.id if who else None)
@@ -1464,6 +1486,8 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     if answer and is_father:
         answer = ai.vary_father(answer)
     if answer:
+        if voice:
+            await _set_voice_mood(chat_id, rude, is_father)
         await _say_human(bot, chat_id, answer, reply_to=last_msg.message_id,
                          voice=voice, to_user=who.id if who else None)
         if who:
@@ -2206,7 +2230,10 @@ async def _auto_roast(bot: Bot, db: Database, chat_id: int) -> None:
         if chat_id in _pending or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
             return
         if text:
-            await _say_human(bot, chat_id, text, reply_to=reply_to, voice=_roll_voice(chat_id),
+            speak = _roll_voice(chat_id)
+            if speak:
+                await _set_voice_mood(chat_id, False, is_father)
+            await _say_human(bot, chat_id, text, reply_to=reply_to, voice=speak,
                              to_user=target[1] if target[1] > 0 else None)
 
 
