@@ -245,7 +245,14 @@ def take(st: dict, uid: int) -> str | None:
         return "Нечего брать"
     st["taking"] = True
     st["passed"] = []
+    _act(st, uid, "Беру")
     return None
+
+
+def _act(st: dict, uid: int, label: str) -> None:
+    """Последнее действие игрока — облачко у его имени на столах соперников (владелец 09.11, идея №3)."""
+    st["seq"] = st.get("seq", 0) + 1
+    st["act"] = [uid, label, st["seq"], time.time()]
 
 
 def pass_(st: dict, uid: int) -> str | None:
@@ -257,6 +264,7 @@ def pass_(st: dict, uid: int) -> str | None:
         return f"Ждём, пока {_nm(st, st['dfd'])} отобьётся"
     if uid not in st["passed"]:
         st["passed"].append(uid)
+        _act(st, uid, "Пас" if st["taking"] else "Бито")
     return None
 
 
@@ -381,13 +389,28 @@ def _status(st: dict, uid: int) -> str:
     return "Ждём остальных" if wait else "Отбился. Подкинь или «Бито»" if can else "Отбился - жми «Бито»"
 
 
-def _flags(st: dict, u: int) -> str:
+def _waited(st: dict) -> tuple[list[int], int, int]:
+    """Кого ждём, сколько секунд осталось и сколько было всего — для таймера на столе (владелец 09.11, идея №1)."""
+    if st.get("phase") != "play" or not st.get("due"):
+        return [], 0, 0
+    if not st["table"]:
+        who, full = [st["att"]], TURN
+    elif _unbeaten(st) and not st["taking"]:
+        who, full = [st["dfd"]], TURN
+    else:
+        who = [u for u in _throwers(st) if u not in st["passed"]] if _room(st) > 0 else []
+        full = TURN if st["att"] in who and not st["taking"] else GRACE
+    return who, max(0, round(st["due"] - time.time())), full
+
+
+def _flags(st: dict, u: int, who: list[int] = ()) -> str:
     if st["phase"] == "lobby":
         return "h" if u == st["host"] else ""
     f = "x" if u in st["out"] else ""
     if st["phase"] == "play":
         f += "a" if u == st["att"] else "d" if u == st["dfd"] else ""
         f += "p" if u in st["passed"] else ""
+        f += "t" if u in who else ""
     return f
 
 
@@ -403,7 +426,17 @@ def view(st: dict, uid: int) -> str:
     else:
         i = ids.index(uid) if uid in ids else -1
         others = [ids[(i + k) % len(ids)] for k in range(1, len(ids))] if i >= 0 else ids
-        v["o"] = [[_nm(st, u)[:NAME_LEN], len(_hand(st, u)), _flags(st, u)] for u in others]
+        who, left, full = _waited(st)
+        act = st.get("act")
+        act = act if act and time.time() - act[3] < 5 else None  # облачко живёт секунды — старое не показываем
+        v["o"] = [[_nm(st, u)[:NAME_LEN], len(_hand(st, u)), _flags(st, u, who)] + ([act[1]] if act and act[0] == u
+                                                                                    else []) for u in others]
+        if who:
+            v["w"] = [left, full]
+            if uid in who:
+                v["tw"] = 1
+        if act:
+            v["q"] = act[2]
         v["h"] = "".join(_sorted(_hand(st, uid), st["trump"][1])) if st.get("hands") else ""
         v["t"] = "".join(a + (d or "--") for a, d in st.get("table", []))
         if st.get("trump"):
