@@ -28,7 +28,7 @@ import os
 import time
 from typing import Any
 
-from aiogram import Bot
+from aiogram import BaseMiddleware, Bot
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.methods.base import TelegramMethod
@@ -195,8 +195,40 @@ async def after_start(bot: Bot, db, config, problem: str) -> None:
             from games.chess import widget
 
             await widget.create(bot, db, user, job.get("name") or "")
+        elif job.get("kind") == "durak":
+            from games.durak import game as durak
+
+            await durak.create(bot, db, user, job.get("name") or "")
     except Exception:  # noqa: BLE001 — бот работает и без этого
         logger.exception("бета: действие после запуска не вышло")
+
+
+# ---------- запросы виджетов ----------
+
+_widget_handlers: list[tuple[str, Any]] = []
+
+
+def on_widget(prefix: str, handler) -> None:
+    """Кто разбирает запросы виджетов — по началу data: «u» — дурак, «» — остальное (шахматы)."""
+    _widget_handlers.append((prefix, handler))
+    _widget_handlers.sort(key=lambda h: -len(h[0]))
+
+
+class WidgetQueries(BaseMiddleware):
+    """Обновление widget_query (Bot API 10.4) aiogram не знает: ловим его до разбора типа обновления
+    (outer middleware dp.update) и отдаём игре по началу data."""
+
+    async def __call__(self, handler, event, data: dict):
+        q = (getattr(event, "model_extra", None) or {}).get("widget_query")
+        if q is None:
+            return await handler(event, data)
+        if isinstance(q, dict) and data.get("bot") is not None and data.get("db") is not None:
+            text = str(q.get("data") or "")
+            for prefix, func in _widget_handlers:
+                if text.startswith(prefix):
+                    await func(data["bot"], data["db"], q)
+                    break
+        return None
 
 
 # ---------- методы Bot API 10.4, которых нет в aiogram ----------

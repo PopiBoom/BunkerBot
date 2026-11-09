@@ -28,8 +28,9 @@ from games import bunker_router, flag_loop, hush, mafia_router, note_channel_pos
 from games.blackjack import router as blackjack_router
 from games.chess import router as chess_router
 from games.chess.game import note_forward as note_chess_forward
-from games.chess.widget import WidgetQueries
 from games.chess.widget import router as chess_widget_router
+from games.durak import router as durak_router
+from games.durak import ticker as durak_ticker
 from handlers import (admin_router, compare_router, fun_router, help_router, menu_router, quotes_router,
                       roast_router, stats_router, user_router)
 from handlers.admin import auto_backup_loop, spend_report_loop
@@ -242,7 +243,7 @@ async def main() -> None:
     # Команды — только админам (кроме /start); проверка до всех роутеров
     dp.message.outer_middleware(AdminOnlyCommands())
     # Запросы HTML-виджетов (widget_query, только на бете) — до разбора типа обновления: aiogram их не знает
-    dp.update.outer_middleware(WidgetQueries())
+    dp.update.outer_middleware(tgbeta.WidgetQueries())
     # admin_router раньше user_router: состояния FSM админа имеют приоритет
     dp.include_router(admin_router)
     dp.include_router(compare_router)
@@ -250,6 +251,7 @@ async def main() -> None:
     dp.include_router(mafia_router)
     dp.include_router(chess_router)  # шахматы: инлайн «@бот» в любом чате и /chess
     dp.include_router(chess_widget_router)  # /chess_widget — шахматы-виджет в личке, вызов через канал
+    dp.include_router(durak_router)  # /durak — дурак-виджет в личке, стол собирается через канал
     dp.include_router(blackjack_router)  # блэкджек: /bj — стол в канал
     dp.include_router(user_router)
     dp.include_router(letters_router)   # письма подписчиков в «Письма Волгограда»
@@ -289,6 +291,7 @@ async def main() -> None:
         asyncio.create_task(spend_report_loop(bot, db, config)),  # отчёт о тратах владельцу раз в неделю
         asyncio.create_task(widgets_probe(bot, db)),  # раз в день: пустил ли Telegram виджеты (HTMLBubbles)
         asyncio.create_task(tgbeta.after_start(bot, db, config, beta_problem)),  # бета: отложенный вызов, сбои
+        asyncio.create_task(durak_ticker(bot, db)),  # дурак: таймеры зависших ходов
     ]
     try:
         # message_reaction Telegram по умолчанию не присылает — просим все типы, что ловят обработчики

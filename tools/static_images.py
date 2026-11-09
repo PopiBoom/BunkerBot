@@ -1,6 +1,6 @@
 """Рисует постоянные картинки бота — один раз, бот потом шлёт готовые файлы:
   * assets/menu/*.jpg — /menu: главная и по одной на каждый раздел (из SECTIONS в handlers/menu.py);
-  * assets/lobby/*.jpg — карточки лобби Бункера и Мафии, вызов в шахматы-виджет;
+  * assets/lobby/*.jpg — карточки лобби Бункера и Мафии, вызов в шахматы-виджет и стол в дурака;
   * assets/mafia/*.jpg — фазы Мафии: night_N, morning_kill_N / morning_safe_N, day_N, vote_N (N = 1..10).
 
 Запускать вручную, когда что-то из этого меняется:  python tools/static_images.py
@@ -224,6 +224,60 @@ def lobby_chess() -> Image.Image:
     return img
 
 
+def _playing_card(rank: str, suit: str, w: int, h: int, back: bool = False) -> Image.Image:
+    """Игральная карта картинкой (для лобби дурака)."""
+    im = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    if back:
+        d.rounded_rectangle([0, 0, w - 1, h - 1], radius=w // 8, fill=(192, 57, 43), outline=(255, 255, 255), width=6)
+        for k in range(-h, w + h, 22):
+            d.line([(k, 0), (k + h, h)], fill=(169, 50, 38), width=8)
+        d.rounded_rectangle([0, 0, w - 1, h - 1], radius=w // 8, outline=(255, 255, 255), width=6)
+        return im
+    red = suit in "♥♦"
+    color = (208, 49, 45) if red else (29, 29, 29)
+    d.rounded_rectangle([0, 0, w - 1, h - 1], radius=w // 8, fill=(255, 255, 255), outline=(0, 0, 0, 60), width=3)
+    d.text((w // 7, h // 14), rank, font=_bold(w // 3), fill=color)
+    d.text((w // 2, h * 3 // 5), suit, font=_regular(w * 3 // 5), fill=color, anchor="mm")
+    return im
+
+
+def lobby_durak() -> Image.Image:
+    """Стол в дурака (/durak): уходит в канал пересылкой. Сукно, веер карт, козырь."""
+    from games.bunker.render import _noise as b_noise
+
+    felt, felt2, gold = (36, 120, 74), (24, 86, 52), (226, 178, 92)
+    img = b_noise(Image.new("RGB", (LW, LH), BG), 65)
+    d = ImageDraw.Draw(img)
+    for y0 in (0, LH - 34):  # полоса сукна сверху и снизу с мастями
+        d.rectangle([0, y0, LW, y0 + 33], fill=felt2)
+        for k, x in enumerate(range(10, LW, 46)):
+            d.text((x + 12, y0 + 17), "♠♥♦♣"[k % 4], font=_regular(22),
+                   fill=(222, 90, 80) if k % 4 in (1, 2) else (230, 236, 232), anchor="mm")
+    cx, cy, r = LW - 64 - 170, 270, 170
+    layer = Image.new("RGB", (LW, LH), felt)
+    shade = Image.new("L", (LW, LH), 0)
+    ImageDraw.Draw(shade).ellipse([cx - r, cy - r, cx + r, cy + r], fill=255)
+    img.paste(layer, (0, 0), shade)
+    fan = Image.new("RGBA", (LW, LH), (0, 0, 0, 0))
+    for k, (rank, suit) in enumerate([("6", "♣"), ("9", "♦"), ("Д", "♠"), ("Т", "♥")]):
+        card = _playing_card(rank, suit, 100, 142).rotate(24 - k * 16, expand=True, resample=Image.BICUBIC)
+        fan.paste(card, (cx - 150 + k * 46, cy - 118 + int(abs(k - 1.5)) * 10), card)
+    back = _playing_card("", "", 84, 120, back=True).rotate(90, expand=True)
+    fan.paste(back, (cx - 60, cy + 46), back)
+    img.paste(fan, (0, 0), fan)
+    d = ImageDraw.Draw(img)
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=gold, width=8)
+    d.text((64, 84), "СТОЛ · ОТ 2 ДО 6 ИГРОКОВ", font=_mono(30), fill=gold)
+    font, _size = _fit(d, "ДУРАК", 132, cx - r - 40 - 58)
+    d.text((58, 120), "ДУРАК", font=font, fill=TEXT)
+    for k, line in enumerate(_wrap(d, "Жми «Сесть за стол» - карты придут в личку. Последний с картами - дурак.",
+                                   _regular(34), cx - r - 40 - 64, 2)):
+        d.text((64, 290 + k * 46), line, font=_regular(34), fill=MUTED)
+    _chips(img, ["СЯДЬ ЗА СТОЛ", "КАРТЫ В ЛИЧКЕ", "НЕ БУДЬ ДУРАКОМ"], gold, 470)
+    return img
+
+
 # ---------- фазы Мафии: ночь / утро (убили или все живы) / день / голосование, с номером ----------
 
 PHASES = ROOT / "assets" / "mafia"
@@ -387,6 +441,7 @@ if __name__ == "__main__":
     save(lobby_bunker(), "bunker", LOBBY)
     save(lobby_mafia(), "mafia", LOBBY)
     save(lobby_chess(), "chess", LOBBY)
+    save(lobby_durak(), "durak", LOBBY)
     for n in range(1, PHASE_MAX + 1):
         save(phase_night(n), f"night_{n}", PHASES)
         save(phase_morning(n, True), f"morning_kill_{n}", PHASES)

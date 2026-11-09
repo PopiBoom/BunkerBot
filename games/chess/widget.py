@@ -31,15 +31,15 @@ import secrets
 import time
 from pathlib import Path
 
-from aiogram import BaseMiddleware, Bot, Router
+from aiogram import Bot, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import (BufferedInputFile, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message,
-                           Update)
+from aiogram.types import BufferedInputFile, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from config import Config
 from database import Database
 from tgbeta import AnswerWidgetQuery, EditMessageWidgetData, SendWidget
+from tgbeta import on_widget as tgbeta_on_widget
 
 logger = logging.getLogger("chess.widget")
 router = Router(name="chess_widget")
@@ -279,19 +279,20 @@ def _side(st: dict, uid: int) -> str:
 # ---------- вызов и вход ----------
 
 
-async def _send_card(bot: Bot, db: Database, uid: int, text: str, kb: InlineKeyboardMarkup) -> Message:
-    """Вызов картинкой (assets/lobby/chess.jpg, потом по file_id); не вышло — тем же текстом."""
-    cached = await db.get_setting(CARD_KEY, "")
-    for photo in ([cached] if cached else []) + ([FSInputFile(CARD)] if CARD.exists() else []):
+async def _send_card(bot: Bot, db: Database, uid: int, text: str, kb: InlineKeyboardMarkup, card: Path = CARD,
+                     key: str = CARD_KEY) -> Message:
+    """Вызов картинкой (assets/lobby/chess.jpg, потом по file_id; дурак — своя); не вышло — тем же текстом."""
+    cached = await db.get_setting(key, "")
+    for photo in ([cached] if cached else []) + [FSInputFile(card)]:  # нет файла — отправка упадёт, дальше текст
         try:
             msg = await bot.send_photo(uid, photo, caption=text, reply_markup=kb)
             if not isinstance(photo, str) and msg.photo:
-                await db.set_setting(CARD_KEY, msg.photo[-1].file_id)
+                await db.set_setting(key, msg.photo[-1].file_id)
             return msg
         except Exception as e:  # noqa: BLE001 — протухший file_id, нет файла: дальше
             logger.info("шахматы-виджет: картинка вызова не ушла (%s)", e)
             if isinstance(photo, str):
-                await db.set_setting(CARD_KEY, "")
+                await db.set_setting(key, "")
     return await bot.send_message(uid, text, reply_markup=kb, disable_web_page_preview=True)
 
 
@@ -589,16 +590,7 @@ async def _replay(bot: Bot, db: Database, st: dict) -> None:
             logger.info("шахматы-виджет: повтор в %s не ушёл: %s", chat, e)
 
 
-class WidgetQueries(BaseMiddleware):
-    """Обновление widget_query (Bot API 10.4) aiogram не знает: ловим его до разбора типа обновления."""
-
-    async def __call__(self, handler, event: Update, data: dict):
-        q = (event.model_extra or {}).get("widget_query")
-        if q is None:
-            return await handler(event, data)
-        if isinstance(q, dict) and data.get("bot") is not None and data.get("db") is not None:
-            await on_query(data["bot"], data["db"], q)
-        return None
+tgbeta_on_widget("", on_query)  # остальные запросы виджетов (дурак — «u…», games/durak)
 
 
 @router.message(Command("chess_widget"))

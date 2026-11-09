@@ -76,6 +76,11 @@ async def cmd_start(message: Message, command: CommandObject, bot: Bot, db: Data
 
         await join(bot, db, user, arg[4:])
         return
+    if arg.startswith("dur_"):  # стол в дурака (/durak): сесть за стол
+        from games.durak.game import join as durak_join
+
+        await durak_join(bot, db, user, arg[4:])
+        return
     if arg == "letter":  # ссылка из подписи выпуска «Писем Волгограда»
         from handlers.letters import ask
 
