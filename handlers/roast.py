@@ -1392,6 +1392,10 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     text = "\n".join(texts) or (last_msg.text or "")
     rt = last_msg.reply_to_message
     voice_back = _voice_back(chat_id, last_msg, bot.id)  # говорит с ботом голосом — и бот ему голосом
+    if not voice_back and ai.eleven_key() and not ai.eleven_geo_blocked():
+        from handlers import rant
+
+        voice_back = rant.in_thread(chat_id, last_msg)  # в комментариях под его голосовым в канале — тоже голосом
     voice = voice_back or _roll_voice(chat_id)  # решаем заранее: голосом ИИ пишет как говорят вслух
     said = rt.text if rt and rt.from_user and rt.from_user.id == bot.id else None
     if not said and rt and rt.from_user and rt.from_user.id == bot.id and rt.voice:  # ответ на голосовое бота

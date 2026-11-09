@@ -38,6 +38,7 @@ from handlers.diss import router as diss_router
 from handlers.letters import observe as letters_observe
 from handlers.letters import router as letters_router
 from handlers.news import router as news_router
+from handlers.rant import observe as rant_observe
 from handlers.rant import router as rant_router
 from handlers.night import router as night_router
 from handlers.protocol import router as protocol_router
@@ -125,6 +126,11 @@ class AdminOnlyCommands(BaseMiddleware):
                 await letters_observe(event, data["db"])
         except Exception as e:
             logger.debug("letters observe: %s", e)
+        try:  # комменты под голосовым Пиздюка в канале — ответит голосом на 1-2 лучших
+            if data.get("db") is not None and data.get("bot") is not None:
+                await rant_observe(event, data["bot"], data["db"], data.get("config"))
+        except Exception as e:
+            logger.debug("rant observe: %s", e)
         cmd = command_name(event.text or event.caption or "")
         if cmd and cmd not in PUBLIC_COMMANDS:
             cfg = data.get("config")

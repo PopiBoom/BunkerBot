@@ -2473,6 +2473,54 @@ async def channel_rant(previous: list[str], topic: str, cta: bool, story: bool =
     return await fix_looks(scrub(_drop_memento(out)))
 
 
+RANT_REPLY_MAX_WORDS = 25
+
+
+async def rant_replies(said: str, comments: list[dict], n: int) -> list[dict]:
+    """Комментарии под голосовым Пиздюка в канале (владелец 09.11 выбрал «Отвечает на комменты»: 1-2 самых интересных,
+    не на всё подряд): выбрать не больше n и ответить каждому — голосом. comments — [{"id", "name", "text"}].
+    [{"id", "text"}]; пусто — отвечать не на что."""
+    if not comments or n <= 0:
+        return []
+    user = (
+        f"Ты записал голосовое в канал бати — вот что ты в нём сказал: <post>{said[:900]}</post>\n"
+        f"Под ним комментарии:\n{_msgs_block(comments)}\n"
+        f"Выбери НЕ БОЛЬШЕ {n} самых интересных — на которые можно ответить смешно: вопрос тебе, наезд или спор с "
+        "тобой, шутка, которую можно перебить, кто-то спалился или сморозил. Не отвечай на пустое («+», «ору», "
+        "смайлы, «база», «согласен», «лайк»), на рекламу и на то, что не про голосовое и не к тебе. Ни одного "
+        "стоящего — верни пустой список, это нормально.\n"
+        "На каждый выбранный — твой ответ ГОЛОСОМ этому человеку, на «ты»: как вслух, 1-2 короткие фразы, до 20 слов, "
+        "прямо на то, что он написал, ядовито и смешно, мат к месту; понятно на слух с первого раза — одна мысль, без "
+        "отсылок к другим комментариям. Его слова повторяешь — в кавычках (их передразнят голосом). Без смайлов, "
+        "списков и сокращений. Не пересказывай своё голосовое. Канал публичный: никаких фактов про людей из чата, "
+        "только то, что видно в комментарии."
+        + _variety() + _gender_note()
+        + '\nВерни СТРОГО JSON: {"replies": [{"id": <id комментария>, "text": "<ответ>"}]} — без рассуждений.'
+    )
+    raw = await _complete(ROAST_SYSTEM, user, max_tokens=4000, model=REPLY_MODEL, effort=REPLY_EFFORT)
+    try:
+        items = _extract_json(raw).get("replies") or []
+    except Exception:
+        logger.info("rant replies: не JSON: %s", (raw or "")[:200])
+        return []
+    by_id = {str(c["id"]): c for c in comments}
+    out, seen = [], set()
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict):
+            continue
+        cid = str(it.get("id", "")).strip()
+        text = strip_tags(str(it.get("text") or "")).strip()
+        if len(text) > 2 and text[0] + text[-1] in ("«»", '""') and text.count(text[0]) == 1:  # весь ответ в кавычках
+            text = text[1:-1].strip()
+        if cid not in by_id or cid in seen or not text:
+            continue
+        seen.add(cid)
+        out.append({"id": by_id[cid]["id"], "text": text})
+        if len(out) >= n:
+            break
+    return out
+
+
 # ---------- сторонние модели через OpenRouter (для постов и слепого сравнения) ----------
 # Claude вызываем как обычно, через SDK Anthropic. Модель с «/» в названии (x-ai/grok-4.7,
 # openai/gpt-6.1-terra-pro…) — это OpenRouter: один ключ OPENROUTER_API_KEY на сотни моделей.

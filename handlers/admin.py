@@ -643,7 +643,8 @@ async def admin_rant(call: CallbackQuery, db: Database, config: Config) -> None:
             f"🎙 Голосовые в канал {state}\n\nРаз в день в случайное время ({rant.FROM_HOUR}-{rant.TO_HOUR} МСК) "
             "Пиздюк голосом (тот, что в /golos) — по кругу: наезд на подписоту, смешная история про канал, наезд с "
             "просьбой поставить реакцию. /podpisota — прямо сейчас (/podpisota история / реакции). ≈$0.03 + "
-            "150-300 символов ElevenLabs за голосовое.")
+            "150-300 символов ElevenLabs за голосовое. Под голосовым отвечает голосом на 1-2 самых интересных "
+            "коммента (≈$0.01 + 60-100 символов на ответ).")
 
 
 @router.callback_query(F.data == "admin:roast_freq")
@@ -960,7 +961,7 @@ KIND_LABELS = {
     "describe_sticker": "описания стикеров (Haiku)", "pick_sticker": "выбор стикера", "pick_reaction": "реакции",
     "extract_promise": "ловушка обещаний", "promise_reminder": "напоминания обещаний", "update_dossier": "досье",
     "short_answer_meaning": "смысл коротких ответов", "fix_looks": "правка «про внешность»",
-    "drop_retell": "правка пересказа фото", "channel_comment": "комменты к постам канала",
+    "drop_retell": "правка пересказа фото", "channel_comment": "комменты к постам канала", "rant_replies": "ответы на комменты под голосовым",
     "own_channel_post": "посты в канал", "clown_of_day": "клоун дня", "week_show": "итоги недели",
     "pick_quotes": "фразы дня", "daily_news": "новости чата", "serial_episode": "сериал",
     "horror_story": "Письма Волгограда: текст", "_place_facts": "Письма Волгограда: поиск места",
