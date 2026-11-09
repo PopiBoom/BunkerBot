@@ -22,7 +22,7 @@ from datetime import datetime
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import ai
@@ -67,7 +67,7 @@ def _caption(n: int, story: dict, now: datetime, weather: str, bot_username: str
 
 
 async def make_episode(db: Database, progress=night._noop, letter: dict | None = None,
-                       bot_username: str = "") -> dict:
+                       bot_username: str = "", own: str | None = None) -> dict:
     """{"ogg", "paragraphs", "caption", "n", "topic", "voice", "secs", "letter"}; без голоса — ogg None."""
     import radio
 
@@ -81,7 +81,7 @@ async def make_episode(db: Database, progress=night._noop, letter: dict | None =
     day = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"][now.weekday()]
     facts = f"сегодня {ai.date_words(now.date())}, {day}; сейчас {night._clock(now)}; " + (
         cond["line"] or "погода неизвестна")
-    story = await ai.gossip_story(used[-12:], facts, now.date(), listener=letter)
+    story = await ai.gossip_story(used[-12:], facts, now.date(), listener=letter, own=own)
     if not story:
         raise RuntimeError("ИИ не написал выпуск")
     topic = story["subject"] or story["title"] or "без темы"
@@ -118,18 +118,21 @@ def _kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🗑 Выкинуть", callback_data="gs:del")]])
 
 
-async def send_draft(bot: Bot, db: Database, chat_id: int, progress=night._noop, letter_id: int | None = None) -> bool:
-    """Собрать выпуск и прислать черновик в личку на одобрение (под общим замком эфиров)."""
+async def send_draft(bot: Bot, db: Database, chat_id: int, progress=night._noop, letter_id: int | None = None,
+                     own: str | None = None) -> bool:
+    """Собрать выпуск и прислать черновик в личку на одобрение (под общим замком эфиров). own — своя сплетня."""
     async with night._lock:
         try:
-            return await asyncio.wait_for(_send_draft(bot, db, chat_id, progress, letter_id), night.EPISODE_TIMEOUT)
+            return await asyncio.wait_for(_send_draft(bot, db, chat_id, progress, letter_id, own),
+                                          night.EPISODE_TIMEOUT)
         except asyncio.TimeoutError:
             await bot.send_message(chat_id, f"⌛ Выпуск не собрался за {night.EPISODE_TIMEOUT // 60} мин - озвучка "
                                             "тормозит. Попробуй ещё раз позже.")
             return False
 
 
-async def _send_draft(bot: Bot, db: Database, chat_id: int, progress, letter_id: int | None) -> bool:
+async def _send_draft(bot: Bot, db: Database, chat_id: int, progress, letter_id: int | None,
+                      own: str | None = None) -> bool:
     from handlers import letters
 
     letter = await letters.get(db, letter_id) if letter_id else None
@@ -137,7 +140,7 @@ async def _send_draft(bot: Bot, db: Database, chat_id: int, progress, letter_id:
         me = (await bot.get_me()).username or ""
     except Exception:
         me = ""
-    ep = await make_episode(db, progress=progress, letter=letter, bot_username=me)
+    ep = await make_episode(db, progress=progress, letter=letter, bot_username=me, own=own)
     text = "\n\n".join(ep["paragraphs"])
     if not ep["ogg"]:
         why = f" ({html.escape(ep['voice'][:300])})" if ep.get("voice") else ""
@@ -156,11 +159,11 @@ async def _send_draft(bot: Bot, db: Database, chat_id: int, progress, letter_id:
                                    caption=night._cut_vis(re.sub(r"<[^>]+>", "", ep["caption"]), 900))
     await db.set_setting(DRAFT_KEY, json.dumps({"file_id": msg.voice.file_id, "caption": ep["caption"], "n": ep["n"],
                                                 "msg": msg.message_id, "chat": chat_id, "letter": ep.get("letter"),
-                                                "secs": ep.get("secs")}, ensure_ascii=False))
+                                                "secs": ep.get("secs"), "own": own}, ensure_ascii=False))
     return True
 
 
-async def _start(bot: Bot, db: Database, uid: int, letter_id: int | None) -> bool:
+async def _start(bot: Bot, db: Database, uid: int, letter_id: int | None, own: str | None = None) -> bool:
     """Собрать черновик и прислать uid в личку. False — в личку не написать."""
     try:
         if not ai.available():
@@ -168,12 +171,13 @@ async def _start(bot: Bot, db: Database, uid: int, letter_id: int | None) -> boo
             return True
         if night.busy():
             await bot.send_message(uid, "⏳ Сейчас собирается другой эфир - пришлю сплетни, когда он будет готов.")
-        first = "🗣 Собираю «Сплетни Волгограда»" + (f" по сплетне № {letter_id}" if letter_id else "") + " - минуты две…"
+        first = ("🗣 Собираю «Сплетни Волгограда»" + (" по твоей сплетне" if own else f" по сплетне № {letter_id}"
+                                                      if letter_id else "") + " - минуты две…")
         status = await bot.send_message(uid, first)
     except Exception:
         return False
     try:
-        await send_draft(bot, db, uid, progress=night._progress(bot, status, first), letter_id=letter_id)
+        await send_draft(bot, db, uid, progress=night._progress(bot, status, first), letter_id=letter_id, own=own)
         try:
             await status.delete()
         except Exception:
@@ -184,11 +188,20 @@ async def _start(bot: Bot, db: Database, uid: int, letter_id: int | None) -> boo
     return True
 
 
-@router.message(Command("spletni"))
-async def cmd_spletni(message: Message, bot: Bot, db: Database) -> None:
-    """/spletni — выпуск «Сплетен Волгограда» черновиком в личку. Есть взятые сплетни подписчиков — сначала выбор."""
+@router.message(Command("spletni", "сплетни", ignore_case=True))
+async def cmd_spletni(message: Message, bot: Bot, db: Database, command: CommandObject | None = None) -> None:
+    """/spletni (или /сплетни) — выпуск «Сплетен Волгограда» черновиком в личку. «/сплетни текст» (или ответом на
+    сообщение с текстом) — выпуск по своей сплетне (владелец 09.11). Иначе есть взятые сплетни подписчиков —
+    сначала выбор."""
     from handlers import letters
 
+    own = ((command.args if command else "") or "").strip()
+    rt = message.reply_to_message
+    if not own and rt is not None and (rt.text or rt.caption) and not (rt.from_user and rt.from_user.is_bot):
+        own = (rt.text or rt.caption or "").strip()
+    if own:
+        _spawn(_run(bot, db, message, None, own=own))
+        return
     ready = await letters.approved(db, "gossip")
     uid = message.from_user.id
     if ready:
@@ -204,9 +217,10 @@ async def cmd_spletni(message: Message, bot: Bot, db: Database) -> None:
     _spawn(_run(bot, db, message, None))
 
 
-async def _run(bot: Bot, db: Database, message: Message | None, letter_id: int | None, uid: int | None = None) -> None:
+async def _run(bot: Bot, db: Database, message: Message | None, letter_id: int | None, uid: int | None = None,
+               own: str | None = None) -> None:
     uid = uid or message.from_user.id
-    if not await _start(bot, db, uid, letter_id) and message is not None:
+    if not await _start(bot, db, uid, letter_id, own) and message is not None:
         await message.answer("Напиши боту /start в личку - черновик приходит туда.")
 
 
@@ -280,4 +294,4 @@ async def cb_draft(call: CallbackQuery, bot: Bot, db: Database, config: Config) 
         await db.set_setting(DRAFT_KEY, "")
         await call.answer("Переписываю - минуты две.")
         await mark("🔄 Переписан - новый ниже.")
-        _spawn(_run(bot, db, None, draft.get("letter"), call.message.chat.id))
+        _spawn(_run(bot, db, None, draft.get("letter"), call.message.chat.id, own=draft.get("own")))
