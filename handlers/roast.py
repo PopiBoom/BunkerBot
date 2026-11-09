@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import contextvars
 import html
+import json
 import logging
 import os
 import random
@@ -29,7 +30,8 @@ from datetime import datetime, timedelta, timezone
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import BufferedInputFile, Message, MessageReactionUpdated, ReactionTypeEmoji, ReplyParameters
+from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+                           MessageReactionUpdated, ReactionTypeEmoji, ReplyParameters)
 
 import ai
 import cards
@@ -789,7 +791,7 @@ def _is_father_channel_post(message: Message) -> bool:
 
 
 @router.message(_is_father_channel_post)
-async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
+async def on_channel_post(message: Message, bot: Bot, db: Database, config=None) -> None:
     chat_id = message.chat.id
     if not _db_ref:
         _db_ref.append(db)
@@ -845,47 +847,15 @@ async def on_channel_post(message: Message, bot: Bot, db: Database) -> None:
         return
     if not text and not media:
         return
-    image = None
-    try:
-        if message.photo:
-            sizes = sorted(message.photo, key=lambda p: p.width)
-            photo = next((p for p in reversed(sizes) if p.width <= 1280), sizes[0])
-            image = ((await bot.download(photo)).read(), "image/jpeg")
-        else:  # у видео — кадр из середины (первый часто тёмный), у гифок — превью
-            vid = message.video or message.video_note
-            if vid is not None and raw is not None:  # уже скачано ради звука
-                frame = await asyncio.to_thread(frames.middle_frame, raw)
-            else:
-                frame = await _video_frame(bot, vid) if vid is not None else None
-            if frame:
-                image = (frame, "image/jpeg")
-                media = f"{media} (ты видишь один кадр из середины)"
-            else:
-                thumb = getattr(message.video or message.animation or message.video_note, "thumbnail", None)
-                if thumb is not None:
-                    data = (await bot.download(thumb)).read()
-                    if ai.image_mime(data):
-                        image = (data, ai.image_mime(data))
-                        media = f"{media} (ты видишь только его превью — первый кадр)"
-        await asyncio.sleep(random.uniform(3.0, 6.0))  # «прочитал» пост
-        await bot.send_chat_action(chat_id, "typing")
-        await _remember_lines(db, chat_id)
-        ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)  # пост бати: иногда и нагрубить
-        if own_id:  # ещё раз: вдруг бот пометил пост своим уже после паузы
-            from handlers.channel_posts import own_posts
-            if own_id in await own_posts(db):
-                return
-        spoken = _channel_post_id(message) is not None and bool(ai.eleven_key()) and not ai.eleven_geo_blocked()
-        answer = await ai.channel_comment(channel, text, media, image, await db.style_sample(chat_id),
-                                          repost_from=repost_from, speech=speech, spoken=spoken)
-    except Exception as e:
-        logger.warning("channel comment failed: %s", e)
+    ctx = _post_context(message, channel, text, media, repost_from, speech)
+    owner = _father_id(config or (_cfg_ref[0] if _cfg_ref else None))
+    if ctx["post"] and owner:
+        # Пост в канале — не отвечаем сами, а спрашиваем владельца в личке (09.11: «надо, чтобы он не всегда отвечал
+        # на мои сообщения в канале; пусть после каждого поста приходит мне в лс — начать генерацию ответа»)
+        await _ask_owner(bot, db, ctx, owner)
         return
-    if answer:
-        answer = ai.vary_father(answer)
-        if spoken and await _channel_voice_reply(bot, db, message, answer):
-            return
-        await _say_human(bot, chat_id, answer, reply_to=message.message_id)  # голос не вышел — текстом в комментарии
+    await asyncio.sleep(random.uniform(3.0, 6.0))  # «прочитал» (сообщение бати от имени канала в комментариях)
+    await _post_reply(bot, db, ctx, spoken=False)
 
 
 def _channel_post_id(message: Message) -> int | None:
@@ -896,15 +866,84 @@ def _channel_post_id(message: Message) -> int | None:
     return getattr(fo, "message_id", None)
 
 
-async def _channel_voice_reply(bot: Bot, db: Database, message: Message, text: str) -> bool:
+def _post_context(message: Message, channel: str, text: str, media: str, repost_from: str | None,
+                  speech: str) -> dict:
+    """Всё, что нужно, чтобы ответить на пост позже (по кнопке в личке): куда отвечать, текст, что слышно, file_id
+    картинки или видео (скачаем заново, когда нажмут)."""
+    fo = message.forward_origin
+    fchat = getattr(fo, "chat", None)
+    photo = None
+    if message.photo:
+        sizes = sorted(message.photo, key=lambda p: p.width)
+        photo = next((p for p in reversed(sizes) if p.width <= 1280), sizes[0]).file_id
+    vid = message.video or message.video_note
+    thumb = getattr(message.video or message.animation or message.video_note, "thumbnail", None)
+    post = _channel_post_id(message)
+    user = getattr(fchat, "username", None)
+    return {"chat": message.chat.id, "msg": message.message_id, "post": post,
+            "chan": getattr(fchat, "id", None) or (message.sender_chat.id if message.sender_chat else None),
+            "link": f"https://t.me/{user}/{post}" if user and post else "", "title": channel, "text": text[:3000],
+            "media": media, "repost": repost_from, "speech": (speech or "")[:2000], "photo": photo,
+            "video": vid.file_id if vid is not None and (vid.file_size or 0) <= VIDEO_MAX else None,
+            "thumb": thumb.file_id if thumb is not None else None, "at": int(time.time())}
+
+
+async def _post_image(bot: Bot, ctx: dict) -> tuple[tuple[bytes, str] | None, str]:
+    """Картинка к посту для ИИ: фото, кадр из середины видео/кружка (первый часто тёмный) или превью."""
+    media = ctx.get("media") or ""
+    try:
+        if ctx.get("photo"):
+            return ((await bot.download(ctx["photo"])).read(), "image/jpeg"), media
+        if ctx.get("video"):
+            frame = await asyncio.to_thread(frames.middle_frame, (await bot.download(ctx["video"])).read())
+            if frame:
+                return (frame, "image/jpeg"), f"{media} (ты видишь один кадр из середины)"
+        if ctx.get("thumb"):
+            data = (await bot.download(ctx["thumb"])).read()
+            if ai.image_mime(data):
+                return (data, ai.image_mime(data)), f"{media} (ты видишь только его превью — первый кадр)"
+    except Exception as e:
+        logger.warning("картинка к посту канала не скачалась: %s", e)
+    return None, media
+
+
+async def _post_reply(bot: Bot, db: Database, ctx: dict, spoken: bool) -> tuple[str, str]:
+    """Ответ на пост бати: spoken — голосовым прямо в канале ответом на пост (не вышло — текстом в комментарии),
+    иначе текстом в комментарии. → (как ответил: "voice" / "text" / "own" / "", текст ответа)."""
+    chat_id = ctx["chat"]
+    image, media = await _post_image(bot, ctx)
+    with contextlib.suppress(Exception):
+        await bot.send_chat_action(chat_id, "typing")
+    await _remember_lines(db, chat_id)
+    ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)  # пост бати: иногда и нагрубить
+    if ctx.get("post"):  # ещё раз: вдруг бот пометил пост своим уже после паузы
+        from handlers.channel_posts import own_posts
+        if ctx["post"] in await own_posts(db):
+            return "own", ""
+    spoken = spoken and bool(ctx.get("post")) and bool(ai.eleven_key()) and not ai.eleven_geo_blocked()
+    try:
+        answer = await ai.channel_comment(ctx.get("title") or "канал бати", ctx.get("text") or "", media, image,
+                                          await db.style_sample(chat_id), repost_from=ctx.get("repost"),
+                                          speech=ctx.get("speech") or "", spoken=spoken)
+    except Exception as e:
+        logger.warning("channel comment failed: %s", e)
+        return "", ""
+    if not answer:
+        return "", ""
+    answer = ai.vary_father(answer)
+    if spoken and await _channel_voice_reply(bot, db, ctx, answer):
+        return "voice", answer
+    await _say_human(bot, chat_id, answer, reply_to=ctx["msg"])  # голос не вышел — текстом в комментарии
+    return "text", answer
+
+
+async def _channel_voice_reply(bot: Bot, db: Database, ctx: dict, text: str) -> bool:
     """Ответ на пост бати голосовым прямо в канале — ответом на этот пост (владелец 08.11: «после каждого сообщения
     в канале пусть Пиздюк записывает глс, как бы отвечая на него»; выбрал «в канал», текст в обсуждении — не дублируем).
     Голос — тот, что в /golos. False — не вышло (тогда — текстом в комментарии, как раньше)."""
     from handlers import channel_posts
 
-    post_id = _channel_post_id(message)
-    fo = message.forward_origin
-    chan = getattr(getattr(fo, "chat", None), "id", None) or (message.sender_chat.id if message.sender_chat else None)
+    post_id, chan = ctx.get("post"), ctx.get("chan")
     text = ai.scrub((text or "").strip())
     if not post_id or not chan or not text:
         return False
@@ -919,14 +958,110 @@ async def _channel_voice_reply(bot: Bot, db: Database, message: Message, text: s
         logger.warning("голос в канал ответом на пост не ушёл: %s", e)
         return False
     await channel_posts.mark_own(db, sent.message_id)  # его пересылку в обсуждение бот не комментирует
-    _last_bot_msg[message.chat.id] = time.time()
+    _last_bot_msg[ctx["chat"]] = time.time()
     try:
-        await db.add_chat_message(message.chat.id, message.message_id * -1, 0, BOT_SELF, None,
+        await db.add_chat_message(ctx["chat"], ctx["msg"] * -1, 0, BOT_SELF, None,
                                   f"[голосом в канале, ответ на пост] {text}"[:1000])
     except Exception as e:
         logger.debug("save channel voice failed: %s", e)
     logger.info("голос в канал ответом на пост %s: %s", post_id, text[:160])
     return True
+
+
+# ---------- ответ на пост канала — по кнопке владельца в личке ----------
+
+ASK_KEY = "channel_reply_ask"  # посты, о которых спросили владельца: {"<чат>_<сообщение>": контекст}
+ASK_KEEP = 20                  # помним последние N постов
+ASK_TTL = 3 * 24 * 3600        # старше — кнопка уже неактуальна
+
+
+async def _asks(db: Database) -> dict:
+    try:
+        data = json.loads(await db.get_setting(ASK_KEY, "{}") or "{}")
+    except (ValueError, TypeError):
+        data = {}
+    now = time.time()
+    return {k: v for k, v in data.items() if isinstance(v, dict) and now - int(v.get("at") or 0) < ASK_TTL}
+
+
+async def _save_asks(db: Database, asks: dict) -> None:
+    keep = sorted(asks.items(), key=lambda kv: int(kv[1].get("at") or 0))[-ASK_KEEP:]
+    await db.set_setting(ASK_KEY, json.dumps(dict(keep), ensure_ascii=False))
+
+
+def _ask_text(ctx: dict) -> str:
+    what = ctx.get("media") or ""
+    body = (ctx.get("text") or "").strip() or (f"говорит: «{ctx['speech']}»" if ctx.get("speech") else "")
+    preview = body[:300] + ("…" if len(body) > 300 else "")
+    head = "📢 Новый пост в канале" + (f" · {html.escape(what)}" if what else "")
+    if ctx.get("link"):
+        head = f'<a href="{html.escape(ctx["link"])}">{head}</a>'
+    return head + (f"\n<blockquote>{html.escape(preview)}</blockquote>" if preview else "") + "\nПиздюку ответить?"
+
+
+def _ask_kb(key: str) -> InlineKeyboardMarkup:
+    row = [InlineKeyboardButton(text="💬 Текстом", callback_data=f"cpa:t:{key}")]
+    if ai.eleven_key() and not ai.eleven_geo_blocked():
+        row.insert(0, InlineKeyboardButton(text="🎙 Голосом", callback_data=f"cpa:v:{key}"))
+    return InlineKeyboardMarkup(inline_keyboard=[row, [InlineKeyboardButton(text="✖️ Не надо",
+                                                                            callback_data=f"cpa:x:{key}")]])
+
+
+async def _ask_owner(bot: Bot, db: Database, ctx: dict, owner: int) -> None:
+    """Владельцу в личку: «новый пост — Пиздюку ответить?» с кнопками. Ответ пишется только по кнопке."""
+    key = f"{ctx['chat']}_{ctx['msg']}"
+    asks = await _asks(db)
+    asks[key] = ctx
+    await _save_asks(db, asks)
+    try:
+        await bot.send_message(owner, _ask_text(ctx), reply_markup=_ask_kb(key), disable_web_page_preview=True)
+        logger.info("пост канала %s: спросил владельца, отвечать ли", ctx.get("post"))
+    except Exception as e:  # в личку не дошло (бот не запущен у владельца) — молчим, как он и хотел
+        logger.warning("пост канала: не смог спросить владельца в личке: %s", e)
+
+
+@router.callback_query(F.data.startswith("cpa:"))
+async def cb_channel_answer(call: CallbackQuery, bot: Bot, db: Database, config=None) -> None:
+    admins = getattr(config, "admin_ids", None) or []
+    if call.from_user.id not in admins and call.from_user.id != _father_id(config):
+        await call.answer("Только админ.", show_alert=True)
+        return
+    _, mode, key = (call.data or "").split(":", 2)
+    asks = await _asks(db)
+    ctx = asks.pop(key, None)
+    msg = call.message
+    head = _ask_text(ctx) if ctx else ""
+
+    async def show(tail: str, kb=None) -> None:
+        if msg is None:
+            return
+        with contextlib.suppress(TelegramBadRequest):
+            await bot.edit_message_text(f"{head}\n\n{tail}" if head else tail, chat_id=msg.chat.id,
+                                        message_id=msg.message_id, reply_markup=kb, disable_web_page_preview=True)
+
+    if ctx is None:
+        await call.answer("Этот пост уже неактуален.", show_alert=True)
+        await show("⌛ Неактуально.")
+        return
+    await _save_asks(db, asks)  # сразу: второе нажатие не напишет второй ответ
+    if mode == "x":
+        await call.answer("Ок, молчу.")
+        await show("✖️ Без ответа.")
+        return
+    await call.answer("Пишу ответ…")
+    await show("⏳ Пишу ответ…")
+    how, answer = await _post_reply(bot, db, ctx, spoken=mode == "v")
+    if how == "voice":
+        await show(f"🎙 Ответил голосом в канале:\n<i>{html.escape(answer[:600])}</i>")
+    elif how == "text":
+        await show(f"💬 Ответил в комментариях:\n<i>{html.escape(answer[:600])}</i>")
+    elif how == "own":
+        await show("Это пост самого бота - не отвечаю.")
+    else:  # не вышло — вернуть кнопки, можно нажать ещё раз
+        asks = await _asks(db)
+        asks[key] = ctx
+        await _save_asks(db, asks)
+        await show("⚠️ Не вышло написать ответ - попробуй ещё раз.", _ask_kb(key))
 
 
 # ---------- реакции на шутки бота: чему чат ставит 🔥, а чему 👎 ----------
