@@ -55,7 +55,6 @@ SQ = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/"  # кл�
 MAX_DATA = 1024          # chat_data и ответ на запрос — не больше (байт)
 NAME_LEN = 18
 CAPTION = "♟ Шахматы"  # старые клиенты сами пишут «обновите Telegram»
-GLYPH = {"k": "♚", "q": "♛", "r": "♜", "b": "♝", "n": "♞", "p": "♟"}
 DRAWS = {"stalemate": "пат", "material": "не хватает фигур для мата", "repeat": "позиция повторилась трижды",
          "fifty": "50 ходов без взятий и ходов пешкой", "agreed": "по согласию"}
 
@@ -221,13 +220,6 @@ def _view(st: dict, uid: int) -> str:
         v["s"] = v.get("s", "")[:24]
         data = json.dumps(v, ensure_ascii=False, separators=(",", ":"))
     return data
-
-
-def _move_text(piece, move, capture: bool, san: str) -> str:
-    chess = _chess()
-    sign = "#" if san.endswith("#") else "+" if san.endswith("+") else ""
-    return (f"{GLYPH[piece.symbol().lower()]}︎ {chess.square_name(move.from_square)}"
-            f"{'×' if capture else '-'}{chess.square_name(move.to_square)}{sign}")
 
 
 # ---------- сообщения ----------
@@ -424,7 +416,6 @@ def _apply(st: dict | None, uid: int, kind: str, arg: str, chat, mid) -> tuple[d
         if not moves:
             return {"err": "Так ходить нельзя"}, ev
         move = next((m for m in moves if m.promotion in (None, chess.QUEEN)), moves[0])
-        piece, capture, san = b.piece_at(fr), b.is_capture(move), b.san(move)
         b.push(move)
         st["moves"].append(move.uci())
         st["draw"] = None
@@ -433,7 +424,7 @@ def _apply(st: dict | None, uid: int, kind: str, arg: str, chat, mid) -> tuple[d
             st["end"] = {"why": why, "win": uid if why == "mate" else 0}
             ev["done"] = True
         else:
-            ev["note"][oid] = f"♟ {html.escape(my_name)}: {_move_text(piece, move, capture, san)}. Твой ход."
+            ev["note"][oid] = "♟ Твой ход"  # без хода соперника — он и так виден на доске (владелец 09.11)
         ev["unnote"].append(uid)
     elif kind == "r":
         st["end"] = {"why": "resign", "win": oid}
@@ -445,8 +436,7 @@ def _apply(st: dict | None, uid: int, kind: str, arg: str, chat, mid) -> tuple[d
         elif st.get("draw") == uid:
             return {"err": "Ты уже предложил - ждём ответа"}, ev
         else:
-            st["draw"] = uid
-            ev["note"][oid] = f"🤝 {html.escape(my_name)} предлагает ничью."
+            st["draw"] = uid  # предложение видно на доске («🤝 Принять»), уведомления нет
     elif kind == "n":
         if not end or end.get("why") == "cancel":
             return {"err": "Партия ещё идёт"}, ev

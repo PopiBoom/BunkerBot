@@ -11,14 +11,15 @@
 не смог — «Беру» (ему ещё могут подкинуть вдогонку), заходит следующий за ним. Добор до 6: сначала заходивший,
 потом остальные по кругу, отбивавшийся последним. Колода кончилась, карты кончились — вышел (не дурак). Последний с
 картами — дурак; вышли последние двое разом — ничья.
-«Бито»/«Пас» не ждём от тех, кому нечего подкинуть, — отбой закрывается сам. Зависшие: заходящий молчит `TURN` —
+«Бито»/«Пас» ждём от всех одинаково (иначе по тому, закрылся ли отбой сам, видно, есть ли у соперника карта);
+сам отбой закрывается, только если подкидывать больше некуда. Зависшие: заходящий молчит `TURN` —
 ходит младшей картой сам; отбивающийся молчит — бьёт младшими, не может — «Беру» (только «Беру» — брошенная
 партия ходила бы по кругу без конца); подкидывающие молчат (`TURN` у заходившего, `GRACE` у
 остальных после его «Бито» или после «Беру») — пас. Таймеры — `ticker` (из bot.py) по партиям из `durak_live`.
 
 Состояние стола каждого — `chat_data` его сообщения (`_view`: рука, стол, козырь, колода, соперники, роль, статус);
 бот правит столы всех после каждого действия (`EditMessageWidgetData`, молча) и пишет с уведомлением тому, чей ход
-(«🃏 Твой ход - заходи», «🛡 Вася заходит 7♥ - отбивайся»; прошлое такое сообщение удаляется). Запросы виджета:
+(«🃏 Твой ход», «🛡 Отбивайся» — без чужих карт; прошлое такое сообщение удаляется). Запросы виджета:
 `ua:<id>:<карта>` — зайти/подкинуть, `ud:<id>:<карта><пара>` — покрыть, `ub` — бито/пас, `ut` — беру, `us` —
 начать, `un` — ещё раз (хозяин, те же игроки, те же сообщения). Карта — 2 знака: достоинство `6789TJQKA` + масть
 `shdc`. Партия — настройка `durak:<id>`. Без ИИ, бесплатно.
@@ -61,7 +62,7 @@ RANKS, SUITS = "6789TJQKA", "shdc"
 SIGN = {"s": "♠", "h": "♥", "d": "♦", "c": "♣"}
 MAX_PLAYERS, HAND = 6, 6
 TURN = 90               # сек на ход (зайти, отбиться, решить «бито»)
-GRACE = 15              # сек остальным подкинуть после «Бито» заходившего или после «Беру»
+GRACE = 10              # сек остальным подкинуть после «Бито» заходившего или после «Беру»
 LOBBY_TTL = 3 * 3600    # стол не начался — закрывается
 GAME_TTL = 4 * 3600     # партия дольше — закрывается без дурака
 TICK = 2
@@ -209,11 +210,11 @@ def attack(st: dict, uid: int, card: str, notes: dict) -> str | None:
     was_beaten = not _unbeaten(st)
     hand.remove(card)
     st["table"].append([card, None])
+    st["last"] = None  # табличка «бито / берёт» прошлого отбоя гаснет
     if uid in st["passed"]:
         st["passed"].remove(uid)
     if not st["taking"] and (first or was_beaten):
-        verb = "заходит" if first else "подкидывает"
-        notes[st["dfd"]] = f"🛡 {html.escape(_nm(st, uid))} {verb} {show(card)} - отбивайся"
+        notes[st["dfd"]] = "🛡 Отбивайся"  # только «твой ход», без чужих карт (владелец 09.11)
     return None
 
 
@@ -265,6 +266,8 @@ def _end_bout(st: dict, notes: dict) -> None:
         _hand(st, dfd).extend(cards)
     else:
         st["discard"] += len(cards)
+    # что случилось — видно на столе до следующего захода (владелец: «кинул карту, показало бито, такой-то берёт»)
+    st["last"] = ["t", _nm(st, dfd)[:NAME_LEN], len(cards)] if took else ["b"]
     st.update(table=[], passed=[], taking=False, limit=0)
     ids = _ids(st)
     i = ids.index(att)
@@ -286,7 +289,7 @@ def _end_bout(st: dict, notes: dict) -> None:
     nxt = _next(st, dfd) if took or dfd in st["out"] else dfd
     st["att"], st["dfd"] = nxt, _next(st, nxt)
     st["bout"] += 1
-    notes[nxt] = "🃏 Твой ход - заходи"
+    notes[nxt] = "🃏 Твой ход"
 
 
 def settle(st: dict, now: float, notes: dict) -> None:
@@ -295,7 +298,10 @@ def settle(st: dict, now: float, notes: dict) -> None:
         if not st["table"] or (_unbeaten(st) and not st["taking"]):
             st["due"] = now + TURN
             return
-        waiting = [u for u in _throwers(st) if u not in st["passed"] and _can_throw(st, u)]
+        # «Бито» ждём от всех одинаково, есть им что подкинуть или нет: раньше отбой закрывался сам, когда
+        # подкинуть было нечем, — и по этому было видно, есть ли у соперника карта (владелец 09.11). Сам — только
+        # когда подкидывать больше некуда (это видят все).
+        waiting = [u for u in _throwers(st) if u not in st["passed"]] if _room(st) > 0 else []
         if waiting:
             st["due"] = now + (TURN if st["att"] in waiting and not st["taking"] else GRACE)
             return
@@ -363,12 +369,12 @@ def _status(st: dict, uid: int) -> str:
         if st["taking"]:
             return "Берёшь. Сейчас подкинут ещё"
         return "Отбивайся или «Беру»" if unb else "Отбился! Ждём «Бито»"
-    can = _can_throw(st, uid) and uid not in st["passed"]
+    can, wait = _can_throw(st, uid), uid in st["passed"] or not _room(st)
     if st["taking"]:
-        return f"{nm(dfd)} берёт" + (" - подкинь вдогонку или «Пас»" if can else "")
+        return f"{nm(dfd)} берёт" + ("" if wait else " - подкинь или «Пас»" if can else " - жми «Пас»")
     if unb:
-        return f"{nm(dfd)} отбивается" + (" - можно подкинуть" if _can_throw(st, uid) else "")
-    return "Отбился. Подкинь или «Бито»" if can else "Ждём остальных"
+        return f"{nm(dfd)} отбивается" + (" - можно подкинуть" if can and not wait else "")
+    return "Ждём остальных" if wait else "Отбился. Подкинь или «Бито»" if can else "Отбился - жми «Бито»"
 
 
 def _flags(st: dict, u: int) -> str:
@@ -399,6 +405,10 @@ def view(st: dict, uid: int) -> str:
         if st.get("trump"):
             v["k"] = st["trump"]
         v["d"] = len(st.get("deck", []))
+        if st.get("discard"):
+            v["b"] = st["discard"]
+        if st.get("last") and not st.get("table"):
+            v["lv"] = st["last"]
     if ph == "play":
         v["r"] = ("x" if uid in st["out"] else "d" if uid == st["dfd"] else "a" if uid == st["att"] else "w")
         if v["r"] in "aw":
@@ -454,9 +464,8 @@ async def _send_notes(bot: Bot, st: dict, notes: dict, unnote: list[int] = ()) -
 
 
 def _deal_notes(st: dict) -> dict:
-    att = st["att"]
-    return {u: f"🃏 Козырь {show(st['trump'])}. "
-               + ("Ты заходишь." if u == att else f"Заходит {html.escape(_nm(st, att))}.") for u in _ids(st)}
+    """Раздали — уведомление только тому, кто заходит (о чужих ходах не пишем — владелец 09.11)."""
+    return {st["att"]: "🃏 Твой ход"}
 
 
 async def create(bot: Bot, db: Database, uid: int, name: str = "") -> None:
