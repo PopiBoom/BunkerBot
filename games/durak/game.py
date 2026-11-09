@@ -1,5 +1,8 @@
-"""Дурак (подкидной) в личке у бота — HTML-виджет, как шахматы (09.11, владелец: «а дурака возможно будет создать?»
-→ подкидной, 2-6 игроков, без игры против Пиздюка).
+"""Дурак (переводной) в личке у бота — HTML-виджет, как шахматы (09.11, владелец: «а дурака возможно будет создать?»
+→ подкидной, 2-6 игроков, без игры против Пиздюка; в тот же день — «делай все столы переводными»).
+
+Перевод: пока ни одна карта не побита, отбивающийся кладёт карту того же достоинства — и отбиваться следующему за
+ним (вдвоём — обратно заходившему); у нового отбивающегося карт должно хватать на все карты стола (`transfer`).
 
 /durak (админ; личка или группа): вызвавшему в личку — стол-виджет (`widget.html`), в канал бати — картинка со
 ссылкой `t.me/<бот>?start=dur_<id>` («Сесть за стол»; в личку не шлём — просьба владельца, как у шахмат);
@@ -220,6 +223,41 @@ def attack(st: dict, uid: int, card: str, notes: dict) -> str | None:
     return None  # уведомлений о ходе нет (владелец 09.11: «уведомления, когда ход твой, — не надо»)
 
 
+def can_transfer(st: dict, uid: int) -> bool:
+    """Может ли uid сейчас перевести: он отбивается, ничего не побито, на столе одно достоинство, у него есть такая
+    карта, а у следующего хватит карт на весь стол после перевода."""
+    t = st["table"]
+    if uid != st["dfd"] or st["taking"] or not t or any(d for _a, d in t) or len({a[0] for a, _d in t}) != 1:
+        return False
+    return (any(c[0] == t[0][0][0] for c in _hand(st, uid))
+            and len(_hand(st, _next(st, uid))) >= len(t) + 1)
+
+
+def transfer(st: dict, uid: int, card: str) -> str | None:
+    """Перевод (владелец 09.11: «делай все столы переводными»): карта того же достоинства — и отбивается следующий."""
+    t = st["table"]
+    if uid != st["dfd"]:
+        return "Переводит только отбивающийся"
+    if st["taking"] or not t or any(d for _a, d in t):
+        return "Перевести можно, пока ничего не побито"
+    if card[0] != t[0][0][0] or len({a[0] for a, _d in t}) != 1:
+        return "Перевести можно только картой того же достоинства"
+    hand = _hand(st, uid)
+    if card not in hand:
+        return "Нет такой карты"
+    nxt = _next(st, uid)
+    if len(_hand(st, nxt)) < len(t) + 1:
+        return f"У {_nm(st, nxt)} не хватит карт отбиться"
+    hand.remove(card)
+    t.append([card, None])
+    st["att"], st["dfd"] = uid, nxt  # перевёл — теперь он «заходил», отбивается следующий
+    st["limit"] = min(HAND, len(_hand(st, nxt)))
+    st["passed"] = []
+    st["last"] = None
+    _act(st, uid, "Перевёл")
+    return None
+
+
 def defend(st: dict, uid: int, card: str, i: int, notes: dict) -> str | None:
     if uid != st["dfd"]:
         return f"Отбивается {_nm(st, st['dfd'])}"
@@ -380,7 +418,9 @@ def _status(st: dict, uid: int) -> str:
     if uid == dfd:
         if st["taking"]:
             return "Берёшь. Сейчас подкинут ещё"
-        return "Отбивайся или «Беру»" if unb else "Отбился! Ждём «Бито»"
+        if unb:
+            return "Отбивайся, переводи или «Беру»" if can_transfer(st, uid) else "Отбивайся или «Беру»"
+        return "Отбился! Ждём «Бито»"
     can, wait = _can_throw(st, uid), uid in st["passed"] or not _room(st)
     if st["taking"]:
         return f"{nm(dfd)} берёт" + ("" if wait else " - подкинь или «Пас»" if can else " - жми «Пас»")
@@ -448,6 +488,8 @@ def view(st: dict, uid: int) -> str:
             v["lv"] = st["last"]
     if ph == "play":
         v["r"] = ("x" if uid in st["out"] else "d" if uid == st["dfd"] else "a" if uid == st["att"] else "w")
+        if can_transfer(st, uid):
+            v["v"] = 1  # можно перевести: второе нажатие на карту того же достоинства
         if v["r"] in "aw":
             v["m"] = _room(st)
             if uid in st["passed"]:
@@ -675,6 +717,8 @@ def _apply(st: dict | None, uid: int, kind: str, arg: str, notes: dict) -> tuple
         return {"err": "Игра ещё не началась" if ph == "lobby" else "Игра окончена"}, ev
     elif kind == "ua":
         err = attack(st, uid, arg[:2], notes)
+    elif kind == "uv":
+        err = transfer(st, uid, arg[:2])
     elif kind == "ud":
         err = defend(st, uid, arg[:2], int(arg[2:] or -1) if arg[2:].isdigit() else -1, notes)
     elif kind == "ub":
@@ -724,7 +768,7 @@ async def on_query(bot: Bot, db: Database, q: dict) -> None:
         if not ev["changed"]:
             await _answer(bot, qid, answer)
         else:
-            if kind in ("ua", "ud", "ub", "ut", "us") and "err" not in answer:
+            if kind in ("ua", "ud", "uv", "ub", "ut", "us") and "err" not in answer:
                 st.setdefault("afk", {})[str(uid)] = 0  # сам сходил — снова в игре
                 st["acted"] = time.time()
             await _save(db, gid, st)

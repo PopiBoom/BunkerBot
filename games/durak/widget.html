@@ -60,7 +60,7 @@ let S,rt,qg,qt,sel=-1,busy=0,tm,pt,ph,fm='';
 function up(s){S=s;rt=Date.now();if(S.q&&S.q!=qg){clearTimeout(qt);qt=setTimeout(()=>{qg=S.q;draw()},3e3)}}
 up(J(T.chatData));pt=S.t||'';ph=S.h||'';
 function ok(c){let p=P(),r=S.r;if(S.p!='g')return 0;
-if(r=='d')return!S.tk&&p.some(x=>!x[1]&&bt(c,x[0]));
+if(r=='d')return!S.tk&&(p.some(x=>!x[1]&&bt(c,x[0]))||S.v&&c[0]==p[0][0][0]);
 if(r!='a'&&r!='w')return 0;if(!p.length)return r=='a';
 return S.m>0&&p.some(x=>x.join('').includes(c[0]))}
 function dim(c){let p=P();return S.p=='g'&&!ok(c)&&(S.r=='d'?!S.tk&&p.some(x=>!x[1]):S.r=='a'||S.r=='w'&&p.length)}
@@ -86,6 +86,7 @@ $('hd').onclick=e=>{let c=e.target.closest('.c');if(!c||!T||busy)return;let i=[.
 if(!ok(q))return toast(dim(q)?'Так нельзя':'Не твой ход');
 if(sel!=i){sel=i;return draw()}
 if(S.r!='d')return send('ua',q);
+if(S.v&&q[0]==P()[0][0][0])return send('uv',q);
 let t=P().map((x,j)=>!x[1]&&bt(q,x[0])?j:-1).filter(j=>j>=0);
 t.length>1?toast('Нажми, какую кроешь'):send('ud',q+t[0])};
 $('pr').onclick=e=>{let c=e.target.closest('.p');if(!c||sel<0||S.r!='d'||busy)return;let j=[...$('pr').children].indexOf(c),q=H()[sel],x=P()[j];
