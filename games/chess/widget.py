@@ -160,7 +160,7 @@ def end_line(st: dict) -> str:
     end = st.get("end") or {}
     why = end.get("why", "")
     if why == "cancel":
-        return "Вызов отменён"
+        return "Партия остановлена" if end.get("stop") else "Вызов отменён"
     if why in DRAWS:
         return "Ничья: " + DRAWS[why]
     winner, loser = _players(st, end)
@@ -298,6 +298,27 @@ async def _drop_post(bot: Bot, st: dict) -> None:
             await bot.delete_message(post[0], post[1])
         except Exception as e:  # noqa: BLE001 — уже удалили руками
             logger.info("шахматы-виджет: пост %s не удалился: %s", post, e)
+
+
+async def close_all(bot: Bot, db: Database) -> int:
+    """/stop_all: все неоконченные партии и вызовы — «Партия остановлена» на досках, пост-вызов удалить. Сколько."""
+    n = 0
+    for key, _raw in await db.settings_with_prefix(KEY):
+        gid = key[len(KEY):]
+        async with _lock(gid):
+            st = await _load(db, gid)
+            if not st or st.get("end"):
+                continue
+            st["end"] = {"why": "cancel", "win": 0, "stop": 1}
+            st.pop("draw", None)
+            for uid in list((st.get("msgs") or {}).keys()):
+                await _unnote(bot, st, int(uid))
+                await _push(bot, st, int(uid))
+            await _drop_post(bot, st)
+            await _save(db, gid, st)
+            n += 1
+    await db.set_setting(OPEN, "")
+    return n
 
 
 async def create(bot: Bot, db: Database, uid: int, name: str = "", where: int | None = None) -> None:

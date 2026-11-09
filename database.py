@@ -1172,6 +1172,13 @@ class Database:
             row = await cur.fetchone()
             return row[0] if row else default
 
+    async def settings_with_prefix(self, prefix: str) -> list[tuple[str, str]]:
+        """Все настройки, чей ключ начинается с prefix (партии шахмат и т.п. — для /stop_all)."""
+        pattern = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT key, value FROM settings WHERE key LIKE ? ESCAPE '\\'", (pattern,))
+            return [(k, v) for k, v in await cur.fetchall()]
+
     async def set_setting(self, key: str, value: str) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(

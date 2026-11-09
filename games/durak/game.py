@@ -558,9 +558,11 @@ async def _drop_post(bot: Bot, st: dict) -> None:
             logger.info("дурак: пост %s не удалился: %s", post, e)
 
 
-async def _close_host_tables(bot: Bot, db: Database, uid: int, why: str) -> None:
+async def _close_host_tables(bot: Bot, db: Database, uid: int | None, why: str) -> int:
     """Новый стол у хозяина — его прошлые столы (несобранные и начатые) закрыть: иначе брошенная партия шла дальше
-    на таймерах и слала ему «отбивайся» (владелец 09.11: «игры нет, а мне пишет в лс»)."""
+    на таймерах и слала ему «отбивайся» (владелец 09.11: «игры нет, а мне пишет в лс»). uid=None — все столы всех
+    (/stop_all). Сколько закрыл."""
+    closed = 0
     try:  # сразу после перезапуска ticker мог ещё не прочитать список
         _live.update(json.loads(await db.get_setting(LIVE, "[]") or "[]"))
     except ValueError:
@@ -568,7 +570,7 @@ async def _close_host_tables(bot: Bot, db: Database, uid: int, why: str) -> None
     for gid in list(_live):
         async with _lock(gid):
             st = await _load(db, gid)
-            if not st or st.get("host") != uid or st["phase"] not in ("lobby", "play"):
+            if not st or (uid is not None and st.get("host") != uid) or st["phase"] not in ("lobby", "play"):
                 continue
             st.update(phase="end", durak=None, cancel=why)
             st.pop("due", None)
@@ -578,6 +580,15 @@ async def _close_host_tables(bot: Bot, db: Database, uid: int, why: str) -> None
             await _drop_post(bot, st)
             await _save(db, gid, st)
             await _set_live(db, gid, False)
+            closed += 1
+    if uid is None:
+        await db.set_setting(OPEN, "")
+    return closed
+
+
+async def close_all(bot: Bot, db: Database, why: str = "Стол закрыт админом") -> int:
+    """/stop_all: закрыть все столы (и несобранные, и идущие)."""
+    return await _close_host_tables(bot, db, None, why)
 
 
 def _deal_notes(st: dict) -> dict:

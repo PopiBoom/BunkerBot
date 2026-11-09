@@ -448,6 +448,24 @@ async def _tick(bot: Bot, db: Database, t: Table) -> None:
         logger.exception("блэкджек: таймер стола")
 
 
+async def close_all(bot: Bot, db: Database) -> int:
+    """/stop_all: все открытые столы закрыть; посреди раунда — ставки раунда назад. Сколько."""
+    n = 0
+    for t in list(_tables.values()):
+        if t.phase == "closed":
+            continue
+        async with t.lock:
+            back = t.phase == "play" and bool(t.bets)
+            if back:
+                for uid, bet in t.bets.items():
+                    await db.add_coins(int(uid), int(bet))
+                await _save_pending(db, t, None)
+            t.phase, t.quip = "closed", "Стол закрыт админом." + (" Ставки раунда вернул." if back else "")
+            _refresh(bot, db, t)
+        n += 1
+    return n
+
+
 # ---------- команды и кнопки ----------
 
 

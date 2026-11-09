@@ -329,6 +329,26 @@ async def _painter(bot: Bot, db: Database, gid: str, target: tuple) -> None:
         _painters.pop(gid, None)
 
 
+async def close_all(bot: Bot, db: Database, text: str = "Партия остановлена") -> int:
+    """/stop_all: все идущие партии — итог «остановлена» на доске (кнопки ходов убираются, как после мата). Сколько."""
+    n = 0
+    for key, _raw in await db.settings_with_prefix(KEY):
+        gid = key[len(KEY):]
+        async with _lock(gid):
+            st = await _load(db, gid)
+            if not st or st.get("over") or not st.get("w"):
+                continue
+            st["over"] = text
+            await _save(db, gid, st)
+        chat, _, msg = gid.partition(":")
+        target = (None, int(chat), int(msg)) if msg else (gid, None, None)
+        _dirty[gid] = _dirty.get(gid, 0) + 1
+        if gid not in _painters:
+            _painters[gid] = asyncio.create_task(_painter(bot, db, gid, target))
+        n += 1
+    return n
+
+
 def _refresh(bot: Bot, db: Database, call: CallbackQuery) -> None:
     """Партия изменилась — перерисовать доску (не сразу, если правок было много: см. EDIT_GAP)."""
     gid = _gid(call)
