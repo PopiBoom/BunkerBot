@@ -221,6 +221,36 @@ async def _noop(_text: str) -> None:
     return None
 
 
+CAPTION_MAX = 1024  # лимит подписи Telegram: видимые знаки после разметки, в UTF-16
+
+
+def _vis_len(text: str) -> int:
+    """Длина подписи так, как её считает Telegram: без тегов, «&lt;» — один знак, эмодзи — два."""
+    return len(html.unescape(re.sub(r"<[^>]+>", "", text)).encode("utf-16-le")) // 2
+
+
+def _cut_vis(text: str, room: int) -> str:
+    """Обычный текст (не HTML) не длиннее room знаков Telegram: по слову и «…»."""
+    if _vis_len(html.escape(text)) <= room:
+        return text
+    cut = text[:max(0, room - 1)]
+    while cut and _vis_len(cut) > room - 1:
+        cut = cut[:-1]
+    return (cut.rsplit(" ", 1)[0] if " " in cut else cut).rstrip(",.;:-— ") + "…"
+
+
+def _draft_caption(caption: str, voice: str, text: str) -> str:
+    """Подпись черновика: подпись выпуска, служебная строка о голосе, начало текста — всё вместе в CAPTION_MAX.
+    09.11: служебная строка выросла (манера, концовка, понятность, сквозное), и 680 знаков текста сверху дали
+    «message caption is too long» — собранный выпуск пропадал. Теперь текст режется по остатку места."""
+    room = CAPTION_MAX - 8 - _vis_len(caption) - len("\n\nЧерновик. Текст:\n")
+    voice_room = min(300, max(0, room - min(250, _vis_len(text))))  # текст важнее: под него до 250 знаков
+    who = f"<i>Голос: {html.escape(_cut_vis(voice, voice_room - 7))}</i>\n" if voice and voice_room > 40 else ""
+    quote = _cut_vis(text, min(680, room - _vis_len(who)))
+    return (f"{caption}\n\n{who}<i>Черновик. Текст:</i>\n"
+            + (f"<blockquote expandable>{html.escape(quote)}</blockquote>" if quote.strip("…") else ""))
+
+
 def _short(text: str, n: int) -> str:
     """Не длиннее n знаков и не посреди слова."""
     return text if len(text) <= n else text[:n].rsplit(" ", 1)[0].rstrip(",;:-— ")
@@ -478,7 +508,6 @@ async def _send_draft(bot: Bot, db: Database, chat_id: int, horror: bool, progre
                                         f"ключа (/setkey yandex или OpenRouter) или сбой озвучки{why}. Это текст.</i>")
         return False
     # какой голос читал (и кто до него не справился) — видно только в черновике, в канал не идёт
-    who = f"<i>Голос: {html.escape(ep.get('voice', '')[:300])}</i>\n" if ep.get("voice") else ""
     cover_id = None
     if ep.get("cover"):  # обложка-улика — над голосовым, как будет в канале
         try:
@@ -486,10 +515,16 @@ async def _send_draft(bot: Bot, db: Database, chat_id: int, horror: bool, progre
             cover_id = ph.photo[-1].file_id
         except Exception as e:  # noqa: BLE001
             logger.info("horror: обложку в черновик не отправил: %s", e)
-    msg = await bot.send_voice(chat_id, BufferedInputFile(ep["ogg"], "night.ogg"), reply_markup=_kb(),
-                               duration=ep.get("secs") or None,
-                               caption=f"{ep['caption']}\n\n{who}<i>Черновик. Текст:</i>\n"
-                                       f"<blockquote expandable>{html.escape(text[:680])}</blockquote>")
+    voice = BufferedInputFile(ep["ogg"], "night.ogg")
+    try:
+        msg = await bot.send_voice(chat_id, voice, reply_markup=_kb(), duration=ep.get("secs") or None,
+                                   caption=_draft_caption(ep["caption"], ep.get("voice") or "", text))
+    except TelegramBadRequest as e:  # подпись всё равно не пустили — голосовое дороже подписи, шлём без текста
+        if "caption" not in str(e).lower():
+            raise
+        logger.warning("night: подпись черновика не принята (%s) — без текста", e)
+        msg = await bot.send_voice(chat_id, voice, reply_markup=_kb(), duration=ep.get("secs") or None,
+                                   caption=_cut_vis(re.sub(r"<[^>]+>", "", ep["caption"]), 900))
     await db.set_setting(DRAFT_KEY, json.dumps({"file_id": msg.voice.file_id, "caption": ep["caption"],
                                                 "n": ep["n"], "msg": msg.message_id, "chat": chat_id,
                                                 "horror": horror, "letter": ep.get("letter"),
