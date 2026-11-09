@@ -30,7 +30,7 @@ from games.chess import router as chess_router
 from games.chess.game import note_forward as note_chess_forward
 from handlers import (admin_router, compare_router, fun_router, help_router, menu_router, quotes_router,
                       roast_router, stats_router, user_router)
-from handlers.admin import auto_backup_loop
+from handlers.admin import auto_backup_loop, spend_report_loop
 from handlers.collect import router as collect_router
 from handlers.court import observe as court_observe
 from handlers.court import router as court_router
@@ -42,7 +42,6 @@ from handlers.rant import observe as rant_observe
 from handlers.rant import router as rant_router
 from handlers.night import router as night_router
 from handlers.protocol import router as protocol_router
-from handlers.serial import router as serial_router
 from handlers.roast import background as roast_background
 
 logging.basicConfig(
@@ -218,6 +217,9 @@ async def main() -> None:
     bot.session.middleware(TempReplies())   # служебные ответы в чате удаляются через минуту
     import ai
     ai.set_usage_sink(db.add_ai_usage)  # учёт токенов и стоимости запросов к ИИ
+    ai.set_eleven_sink(db.add_eleven_usage)  # что списал ElevenLabs — для недельного отчёта
+    import watchdog
+    watchdog.setup(bot, config.token, config.admin_ids[0], config.proxy or "")  # сбои Claude/ElevenLabs/прокси — владельцу
     ai.set_openrouter_key(await db.get_setting("openrouter_key", ""))  # ключ, присланный боту через /setkey
     ai.set_eleven_key(await db.get_setting("eleven_key", ""))  # голос ночного эфира (/setkey eleven …)
     ai.set_eleven_voice(await db.get_setting("eleven_voice", ""))  # голос рубрики (/setkey eleven голоса)
@@ -251,7 +253,6 @@ async def main() -> None:
     dp.include_router(diss_router)      # /diss — дисс-трек (ElevenLabs Music)
     dp.include_router(news_router)      # /news — новости чата (сами в 21:00)
     dp.include_router(rant_router)      # /podpisota — голосовое в канал (само раз в день)
-    dp.include_router(serial_router)    # /serial
     dp.include_router(night_router)     # /night — ночной эфир, черновик в личку
     # Стёб-бот последним: ловит все остальные сообщения групп
     dp.include_router(roast_router)
@@ -272,6 +273,8 @@ async def main() -> None:
         asyncio.create_task(roast_background(bot, db)),
         asyncio.create_task(auto_backup_loop(bot, db, config)),  # ночной бэкап базы бате в личку
         asyncio.create_task(flag_loop()),  # флаг «идёт игра»: пока он свежий, сервер не обновляется
+        asyncio.create_task(watchdog.loop()),  # сторож: прокси раз в 5 мин, досылка «не работает / снова работает»
+        asyncio.create_task(spend_report_loop(bot, db, config)),  # отчёт о тратах владельцу раз в неделю
     ]
     try:
         # message_reaction Telegram по умолчанию не присылает — просим все типы, что ловят обработчики

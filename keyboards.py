@@ -27,12 +27,22 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats"))
     builder.row(InlineKeyboardButton(text="📢 Рассылка", callback_data="admin:broadcast"))
-    builder.row(InlineKeyboardButton(text="💰 Расходы ИИ", callback_data="admin:ai_costs"))
+    builder.row(
+        InlineKeyboardButton(text="💰 Расходы ИИ", callback_data="admin:ai_costs"),
+        InlineKeyboardButton(text="💸 Траты за неделю", callback_data="admin:spend_week"),
+    )
     builder.row(InlineKeyboardButton(text="🔥 Стёб-бот: вкл/выкл", callback_data="admin:roast_toggle"))
     builder.row(InlineKeyboardButton(text="⏱ Как часто бот встревает", callback_data="admin:roast_freq"))
     builder.row(InlineKeyboardButton(text="😈 Как часто ставит реакции", callback_data="admin:react"))
+    builder.row(
+        InlineKeyboardButton(text="📷 Частота фото", callback_data="admin:rate:photo"),
+        InlineKeyboardButton(text="🧩 Частота стикеров", callback_data="admin:rate:sticker"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🎶 Частота рифм", callback_data="admin:rate:rhyme"),
+        InlineKeyboardButton(text="🗣 Частота голоса", callback_data="admin:rate:voice"),
+    )
     builder.row(InlineKeyboardButton(text="🤔 Вопрос дня в тишину: вкл/выкл", callback_data="admin:quiet_kick"))
-    builder.row(InlineKeyboardButton(text="📢 Посты в канал (тест): вкл/выкл", callback_data="admin:chan_posts"))
     builder.row(InlineKeyboardButton(text="🎙 Голосовые в канал: вкл/выкл", callback_data="admin:rant"))
     builder.row(
         InlineKeyboardButton(text="🃏 Карточки: вкл/выкл", callback_data="admin:cards"),
@@ -85,6 +95,19 @@ def react_rate_keyboard(current: float) -> InlineKeyboardMarkup:
     for rate, label in REACT_OPTIONS:
         mark = "✅ " if abs(rate - current) < 1e-9 else ""
         builder.button(text=f"{mark}{label}", callback_data=f"admin:react:{rate}")
+    builder.adjust(4)
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:cancel"))
+    return builder.as_markup()
+
+
+def rate_keyboard(key: str, current: float) -> InlineKeyboardMarkup:
+    """Частота фото/стикеров/рифм/голоса (handlers/roast.RATES) — по образцу «Как часто ставит реакции»."""
+    from handlers.roast import RATES
+
+    builder = InlineKeyboardBuilder()
+    for value, label in RATES[key]["options"]:
+        mark = "✅ " if abs(value - current) < 1e-9 else ""
+        builder.button(text=f"{mark}{label}", callback_data=f"admin:rate:{key}:{value}")
     builder.adjust(4)
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:cancel"))
     return builder.as_markup()

@@ -49,6 +49,7 @@ from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButto
                            MessageReactionCountUpdated)
 
 import ai
+import evening
 from config import Config
 from database import Database
 from ephemeral import temp_reply
@@ -341,10 +342,10 @@ async def tick(bot: Bot, db: Database) -> None:
     slot = await db.get_setting(SLOT_KEY, "")
     if not slot.startswith(today):
         earliest = max(FROM_HOUR * 60, now.hour * 60 + now.minute + 10)  # запустились посреди дня — не сразу
-        if earliest >= TO_HOUR * 60:
+        at = evening.pick_minute(earliest, TO_HOUR * 60)  # не в 19:30-22:30: там итоги недели, новости, клоун
+        if at is None:
             await db.set_setting(DAY_KEY, today)  # сегодня уже поздно
             return
-        at = random.randint(earliest, TO_HOUR * 60 - 1)
         slot = f"{today} {at // 60:02d}:{at % 60:02d}"
         await db.set_setting(SLOT_KEY, slot)
         logger.info("голосовое в канал сегодня в %s", slot[-5:])

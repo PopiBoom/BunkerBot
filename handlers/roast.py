@@ -33,6 +33,7 @@ from aiogram.types import BufferedInputFile, Message, MessageReactionUpdated, Re
 
 import ai
 import cards
+import evening
 import frames
 import links
 import memes
@@ -281,6 +282,57 @@ def react_label(rate: float) -> str:
     return next((label for r, label in REACT_OPTIONS if abs(r - rate) < 1e-9), f"{int(rate * 100)}%")
 
 
+# Частоты, которые админ меняет кнопками в /admin (09.11, владелец; раньше — константы в коде). Ключ настройки —
+# RATE_PREFIX + имя; в памяти — _rates (обработчики сообщений синхронно спрашивают rate()). Загружает load_rates
+# при первом тике фона, меняет set_rate из /admin.
+RATE_PREFIX = "rate_"
+RATES: dict[str, dict] = {
+    "photo": {"title": "📷 Комменты к фото и видео", "default": 0.35,
+              "options": [(0.0, "выкл"), (0.15, "редко"), (0.35, "иногда"), (0.6, "часто")],
+              "about": "На фото, кружок или видео без обращения к боту — коммент с этим шансом (не сразу после "
+                       "своей реплики). Редко ≈ 15%, иногда ≈ 35%, часто ≈ 60%. На фото с обращением к боту и "
+                       "демотиваторы/видео-мемы это не влияет."},
+    "sticker": {"title": "🧩 Стикеры", "default": 0.2,
+                "options": [(0.0, "выкл"), (0.1, "редко"), (0.2, "иногда"), (0.4, "часто")],
+                "about": "Стикер после ответа (редко ≈ 10%, иногда ≈ 20%, часто ≈ 40%), стикер вместо слов, когда "
+                         "лень отвечать (иначе реакция), и своим стикером на чужой. Выкл — бот стикеры не кидает "
+                         "совсем, только реакции."},
+    "rhyme": {"title": "🎶 Рифмы", "default": 0.12,
+              "options": [(0.0, "выкл"), (0.06, "редко"), (0.12, "иногда"), (0.25, "часто")],
+              "about": "Рифмы-отговорки на «и чё?», «ну», «да» (без ИИ). В общем чате — с этим шансом и не "
+                       "чаще раза в 15 мин (редко ≈ 6%, иногда ≈ 12%, часто ≈ 25%); в ответ боту — почти всегда. "
+                       "Выкл — рифм нет совсем."},
+    "voice": {"title": "🗣 Голосом в чате", "default": 0.15,
+              "options": [(0.0, "выкл"), (0.08, "редко"), (0.15, "иногда"), (0.3, "часто")],
+              "about": "Сколько ответов бот сам говорит голосом (ElevenLabs, голос из /golos), не чаще раза в "
+                       "5 мин: редко ≈ 8%, иногда ≈ 15%, часто ≈ 30%. На голосовое, обращённое к боту, он "
+                       "отвечает голосом всегда (это разговор, не шанс)."},
+}
+_rates: dict[str, float] = {}
+
+
+def rate(key: str) -> float:
+    return _rates.get(key, RATES[key]["default"])
+
+
+def rate_label(key: str, value: float | None = None) -> str:
+    value = rate(key) if value is None else value
+    return next((label for v, label in RATES[key]["options"] if abs(v - value) < 1e-9), f"{value * 100:.0f}%")
+
+
+async def load_rates(db: Database) -> None:
+    for key, spec in RATES.items():
+        try:
+            _rates[key] = float(await db.get_setting(RATE_PREFIX + key, str(spec["default"])))
+        except ValueError:
+            _rates[key] = spec["default"]
+
+
+async def set_rate(db: Database, key: str, value: float) -> None:
+    await db.set_setting(RATE_PREFIX + key, str(value))
+    _rates[key] = value
+
+
 def _spawn(coro) -> None:
     task = asyncio.create_task(coro)
     _bg.add(task)
@@ -415,9 +467,8 @@ async def _typing_on(bot: Bot, chat_id: int, action: str = "typing"):
 
 
 # Иногда — голосом (владелец 08.11: «иногда отвечай голосом в чате, когда стебёшь; пусть расставляет интонацию»):
-# ответ на обращение, ответка, сам встрял — с шансом VOICE_SHARE, не чаще раза в VOICE_GAP в чате; озвучка —
+# ответ на обращение, ответка, сам встрял — с шансом rate("voice") (/admin, по умолчанию 0.15), не чаще раза в VOICE_GAP в чате; озвучка —
 # ai.roast_speech (Haiku ставит пометки интонации, ElevenLabs v4). Не вышло — текстом, как обычно.
-VOICE_SHARE = 0.15
 VOICE_GAP = 5 * 60
 _voice_last: dict[int, float] = {}
 
@@ -425,12 +476,12 @@ _voice_last: dict[int, float] = {}
 def _roll_voice(chat_id: int) -> bool:
     if not ai.eleven_key() or ai.eleven_geo_blocked() or time.time() - _voice_last.get(chat_id, 0) < VOICE_GAP:
         return False
-    return random.random() < VOICE_SHARE
+    return random.random() < rate("voice")  # /admin «🗣 Голосом в чате», по умолчанию 0.15
 
 
 # Голосовой разговор (владелец 08.11: «если бот кинул голосовое и на него ответили тоже голосом — пусть и дальше
 # отвечает этому человеку голосовыми, а не текстом»): человек ответил голосом на голосовое бота — или, пока идёт
-# разговор (VOICE_TALK после голосового бота ему), обратился к боту голосом — ответ тоже голосом, без шанса VOICE_SHARE
+# разговор (VOICE_TALK после голосового бота ему), обратился к боту голосом — ответ тоже голосом, без шанса rate("voice")
 # и паузы VOICE_GAP. Перешёл на текст — бот снова отвечает как обычно.
 VOICE_TALK = 15 * 60
 _voice_talk: dict[tuple[int, int], float] = {}  # (чат, человек) → когда бот последний раз ответил ему голосом
@@ -1320,7 +1371,7 @@ async def _maybe_laugh(message: Message, bot: Bot, db: Database, config) -> bool
 
 
 RHYME_REPLY = 0.85      # на «да / и чё / а?» в ответ боту — почти всегда рифмой
-RHYME_FREE = 0.12       # на такое же в общем чате — изредка…
+# на такое же в общем чате — изредка: rate("rhyme") из /admin «🎶 Рифмы», по умолчанию 0.12; 0 — рифм нет совсем
 RHYME_GAP = 15 * 60     # …и не чаще раза в 15 минут в чате
 _rhyme_last: dict[int, float] = {}
 
@@ -1334,12 +1385,14 @@ async def _maybe_rhyme(message: Message, bot: Bot, config) -> bool:
     user = message.from_user
     if user and user.id == _father_id(config) and random.random() >= ai.FATHER_RUDE_CHANCE:
         return False  # бате — только в «грубый» раз, как и остальная грубость
+    if rate("rhyme") <= 0:
+        return False
     reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user
                         and message.reply_to_message.from_user.id == bot.id)
     if reply_to_bot:
         if random.random() > RHYME_REPLY:
             return False
-    elif time.time() - _rhyme_last.get(chat_id, 0) < RHYME_GAP or random.random() > RHYME_FREE:
+    elif time.time() - _rhyme_last.get(chat_id, 0) < RHYME_GAP or random.random() > rate("rhyme"):
         return False
     answer = rhymes.rhyme_for(text, chat_id)
     _mark("рифма (без ИИ)")
@@ -1429,7 +1482,7 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
         if empty and n >= 1:
             chance = min(chance, 0.3)
         if random.random() > chance:
-            if random.random() < STICKER_INSTEAD or not await _send_sticker(bot, db, chat_id, text, last_msg.message_id):
+            if random.random() < _sticker_instead() or not await _send_sticker(bot, db, chat_id, text, last_msg.message_id):
                 await _react(bot, chat_id, last_msg.message_id,
                              "🖕" if rude else random.choice(COOL_REACTIONS), force=True)
             return
@@ -1496,17 +1549,29 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
                          voice=voice, to_user=who.id if who else None)
         if who:
             _thread.setdefault((chat_id, who.id), []).append(time.time())
-        if random.random() < STICKER_AFTER:
+        if random.random() < rate("sticker"):
             await asyncio.sleep(random.uniform(1.0, 2.5))
             await _send_sticker(bot, db, chat_id, f"{text}\nОтвет бота: {answer}")
 
 
 # ---------- стикеры и гифки ----------
 
-STICKER_AFTER = 0.2     # иногда после ответа бот докидывает стикер
-STICKER_INSTEAD = 0.5   # когда лень отвечать словами: доля случаев, где хватит реакции, а не стикера
+# Частота — rate("sticker") из /admin «🧩 Стикеры» (по умолчанию 0.2): с этим шансом бот докидывает стикер после
+# ответа, от неё же — «стикер вместо слов» и «своим на чужой»; 0 — стикеров нет совсем.
 STICKER_REPLY = 0.7     # на стикер в ответ боту — стикером
-STICKER_RANDOM = 0.04   # на чужой стикер — иногда своим
+STICKER_RANDOM = 0.04   # на чужой стикер — иногда своим (при частоте по умолчанию)
+
+
+def _sticker_instead() -> float:
+    """Когда лень отвечать словами: доля случаев, где хватит реакции, а не стикера (0.5 при частоте 0.2)."""
+    return max(0.0, 1.0 - rate("sticker") * 2.5)
+
+
+def _sticker_back(reply_to_bot: bool) -> float:
+    r = rate("sticker")
+    if r <= 0:
+        return 0.0
+    return STICKER_REPLY if reply_to_bot else STICKER_RANDOM * r / RATES["sticker"]["default"]
 MIN_STICKERS = 3        # пока чат не накидал хотя бы столько разных стикеров/гифок — не отвечаем ими
 _sticker_last: dict[int, float] = {}
 STICKER_GAP = 20        # сек между стикерами бота в одном чате
@@ -1581,7 +1646,7 @@ async def _maybe_answer_sticker(bot: Bot, db: Database, message: Message) -> Non
         return
     reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user
                         and message.reply_to_message.from_user.id == bot.id)
-    if random.random() < (STICKER_REPLY if reply_to_bot else STICKER_RANDOM):
+    if random.random() < _sticker_back(reply_to_bot):
         ctx = _as_dicts(await db.recent_messages(message.chat.id, limit=6))
         situation = "\n".join(f"{m['name']}: {m['text']}" for m in ctx)
         await asyncio.sleep(random.uniform(1.0, 3.0))
@@ -1709,7 +1774,7 @@ async def cmd_promises(message: Message, db: Database) -> None:
 
 # ---------- стёб по фото ----------
 
-PHOTO_CHANCE = 0.35  # на фото без обращения к боту отвечает примерно на каждое третье
+# На фото без обращения к боту — коммент с шансом rate("photo") (/admin «📷 Комменты к фото», по умолчанию 0.35)
 
 
 @router.message(F.photo)
@@ -2038,7 +2103,7 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
                                                                                     label, speech):
         return
     if not addressed:
-        if random.random() > PHOTO_CHANCE or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
+        if random.random() >= rate("photo") or time.time() - _last_bot_msg.get(chat_id, 0) < QUIET_AFTER_SPEAKING:
             return
     is_father = user.id == _father_id(config)
     if is_father:
@@ -2065,7 +2130,6 @@ async def _visual(message: Message, bot: Bot, db: Database, config, src_file, la
 
 # ---------- «Клоун дня» ----------
 
-CLOWN_HOUR = 21  # МСК: в это время (и позже) бот выбирает клоуна дня
 
 
 async def _clown_of_day(bot: Bot, db: Database, chat_id: int) -> bool:
@@ -2264,15 +2328,17 @@ async def _heavy(bot: Bot, db: Database) -> None:
             logger.warning("dossier update failed: %s", e)
 
     now_msk = datetime.now(MSK)
-    if now_msk.hour >= CLOWN_HOUR:  # клоун дня — раз в сутки, после 21:00 МСК
+    if now_msk.hour * 60 + now_msk.minute >= evening.CLOWN_AT:  # клоун дня — раз в сутки, с 21:40 МСК
         today = now_msk.strftime("%Y-%m-%d")
         for chat_id in await db.active_chats(int(time.time()) - 86400):
             key = f"roast_clown:{chat_id}"
             if await db.get_setting(key, "") == today or _bunker_active(chat_id):
                 continue
             from handlers import news
-            if await news.pending(db, chat_id):  # новости тоже в 21:00 — клоун после них, не разом
+            if await news.pending(db, chat_id):  # новости в 21:00 — клоун после них, не разом
                 continue
+            if time.time() - await news.last_issue(db, chat_id) < evening.CLOWN_AFTER_NEWS:
+                continue  # новости только что вышли — клоун через 35 мин
             await db.set_setting(key, today)
             try:
                 await _clown_of_day(bot, db, chat_id)
@@ -2305,6 +2371,10 @@ async def background(bot: Bot, db: Database) -> None:
     """Запускается из bot.py: тяжёлая работа раз в 10 минут, обещания, посты, опросы. Спонтанные подколы —
     не здесь, а шансом на каждое сообщение (_maybe_auto)."""
     last_heavy = 0.0
+    try:
+        await load_rates(db)  # частоты фото/стикеров/рифм/голоса из /admin
+    except Exception as e:
+        logger.warning("rates load failed: %s", e)
     while True:
         try:
             if await _enabled(db) and ai.available():
@@ -2315,12 +2385,6 @@ async def background(bot: Bot, db: Database) -> None:
                     await _remind_promises(bot, db)
                 except Exception as e:
                     logger.warning("promise reminders failed: %s", e)
-                # Посты бота в канал (пока тестовый режим из /admin)
-                try:
-                    from handlers import channel_posts
-                    await channel_posts.tick(bot, db)
-                except Exception as e:
-                    logger.warning("channel posts tick failed: %s", e)
                 # Голосовое Пиздюка в канал — раз в день в случайное время (минута записи — фон не ждёт)
                 try:
                     from handlers import rant
@@ -2338,7 +2402,7 @@ async def background(bot: Bot, db: Database) -> None:
                         _spawn(night.resume_tick(bot, db))  # перезапуск посреди сборки эфира — собрать заново
                 except Exception as e:
                     logger.warning("night first tick failed: %s", e)
-                # Новости чата — раз в день в 21:00 МСК (сериал сам больше не выходит — serial.AUTO)
+                # Новости чата — раз в день в 21:00 МСК
                 try:
                     from handlers import news
                     await news.tick(bot, db)

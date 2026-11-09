@@ -54,6 +54,17 @@ class Database:
                 )
                 """
             )
+            await db.execute(  # что списал ElevenLabs (заголовок character-cost) — недельный отчёт владельцу
+                """
+                CREATE TABLE IF NOT EXISTS eleven_usage (
+                    ts       INTEGER NOT NULL,
+                    kind     TEXT,
+                    what     TEXT,
+                    chars    INTEGER NOT NULL DEFAULT 0,
+                    credits  INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS chat_messages (
@@ -957,6 +968,29 @@ class Database:
                 (int(time.time()), game_key, model, input_tokens, output_tokens, cost, kind),
             )
             await db.commit()
+
+    async def add_eleven_usage(self, kind: str | None, what: str, chars: int, credits: int) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("INSERT INTO eleven_usage (ts, kind, what, chars, credits) VALUES (?, ?, ?, ?, ?)",
+                             (int(time.time()), kind, what, int(chars), int(credits)))
+            await db.commit()
+
+    async def spend_since(self, since: int) -> dict:
+        """Расходы с since: Claude по функциям [(kind, $, запросов)] и ElevenLabs по функциям
+        [(kind, what, кредитов, запросов)] — для недельного отчёта владельцу."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT COALESCE(kind, ''), SUM(cost), COUNT(*) FROM ai_usage WHERE ts >= ? "
+                "GROUP BY kind ORDER BY SUM(cost) DESC", (since,))
+            claude = list(await cur.fetchall())
+            cur = await db.execute(
+                "SELECT COALESCE(kind, ''), COALESCE(what, ''), SUM(credits), COUNT(*) FROM eleven_usage "
+                "WHERE ts >= ? GROUP BY kind, what ORDER BY SUM(credits) DESC", (since,))
+            eleven = list(await cur.fetchall())
+            cur = await db.execute("SELECT model, SUM(cost) FROM ai_usage WHERE ts >= ? GROUP BY model "
+                                   "ORDER BY SUM(cost) DESC", (since,))
+            models = list(await cur.fetchall())
+        return {"claude": claude, "eleven": eleven, "models": models}
 
     async def ai_usage_report(self) -> dict:
         """Сводка расходов: последняя партия, сегодня, 30 дней, всё время, по моделям."""

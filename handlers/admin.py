@@ -553,35 +553,6 @@ def _ver() -> str:
         return "?"
 
 
-@router.callback_query(F.data == "admin:chan_posts")
-async def admin_chan_posts(call: CallbackQuery, bot: Bot, db: Database, config: Config) -> None:
-    if not _is_admin(call.from_user.id, config):
-        await call.answer(texts.ADMIN_ONLY, show_alert=True)
-        return
-    from handlers import channel_posts as CP
-
-    if (await db.get_setting(CP.MODE_KEY, "off")) == "test":
-        await CP.stop(db)
-        await call.answer("Посты в канал выключены ⛔", show_alert=True)
-        return
-    chan = await CP.channel_id(bot, db)
-    if chan is None:
-        await call.answer("Не нашёл канал: привяжи его к чату (Канал → Обсуждение) "
-                          "или впиши BOT_CHANNEL_ID в .env.", show_alert=True)
-        return
-    await CP.start_test(db, call.from_user.id)
-    await call.answer("Тест включён 📢", show_alert=True)
-    if call.message:
-        await call.message.answer(
-            f"📢 <b>Тест постов в канал включён</b>\n\n"
-            f"Бот пишет в канал от себя каждые {CP.TEST_EVERY // 60} мин, через {CP.TEST_FOR // 60} мин "
-            "выключится сам и напишет тебе. Выключить раньше — та же кнопка.\n\n"
-            "Нужно, чтобы бот был админом канала с правом «Публикация сообщений». В постах — его мысли "
-            "в духе канала, без имён и переписки из чата (канал видят подписчики). Свои посты он в чате "
-            "не комментирует. Пишут по очереди Opus и Gemini (без ключа OpenRouter — только Opus) или победитель /compare — каждый пост ≈ $0.003-0.03."
-        )
-
-
 @router.callback_query(F.data == "admin:quiet_kick")
 async def admin_quiet_kick(call: CallbackQuery, db: Database, config: Config) -> None:
     if not _is_admin(call.from_user.id, config):
@@ -811,6 +782,50 @@ async def admin_react_set(call: CallbackQuery, db: Database, config: Config) -> 
             logger.warning("react menu edit failed: %s", e)
 
 
+def _rate_text(key: str) -> str:
+    from handlers.roast import RATES, rate_label
+
+    spec = RATES[key]
+    return f"<b>{spec['title']}: как часто</b>\n\nСейчас: <b>{rate_label(key)}</b>\n\n{spec['about']}"
+
+
+@router.callback_query(F.data.startswith("admin:rate:"))
+async def admin_rate(call: CallbackQuery, db: Database, config: Config) -> None:
+    """Частоты фото/стикеров/рифм/голоса: «admin:rate:<ключ>» — меню, «admin:rate:<ключ>:<значение>» — выбор."""
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    from handlers.roast import RATES, load_rates, rate, rate_label, set_rate
+    from keyboards import rate_keyboard
+
+    parts = (call.data or "").split(":")
+    key = parts[2] if len(parts) > 2 else ""
+    if key not in RATES:
+        await call.answer()
+        return
+    if len(parts) == 3:
+        await load_rates(db)
+        await call.answer()
+        if call.message:
+            await call.message.answer(_rate_text(key), reply_markup=rate_keyboard(key, rate(key)))
+        return
+    try:
+        value = float(parts[3])
+    except ValueError:
+        await call.answer()
+        return
+    if not any(abs(value - v) < 1e-9 for v, _ in RATES[key]["options"]):
+        await call.answer()
+        return
+    await set_rate(db, key, value)
+    await call.answer(f"Готово: {rate_label(key, value)}")
+    if call.message:
+        try:
+            await call.message.edit_text(_rate_text(key), reply_markup=rate_keyboard(key, value))
+        except Exception as e:
+            logger.warning("rate menu edit failed: %s", e)
+
+
 # --- Бэкап и восстановление базы (для переезда на сервер) ---
 
 _DB_TABLES = {"users", "settings", "chat_messages", "dossiers", "bunker_stats"}  # stickers досоздаст init()
@@ -965,7 +980,7 @@ KIND_LABELS = {
     "short_answer_meaning": "смысл коротких ответов", "fix_looks": "правка «про внешность»",
     "drop_retell": "правка пересказа фото", "channel_comment": "комменты к постам канала", "rant_replies": "ответы на комменты под голосовым",
     "own_channel_post": "посты в канал", "clown_of_day": "клоун дня", "week_show": "итоги недели",
-    "pick_quotes": "фразы дня", "daily_news": "новости чата", "serial_episode": "сериал",
+    "pick_quotes": "фразы дня", "daily_news": "новости чата",
     "horror_story": "Письма Волгограда: текст", "_place_facts": "Письма Волгограда: поиск места",
     "night_monologue": "ночной эфир: текст", "narrate_all": "озвучка эфира (OpenRouter)", "narrate": "озвучка",
     "diss_lyrics": "дисс: текст", "court_charges": "суд: обвинение", "court_verdict": "суд: приговор",
@@ -976,6 +991,91 @@ KIND_LABELS = {
     "narrate_elimination": "Бункер: выбывание", "final_verdict": "Бункер: финал", "threat_chances": "Бункер: угроза",
     "threat_outcome": "Бункер: угроза", "_mafia_text": "Мафия: ведущий", "mafia_intro": "Мафия: вступление",
 }
+
+
+ELEVEN_LABELS = {  # что тратит ElevenLabs (функция ai.py, откуда пошла озвучка)
+    "roast_speech": "голос Пиздюка (чат, войс, канал, /golos)", "narrate_all": "эфиры: голос",
+    "narrate": "эфиры: голос", "eleven_sfx": "Письма Волгограда: звуки", "eleven_ambient": "Письма Волгограда: музыка",
+    "eleven_music": "дисс-треки", "eleven_try_voice": "проба голоса", "_set_eleven": "проверка ключа",
+    "_eleven_samples": "образцы голосов", "?": "эфиры: голос",
+}
+SPEND_KEY = "spend_report_week"   # за какую неделю отчёт уже ушёл
+SPEND_DAY, SPEND_HOUR = 0, 12     # понедельник, 12:00 МСК — за прошлые 7 дней
+
+
+def _money(x: float) -> str:
+    return f"${x:.2f}" if x >= 0.01 or x == 0 else f"${x:.4f}"
+
+
+async def spend_report(db: Database, days: int = 7) -> str:
+    """Сколько потрачено за days дней: Claude по функциям, ElevenLabs по функциям (кредиты), с итогами."""
+    import time as _t
+
+    r = await db.spend_since(int(_t.time()) - days * 86400)
+    total = sum(c or 0 for _k, c, _n in r["claude"])
+    lines = [f"💸 <b>Траты за {days} дней</b>", "", f"🤖 <b>Claude: {_money(total)}</b>"
+             + (f" (≈ {_money(total / days)} в день)" if total else "")]
+    grouped: dict[str, list] = {}
+    for kind, cost, n in r["claude"]:
+        label = KIND_LABELS.get(kind, kind or "без метки")
+        g = grouped.setdefault(label, [0.0, 0])
+        g[0] += cost or 0
+        g[1] += n
+    for label, (cost, n) in sorted(grouped.items(), key=lambda kv: -kv[1][0])[:12]:
+        share = f" · {cost / total * 100:.0f}%" if total else ""
+        lines.append(f"• {html.escape(label)}: {_money(cost)}{share} · {n} запр.")
+    rest = sorted(grouped.items(), key=lambda kv: -kv[1][0])[12:]
+    if rest:
+        lines.append(f"• остальное ({len(rest)}): {_money(sum(v[0] for _l, v in rest))}")
+    if len(r["models"]) > 1:
+        lines.append("Модели: " + ", ".join(f"{m} {_money(c or 0)}" for m, c in r["models"][:4]))
+    credits = sum(c or 0 for _k, _w, c, _n in r["eleven"])
+    lines += ["", f"🎙 <b>ElevenLabs: {credits:,} кредитов</b>".replace(",", " ")]
+    egroup: dict[str, list] = {}
+    for kind, what, cr, n in r["eleven"]:
+        label = ELEVEN_LABELS.get(kind, kind or "?")
+        if what and what != "голос":
+            label = f"{label} ({what})" if what not in label else label
+        g = egroup.setdefault(label, [0, 0])
+        g[0] += cr or 0
+        g[1] += n
+    for label, (cr, n) in sorted(egroup.items(), key=lambda kv: -kv[1][0])[:10]:
+        share = f" · {cr / credits * 100:.0f}%" if credits else ""
+        lines.append(f"• {html.escape(label)}: {cr:,}{share} · {n} запр.".replace(",", " "))
+    if not r["eleven"]:
+        lines.append("• ничего (или ElevenLabs не подключён)")
+    lines += ["", "<i>Claude — оценка по ценам Anthropic; ElevenLabs — по заголовку списания в ответе. "
+                  "Точно — в кабинетах сервисов.</i>"]
+    return "\n".join(lines)
+
+
+async def spend_report_loop(bot: Bot, db: Database, config: Config) -> None:
+    """Раз в неделю (пн 12:00 МСК) — отчёт о тратах владельцу в личку. Запускается из bot.py."""
+    from datetime import datetime, timedelta, timezone
+
+    msk = timezone(timedelta(hours=3))
+    while True:
+        try:
+            now = datetime.now(msk)
+            week = now.strftime("%G-%V")
+            if (config.admin_ids and now.weekday() == SPEND_DAY and now.hour >= SPEND_HOUR
+                    and (await db.get_setting(SPEND_KEY, "")) != week):
+                await db.set_setting(SPEND_KEY, week)  # сразу: упало — не повторяем каждые 10 мин
+                await bot.send_message(config.admin_ids[0], await spend_report(db))
+                logger.info("отчёт о тратах за неделю отправлен")
+        except Exception:
+            logger.exception("spend report failed")
+        await asyncio.sleep(600)
+
+
+@router.callback_query(F.data == "admin:spend_week")
+async def admin_spend_week(call: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(call.from_user.id, config):
+        await call.answer(texts.ADMIN_ONLY, show_alert=True)
+        return
+    await call.answer()
+    if call.message:
+        await call.message.answer(await spend_report(db))
 
 
 @router.callback_query(F.data == "admin:ai_costs")

@@ -557,39 +557,6 @@ def render_protocol(no: int, when: str, place: str, violator: str, victim: str, 
     return _png(img.convert("RGB"))
 
 
-# ---------- сериал про чат (handlers/serial.py) ----------
-
-
-def render_serial_cover(season: int, episode: int, title: str, logline: str, cast: list[str]) -> bytes:
-    """Обложка серии: тёмный кинематографичный градиент, «ЧАТ · СЕЗОН 1 · СЕРИЯ N», название, логлайн, в ролях."""
-    w, h = 1000, 640
-    img = Image.new("RGB", (w, h), (10, 10, 14))
-    d = ImageDraw.Draw(img)
-    for i in range(h):
-        t = i / h
-        d.line((0, i, w, i), fill=(int(40 * (1 - t) + 10), int(18 * (1 - t) + 10), int(60 * (1 - t) + 14)))
-    img = _noise(img, episode)
-    d = ImageDraw.Draw(img)
-    d.rectangle((0, 0, w, 44), fill=(0, 0, 0))
-    d.rectangle((0, h - 44, w, h), fill=(0, 0, 0))
-    d.text((PAD, 96), f"ЧАТ · СЕЗОН {season} · СЕРИЯ {episode}", font=_mono(30), fill=GOLD)
-    y = 150
-    size = 84
-    t = f"«{_plain(title).upper()}»"
-    while size > 48 and len(_wrap(d, t, _serif(size, True), w - 2 * PAD, 3)) > 2:
-        size -= 6
-    for line in _wrap(d, t, _serif(size, True), w - 2 * PAD, 2):
-        d.text((PAD - 4, y), line, font=_serif(size, True), fill=TEXT)
-        y += int(size * 1.2)
-    for line in _wrap(d, _plain(logline), _regular(30), w - 2 * PAD, 2):
-        d.text((PAD, y + 20), line, font=_regular(30), fill=(200, 196, 210))
-        y += 42
-    if cast:
-        d.text((PAD, h - 120), _wrap(d, "В РОЛЯХ:  " + " · ".join(_plain(c) for c in cast[:6]), _mono(24),
-                                     w - 2 * PAD, 1)[0], font=_mono(24), fill=MUTED)
-    return _png(img)
-
-
 def render_diss_cover(name: str, title: str, genre: str, photo: bytes | None, seed: int = 0, side: int = 320) -> bytes:
     """Обложка дисс-трека (значок у аудио в Telegram — до 320×320, JPEG до 200 КБ): тёмный фон с красным
     свечением, аватарка героя, «ДИСС», название, плашка «ОСТОРОЖНО: МАТ»."""

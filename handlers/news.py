@@ -4,8 +4,8 @@
 остальными) и текст — приветствие ведущего, 3-4 сюжета дня (каждый — одно реальное событие: кто, что, как
 отреагировали, чем кончилось; не больше одной дословной цитаты), «погода в чате на завтра», прощание. ИИ —
 ai.daily_news (Opus, effort medium, ≈$0.03). Только в чат (канал публичный). Выходит, если за день было от
-MIN_TODAY сообщений; /news у админа — выпуск сейчас. Вкл/выкл — /admin «📰 Новости». Клоун дня (тоже 21:00) ждёт,
-пока выйдут новости (roast._heavy смотрит news.pending) — не валятся в чат разом.
+MIN_TODAY сообщений; /news у админа — выпуск сейчас. Вкл/выкл — /admin «📰 Новости». Клоун дня ждёт,
+пока выйдут новости, и ещё 35 мин (roast._heavy: news.pending, last_issue, evening.py) — не валятся в чат разом.
 """
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ MSK = timezone(timedelta(hours=3))
 ON_KEY = "news_on"
 DAY_KEY = "news_day:"     # в какой день выпуск уже был (или пробовали)
 NO_KEY = "news_no:"       # номер выпуска в чате
+AT_KEY = "news_at:"       # когда вышел последний выпуск (ts) — клоун дня ждёт evening.CLOWN_AFTER_NEWS
 HOUR = 21
 MIN_TODAY = 30
 MAX_MSGS = 220            # последних сообщений дня в промпт
@@ -86,8 +87,17 @@ async def issue(bot: Bot, db: Database, chat_id: int) -> bool:
             f"{s['headline']}: {s['text']}" for s in news["stories"]))
     except Exception as e:
         logger.debug("news memory: %s", e)
+    await db.set_setting(AT_KEY + str(chat_id), str(int(time.time())))
     logger.info("новости %s: выпуск %s - %s", chat_id, no, " | ".join(heads))
     return True
+
+
+async def last_issue(db: Database, chat_id: int) -> float:
+    """Когда в чате вышли последние новости (ts, 0 — не выходили)."""
+    try:
+        return float(await db.get_setting(AT_KEY + str(chat_id), "0") or 0)
+    except ValueError:
+        return 0.0
 
 
 @router.message(Command("news"))

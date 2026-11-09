@@ -24,6 +24,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+import evening
 from database import Database
 
 logger = logging.getLogger("collect")
@@ -268,12 +269,12 @@ async def tick(bot: Bot, db: Database) -> None:
         key = DAY_KEY + str(chat_id)
         day, planned, done = (await db.get_setting(key, "") + "||").split("|")[:3]
         if day != today:  # новый день — назначить время выпадения
-            start = max(now, now.replace(hour=DROP_FROM, minute=0, second=0, microsecond=0))
-            end = now.replace(hour=DROP_TO, minute=0, second=0, microsecond=0)
-            if start >= end:
-                await db.set_setting(key, f"{today}|0|done")  # сегодня уже поздно
+            minute = evening.pick_minute(max(DROP_FROM * 60, now.hour * 60 + now.minute + 1), DROP_TO * 60)
+            if minute is None:  # сегодня уже поздно (вечер 19:30-22:30 — новости и клоун, туда не лезем)
+                await db.set_setting(key, f"{today}|0|done")
                 continue
-            at = start.timestamp() + random.random() * (end.timestamp() - start.timestamp())
+            base = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            at = base + minute * 60 + random.random() * 60
             await db.set_setting(key, f"{today}|{int(at)}|")
             continue
         if done or not planned or time.time() < float(planned) or active(chat_id):
