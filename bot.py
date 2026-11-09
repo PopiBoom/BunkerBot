@@ -40,6 +40,7 @@ from handlers.letters import router as letters_router
 from handlers.news import router as news_router
 from handlers.rant import observe as rant_observe
 from handlers.rant import router as rant_router
+from handlers.widgets import router as widgets_router
 from handlers.night import router as night_router
 from handlers.protocol import router as protocol_router
 from handlers.roast import background as roast_background
@@ -253,6 +254,7 @@ async def main() -> None:
     dp.include_router(diss_router)      # /diss — дисс-трек (ElevenLabs Music)
     dp.include_router(news_router)      # /news — новости чата (сами в 21:00)
     dp.include_router(rant_router)      # /podpisota — голосовое в канал (само раз в день)
+    dp.include_router(widgets_router)   # /widget — проверка HTML-виджетов (Telegram 13.2)
     dp.include_router(night_router)     # /night — ночной эфир, черновик в личку
     # Стёб-бот последним: ловит все остальные сообщения групп
     dp.include_router(roast_router)
