@@ -22,11 +22,12 @@ import math
 import os
 import random
 import re
+import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -237,6 +238,106 @@ async def tg_retry(fn, *args, **kwargs):
             await asyncio.sleep(e.retry_after + 1)
 
 
+# Голосовое эфира — 1-3 МБ (5 мин ≈ 1.8 МБ). 10.11 «Эфир не собрался: HTTP Client says - Request timeout error»:
+# aiogram ждёт ответа Telegram 60 с, через прокси загрузка шла дольше — Telegram голосовое ПРИНЯЛ (черновик пришёл), а
+# бот решил, что не вышло, черновик не запомнил, и кнопки под ним отвечали «неактуален». Теперь: ждём до
+# UPLOAD_TIMEOUT; не дождались — НЕ повторяем (будет дубль), запоминаем черновик без id — первое нажатие на кнопку
+# под голосовым, пришедшим после начала отправки, его «узнаёт» (`adopt`); не пришло — «📤 Прислать ещё раз» из файла.
+UPLOAD_TIMEOUT = 300
+
+
+def _spare_path(key: str) -> str:
+    return os.path.join(tempfile.gettempdir(), f"bunkerbot_{key}.ogg")
+
+
+async def send_big_voice(bot: Bot, chat_id: int, ogg: bytes, name: str, caption: str, short_caption: str,
+                         **kwargs) -> Message | None:
+    """Голосовое эфира с долгим ожиданием. Подпись не пустили — с короткой. None — Telegram не ответил (может, и
+    принял: не повторяем)."""
+    async def send(cap: str) -> Message:
+        return await tg_retry(bot.send_voice, chat_id, BufferedInputFile(ogg, name), caption=cap,
+                              request_timeout=UPLOAD_TIMEOUT, **kwargs)
+
+    try:
+        try:
+            return await send(caption)
+        except TelegramBadRequest as e:  # подпись всё равно не пустили — голосовое дороже подписи, шлём без текста
+            if "caption" not in str(e).lower():
+                raise
+            logger.warning("эфир: подпись черновика не принята (%s) — без текста", e)
+            return await send(short_caption)
+    except TelegramNetworkError as e:
+        logger.warning("эфир: Telegram не ответил на голосовое %d КБ (%s) — не повторяю: оно могло дойти",
+                       len(ogg) // 1024, e)
+        return None
+
+
+async def keep_spare(bot: Bot, chat_id: int, key: str, ogg: bytes, again: str) -> None:
+    """Голосовое не подтвердилось — файл на диск и записка с кнопкой «Прислать ещё раз» (callback again)."""
+    def save() -> None:
+        with open(_spare_path(key), "wb") as f:
+            f.write(ogg)
+
+    try:
+        await asyncio.to_thread(save)
+    except OSError as e:
+        logger.warning("эфир: не сохранил запасной файл: %s", e)
+    await tg_retry(bot.send_message, chat_id,
+                   "⚠️ Telegram не подтвердил, что голосовое дошло (не ответил за 5 минут). Пришло выше - кнопки под "
+                   "ним работают. Не пришло - жми «📤 Прислать ещё раз».",
+                   reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                       InlineKeyboardButton(text="📤 Прислать ещё раз", callback_data=again)]]))
+
+
+async def adopt(db: Database, key: str, draft: dict, call: CallbackQuery) -> bool:
+    """Это сообщение — текущий черновик? Черновик без id (Telegram не ответил на отправку) узнаём по первому нажатию
+    на голосовое, пришедшее после начала отправки, и запоминаем его id и file_id."""
+    m = call.message
+    if not draft or not m:
+        return False
+    if draft.get("msg") == m.message_id:
+        return True
+    voice = getattr(m, "voice", None)
+    if draft.get("msg") is None and voice and m.date and m.date.timestamp() >= float(draft.get("sent_at", 0)) - 5:
+        draft.update(msg=m.message_id, file_id=voice.file_id)
+        await db.set_setting(key, json.dumps(draft, ensure_ascii=False))
+        logger.info("эфир: черновик %s узнан по нажатию (сообщение %s)", key, m.message_id)
+        return True
+    return False
+
+
+async def send_again(bot: Bot, db: Database, key: str, draft: dict, call: CallbackQuery, kb, name: str) -> None:
+    """«📤 Прислать ещё раз» — голосовое черновика из запасного файла."""
+    if not draft or draft.get("msg") is not None:
+        await call.answer("Черновик уже пришёл - жми кнопки под ним." if draft else "Этот черновик уже неактуален.",
+                          show_alert=True)
+        return
+    def load() -> bytes:
+        with open(_spare_path(key), "rb") as f:
+            return f.read()
+
+    try:
+        ogg = await asyncio.to_thread(load)
+    except OSError:
+        await call.answer("Файла уже нет - собери выпуск заново.", show_alert=True)
+        return
+    await call.answer("Отправляю…")
+    draft["sent_at"] = time.time()
+    msg = await send_big_voice(bot, call.message.chat.id, ogg, name, draft.get("dcap") or draft["caption"],
+                               _cut_vis(re.sub(r"<[^>]+>", "", draft["caption"]), 900), reply_markup=kb,
+                               duration=draft.get("secs") or None)
+    if msg is None:
+        await db.set_setting(key, json.dumps(draft, ensure_ascii=False))
+        await bot.send_message(call.message.chat.id, "⚠️ Опять без ответа. Пришло - жми кнопки под голосовым.")
+        return
+    draft.update(msg=msg.message_id, file_id=msg.voice.file_id)
+    await db.set_setting(key, json.dumps(draft, ensure_ascii=False))
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+
+
 CAPTION_MAX = 1024  # лимит подписи Telegram: видимые знаки после разметки, в UTF-16
 
 
@@ -310,7 +411,7 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
     import radio
     from handlers import letters as inbox
 
-    music_task, sfx_tasks, story = None, [], {}
+    music_task, room_task, sfx_tasks, story, main_n = None, None, [], {}, 3
 
     await progress("🔎 Ищу городские легенды и пишу письмо…" if horror else "✍️ Пишу текст эфира…")
     now = datetime.now(MSK)
@@ -351,6 +452,8 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
         if ai.eleven_key() and not ai.eleven_geo_blocked():  # музыка и звуки — пока озвучивается голос
             music_task = asyncio.create_task(ai.eleven_ambient(story.get("music", "")))
             sfx_tasks = [asyncio.create_task(ai.eleven_sfx(x["sound"], x["secs"])) for x in story.get("sfx") or []]
+            if story.get("ambience"):  # фон места действия (владелец 10.11) — петля до 30 с
+                room_task = asyncio.create_task(ai.eleven_room(story["ambience"]))
         topic = story["subject"] or story["title"] or "без темы"
         # ведущий «радио Волгограда» (владелец: «как будто разговариваешь со зрителем»); ИИ промолчал — запасной
         intro = story["intro"] or (f"Хей, всем привет, ребята! Это радио Волгограда. {cond['line']} И ваша любимая "
@@ -381,11 +484,15 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
         # кусками (ведущий прерывается, звонящий, ведущий возвращается), radio.studio вклеивает их в паузу письма.
         # Владелец раньше: «история прерывается посередине» — письмо двумя кусками начиналось заново другим тоном,
         # поэтому само письмо — одним куском.
-        chunks = [intro, "\n\n".join(letter_paras), outro]
-        styles = ["host", "letter", "host"]
+        # Ведущий после письма (владелец 10.11): первая фраза — отдельным куском, тише и медленнее (host_soft), в
+        # тишине; остальное — обычным голосом под мрачную подложку.
+        soft, rest = _soft_outro(outro)
+        chunks = [intro, "\n\n".join(letter_paras), soft] + ([rest] if rest else [])
+        styles = ["host", "letter", "host_soft"] + (["host"] if rest else [])
         author = story.get("author") or {}
         roles = ["host", ai.author_role(author.get("gender", "m"), int(author.get("age") or 30))
-                 if fmt == "диктофон" else "letter", "host"]
+                 if fmt == "диктофон" else "letter", "host_soft"] + (["host"] if rest else [])
+        main_n = len(chunks)
         if call:
             chunks += [call["host_in"], call["text"], call["host_back"]]
             roles += ["host", f"call_{call['gender']}", "host"]
@@ -418,7 +525,7 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
     voice = await ai.narrate_all(chunks, roles, horror=horror, progress=step)
     who = ai.last_voice[0] + (f" (не вышло: {ai.voice_trouble[0]})" if ai.voice_trouble[0] else "")
     if not voice:
-        for t in [music_task] + sfx_tasks:
+        for t in [music_task, room_task] + sfx_tasks:
             if t:
                 t.cancel()
         return {"ogg": None, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic,
@@ -440,16 +547,30 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
         if music_task:
             data = await music_task
             music = await asyncio.to_thread(radio.decode, data) if data else None
+        room = None
+        if room_task:
+            data = await room_task
+            room = await asyncio.to_thread(radio.decode, data) if data else None
+        through = []
+        for x in story.get("through") or []:
+            sp = ai.span_time(x["quote"])
+            if sp:
+                through.append((sp[0], sp[1], x["via"]))
+            else:
+                logger.info("horror: реплика «%s» (%s) не встала - нет меток времени или слов", x["quote"][:40],
+                            x["via"])
         interrupt = None
         call = story.get("call")
-        if call and len(voice) >= 6:
+        if call and len(voice) >= main_n + 3:
             at = ai.sfx_time(call["after"], letter_text, letter_secs)
-            interrupt = (at if at is not None else letter_secs * 0.55, voice[3:6])
+            interrupt = (at if at is not None else letter_secs * 0.55, voice[main_n:main_n + 3])
         extras = (f"{story.get('format', 'письмо')}, тема «{story.get('kind', '')}», звуков {len(events)} из "
                   f"{len(story.get('sfx') or [])}, музыка {'ElevenLabs' if music is not None else 'своя'}, звонок "
                   + (f"посреди письма ({interrupt[0]:.0f} с из {letter_secs:.0f}"
                      + (", обрыв и гудки)" if call.get("drop") else ", без обрыва)") if interrupt else "нет")
                   + (", метки времени" if ai.letter_alignment[0] else "")
+                  + (f", фон места {'есть' if room is not None else 'не вышел'}" if story.get("ambience") else "")
+                  + (f", через предмет {len(through)} из {len(story['through'])}" if story.get("through") else "")
                   + (f", манера «{story['style']}»" if story.get("style") else "")
                   + (f", концовка «{story['ending']}»" if story.get("ending") else "")
                   + (f", понятность {story['check']['clear']}/5" if (story.get("check") or {}).get("clear") else "")
@@ -457,9 +578,9 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
                   + (f", правки письма: {', '.join(story['fixes'])}" if story.get("fixes") else ""))
         logger.info("horror: %s", extras)
         who = f"{who} · {extras}" if who else extras
-        mix = await asyncio.to_thread(radio.studio, voice[:3], styles, ai.SPEAK_RATE, int(time.time()), events, music,
-                                      interrupt, story.get("format") == "диктофон",
-                                      call_drop=bool(interrupt and call.get("drop")))
+        mix = await asyncio.to_thread(radio.studio, voice[:main_n], styles, ai.SPEAK_RATE, int(time.time()), events,
+                                      music, interrupt, story.get("format") == "диктофон",
+                                      call_drop=bool(interrupt and call.get("drop")), through=through, place=room)
     else:       # ночной эфир — «сквозь приёмник», как было
         mix = await asyncio.to_thread(radio.broadcast, voice, ai.SPEAK_RATE, cond["rain"], int(time.time()))
     ogg = await asyncio.to_thread(radio.to_ogg, mix)
@@ -468,6 +589,22 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
                 len(mix) / radio.SR, who or "?")
     return {"ogg": ogg, "paragraphs": paragraphs, "caption": caption, "n": n, "topic": topic, "voice": who,
             "letter": (letter or {}).get("id"), "secs": secs, **(lore_info if horror else {})}
+
+
+_CHEER_TAG = re.compile(r"\[(?:excited|laughs?|chuckles?|cheerful|mischievously|giggles?|playful)[^\]]*\]\s*",
+                        re.IGNORECASE)
+
+
+def _soft_outro(outro: str) -> tuple[str, str]:
+    """Концовка ведущего: (первая фраза — тихо, медленно и без весёлых пометок; остальное). Короткую первую фразу
+    («Да.») склеиваем со следующей."""
+    parts = re.split(r"(?<=[.!?…])\s+", outro.strip())
+    first, i = parts[0], 1
+    while len(ai.strip_tags(first).split()) < 4 and i < len(parts):
+        first, i = f"{first} {parts[i]}", i + 1
+    first = _CHEER_TAG.sub("", first).strip()
+    first = re.sub(r"^(?:\[[^\]]*\]\s*)+", "", first)
+    return f"[softly] {first}", " ".join(parts[i:]).strip()
 
 
 def _kb() -> InlineKeyboardMarkup:
@@ -520,22 +657,19 @@ async def _send_draft(bot: Bot, db: Database, chat_id: int, horror: bool, progre
                                         f"ключа (/setkey yandex или OpenRouter) или сбой озвучки{why}. Это текст.</i>")
         return False
     # какой голос читал (и кто до него не справился) — видно только в черновике, в канал не идёт
-    voice = BufferedInputFile(ep["ogg"], "night.ogg")
-    try:
-        msg = await tg_retry(bot.send_voice, chat_id, voice, reply_markup=_kb(), duration=ep.get("secs") or None,
-                             caption=_draft_caption(ep["caption"], ep.get("voice") or "", text))
-    except TelegramBadRequest as e:  # подпись всё равно не пустили — голосовое дороже подписи, шлём без текста
-        if "caption" not in str(e).lower():
-            raise
-        logger.warning("night: подпись черновика не принята (%s) — без текста", e)
-        msg = await tg_retry(bot.send_voice, chat_id, voice, reply_markup=_kb(), duration=ep.get("secs") or None,
-                             caption=_cut_vis(re.sub(r"<[^>]+>", "", ep["caption"]), 900))
-    await db.set_setting(DRAFT_KEY, json.dumps({"file_id": msg.voice.file_id, "caption": ep["caption"],
-                                                "n": ep["n"], "msg": msg.message_id, "chat": chat_id,
+    dcap = _draft_caption(ep["caption"], ep.get("voice") or "", text)
+    sent_at = time.time()
+    msg = await send_big_voice(bot, chat_id, ep["ogg"], "night.ogg", dcap,
+                               _cut_vis(re.sub(r"<[^>]+>", "", ep["caption"]), 900), reply_markup=_kb(),
+                               duration=ep.get("secs") or None)
+    await db.set_setting(DRAFT_KEY, json.dumps({"file_id": msg.voice.file_id if msg else "", "caption": ep["caption"],
+                                                "n": ep["n"], "msg": msg.message_id if msg else None, "chat": chat_id,
                                                 "horror": horror, "letter": ep.get("letter"),
-                                                "secs": ep.get("secs"),
+                                                "secs": ep.get("secs"), "sent_at": sent_at, "dcap": dcap,
                                                 "lore_used": ep.get("lore_used"), "lore_new": ep.get("lore_new")},
                                                ensure_ascii=False))
+    if msg is None:
+        await keep_spare(bot, chat_id, DRAFT_KEY, ep["ogg"], "nr:again")
     return True
 
 
@@ -628,7 +762,10 @@ async def cb_night(call: CallbackQuery, bot: Bot, db: Database, config: Config) 
     except ValueError:
         draft = {}
     action = (call.data or "")[3:]
-    if not draft or draft.get("msg") != (call.message.message_id if call.message else None):
+    if action == "again":
+        await send_again(bot, db, DRAFT_KEY, draft, call, _kb(), "night.ogg")
+        return
+    if not await adopt(db, DRAFT_KEY, draft, call):
         await call.answer("Этот черновик уже неактуален.", show_alert=True)
         return
 

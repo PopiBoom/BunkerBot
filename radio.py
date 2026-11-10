@@ -611,9 +611,11 @@ def _ep(f: float, ln: float) -> np.ndarray:
     return (tone * np.minimum(1, t / 0.004) * np.exp(-t * 1.1)).astype(np.float32)
 
 
-def _talk_bed(n: int, rng: np.random.Generator, chords: list | None = None, bpm: float = BED_BPM) -> np.ndarray:
+def _talk_bed(n: int, rng: np.random.Generator, chords: list | None = None, bpm: float = BED_BPM,
+              drums: bool = True) -> np.ndarray:
     """Подложка под ведущего: спокойный вечерний грув — электропиано по ля-минору, бас, мягкая бочка, щелчок и
-    тарелочка с лёгким свингом. float32, пик ≈ 1. chords/bpm — другая гармония и темп (весёлая — у сплетен)."""
+    тарелочка с лёгким свингом. float32, пик ≈ 1. chords/bpm — другая гармония и темп (весёлая — у сплетен);
+    drums=False — без барабанов (мрачная подложка после письма)."""
     chords = chords or _CHORDS
     beat = 60 / bpm
     bar = 4 * beat
@@ -648,10 +650,11 @@ def _talk_bed(n: int, rng: np.random.Generator, chords: list | None = None, bpm:
             t = np.arange(int(1.9 * beat * SR)) / SR
             bass = (np.sin(2 * np.pi * root * t) + 0.25 * np.sin(4 * np.pi * root * t)) * np.minimum(1, t / 0.01)
             put((bass * np.exp(-t * 1.4)).astype(np.float32), t0 + hit, 0.3)
-            put(kick, t0 + hit, 0.45)
-        for hit in (beat, 3 * beat):
+            if drums:
+                put(kick, t0 + hit, 0.45)
+        for hit in (beat, 3 * beat) if drums else ():
             put(snap, t0 + hit, 0.1)
-        for k in range(8):
+        for k in range(8 if drums else 0):
             put(hat, t0 + k * beat / 2 + (0.012 if k % 2 else 0.0), 0.05 if k % 2 else 0.03)
         i += 1
     return _peak1(_band(out[:n], 35, 9000))
@@ -1015,6 +1018,75 @@ def _interrupt(chunks: list[np.ndarray], letter_db: float, drop: bool = False) -
     return np.concatenate(out).astype(np.float32)
 
 
+# Ведущий после письма (владелец 10.11, «7» из идей): раньше сразу возвращалась та же бодрая подложка, что в начале.
+# Теперь первая фраза (роль host_soft — тише и медленнее) — в тишине, потом вступает мрачная подложка: без барабанов,
+# медленнее, ля минор с доминантой ми мажор, тише обычной.
+_DARK_CHORDS = [
+    (55.0, (220.0, 261.63, 329.63)),      # Am
+    (43.65, (174.61, 220.0, 261.63)),     # F
+    (36.71, (146.83, 174.61, 220.0)),     # Dm
+    (41.2, (164.81, 207.65, 246.94)),     # E
+]
+DARK_BPM = 62
+DARK_BED_DB = -22.0     # мрачная подложка после письма — тише обычной (TALK_BED_DB)
+DARK_BED_IN = 3.0       # вступает плавно, за столько секунд
+SOFT_DB = -1.5          # первая фраза после письма — на 3 дБ тише ведущего (ведущий — +1.5 к письму)
+ROOM_DB = -24.0         # фон места под письмом — от речи в полосе телефона (в паузах)
+ROOM_DUCK_DB = -4.0     # под словами фон места почти не приседает — это «воздух» комнаты, а не музыка
+THROUGH_DB = {"intercom": -1.0, "door": -6.0, "phone": -1.5, "speaker": -2.0}  # реплика «через предмет» к своей громкости
+
+
+def _through_one(seg: np.ndarray, via: str, rng: np.random.Generator) -> np.ndarray:
+    """Реплика «через предмет»: домофон — дешёвый динамик с хрипом и фоном линии; за дверью — глухо, только низ и
+    короткий отзвук коробки; телефон — трубка; динамик — объявление в транспорте/на станции, с отзвуком зала."""
+    if via == "intercom":
+        x = _peak1(_band(seg, 480, 3000))
+        x = np.tanh(x * 3.2) / np.tanh(3.2)
+        t = np.arange(len(x)) / SR
+        x = x + (0.02 * np.sin(2 * np.pi * 100 * t) + 0.012 * _band(rng.standard_normal(len(x)).astype(np.float32),
+                                                                       1000, 4000)).astype(np.float32)
+        return _band(x.astype(np.float32), 350, 3600)
+    if via == "door":
+        x = _band(seg, 60, 600)
+        out = x.copy()
+        for ms, g in ((9, 0.35), (17, 0.22), (29, 0.12)):  # короткий отзвук: голос «в коробке» за дверью
+            k = int(ms * SR / 1000)
+            out[k:] += x[:-k] * np.float32(g)
+        return out
+    if via == "phone":
+        return _phone(seg)
+    x = _peak1(_band(seg, 330, 4500))  # speaker
+    x = (np.tanh(x * 2.0) / np.tanh(2.0)).astype(np.float32)
+    out = x.copy()
+    for ms, g in ((110, 0.3), (230, 0.16), (370, 0.08)):  # отзвук зала
+        k = int(ms * SR / 1000)
+        if k < len(x):
+            out[k:] += x[:-k] * np.float32(g)
+    return out
+
+
+def _through(v: np.ndarray, spans: list[tuple[float, float, str]] | None, rng: np.random.Generator) -> np.ndarray:
+    """Голоса «через предмет»: те секунды письма (по меткам ElevenLabs) — обработкой нужного предмета, громкость
+    как у исходной речи (за дверью — тише), края — плавно за 25 мс."""
+    if not spans:
+        return v
+    v = v.copy()
+    xf = int(0.025 * SR)
+    for t0, t1, via in spans:
+        a, b = max(0, int(t0 * SR)), min(len(v), int(t1 * SR))
+        if b - a < 4 * xf:
+            continue
+        seg = v[a:b].copy()
+        x = _through_one(seg, via, rng)
+        r0 = float(np.sqrt(np.mean(np.square(seg, dtype=np.float64)))) or 1.0
+        r1 = float(np.sqrt(np.mean(np.square(x, dtype=np.float64)))) or 1.0
+        x = (x * np.float32(r0 / r1 * _db(THROUGH_DB.get(via, 0.0)))).astype(np.float32)
+        w = np.ones(b - a, dtype=np.float32)
+        w[:xf], w[-xf:] = np.linspace(0, 1, xf), np.linspace(1, 0, xf)
+        v[a:b] = seg * (1 - w) + x * w
+    return v
+
+
 def _loop(x: np.ndarray, n: int, xf: float = 3.0) -> np.ndarray:
     """Музыка нужной длины: короче — повторяем с плавным переходом xf с."""
     k = int(xf * SR)
@@ -1032,13 +1104,16 @@ def _loop(x: np.ndarray, n: int, xf: float = 3.0) -> np.ndarray:
 def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed: int = 0,
            sfx: list[tuple[float, np.ndarray]] | None = None, music: np.ndarray | None = None,
            interrupt: tuple[float, list[bytes]] | None = None, tape: bool = False,
-           call_drop: bool = False) -> np.ndarray:
+           call_drop: bool = False, through: list[tuple[float, float, str]] | None = None,
+           place: np.ndarray | None = None) -> np.ndarray:
     """«Письма Волгограда» как настоящий эфир (float32, 48 кГц, пик ≈ -1 дБ). styles — "host" / "letter" для каждого
     куска голоса ("host_call" — ведущий после звонка телефона, "call" — звонящий в студию, телефонная полоса); sfx —
     звуки по сюжету [(секунда в голосе письма, звук 48 кГц)] — каждый в свою паузу; music — музыка под письмом
     (ElevenLabs; нет — синтезированный фон _pad); interrupt — звонок посреди письма (секунда в голосе письма,
     [ведущий, звонящий, ведущий]); call_drop — связь со звонящим обрывается (хрип и короткие гудки); tape — письмо
-    как с диктофона («расшифровка диктофона»). Ведущий — «эфирный» голос поверх музыкальной подложки; перед письмом — настройка на волну; над
+    как с диктофона («расшифровка диктофона»); through — реплики «через предмет» [(с, по, intercom/door/phone/
+    speaker)] в секундах голоса письма; place — фон места под письмом (ElevenLabs, петля); "host_soft" — первая
+    фраза ведущего после письма: тише, в тишине, после неё — мрачная подложка. Ведущий — «эфирный» голос поверх музыкальной подложки; перед письмом — настройка на волну; над
     письмом — мрачный фон, напряжение и помехи эфира (замирания, шипение, треск, свист, провалы и «чужой голос» в
     паузах), слова не рвутся; перед последней фразой всё стихает — финал в тишине; потом обрыв сигнала и ведущий."""
     rng = np.random.default_rng(seed)
@@ -1050,12 +1125,13 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
             continue
         st = styles[i] if i < len(styles) else "host"
         v = _band(v, 70, 11000)
-        if st in ("host", "host_call"):
+        if st in ("host", "host_call", "host_soft"):
             parts.append((_on_air(v), st))
         elif st == "call":
             parts.append((_phone(v), st))
         else:
             v = _peak1(_compress(_peak1(v), -22, 2.5))
+            v = _through(v, through, rng)  # до вставок звуков и звонка: секунды — по исходному голосу письма
             if tape:
                 v = _tape(v, rng)
             cut_t = interrupt[0] if interrupt else None
@@ -1079,14 +1155,16 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
     letter_db = [_speech_db(v) for v, st in parts if st == "letter"]
     for v, st in parts:
         if st != "letter" and letter_db:
-            v *= np.float32(_db(letter_db[0] + (CALL_DB if st == "call" else 1.5) - _speech_db(v)))
+            v *= np.float32(_db(letter_db[0] + (CALL_DB if st == "call" else SOFT_DB if st == "host_soft" else 1.5)
+                                - _speech_db(v)))
     pieces, spans, pos, ring_at = [], [], 0, []   # spans: (начало, конец, стиль) кусков внутри дорожки голоса
     ring = _ring()
     for v, st in parts:
         if pieces:
             prev = spans[-1][2]
             sec = (LETTER_IN if st == "letter" and prev != "letter" else
-                   LETTER_OUT if prev == "letter" and st != "letter" else 0.45 if st == "call" else 0.7)
+                   LETTER_OUT if prev == "letter" and st != "letter" else 0.45 if st == "call" else
+                   0.55 if prev == "host_soft" else 0.7)
             gap = int(sec * SR)
             if st == "host_call":  # звонок в студию: телефон звонит в тишине, потом ведущий снимает трубку
                 ring_at.append(pos + gap)
@@ -1119,19 +1197,23 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
 
     # 3) подложка под ведущим
     if host:
-        for a0, b0 in host:
-            a, b = max(0, start + a0 - int(0.5 * SR)), min(n, start + b0 + int(1.0 * SR))
-            bed = _talk_bed(b - a, rng)
+        for j, (a0, b0, st) in enumerate(spans):
+            if st not in ("host", "host_call"):
+                continue
+            dark = j > 0 and spans[j - 1][2] == "host_soft"  # после письма и тихой фразы — мрачная, без барабанов
+            a, b = max(0, start + a0 - (0 if dark else int(0.5 * SR))), min(n, start + b0 + int(1.0 * SR))
+            bed = _talk_bed(b - a, rng, _DARK_CHORDS, DARK_BPM, drums=False) if dark else _talk_bed(b - a, rng)
             r = float(np.sqrt(np.mean(np.square(_band(bed, *PHONE_BAND), dtype=np.float64))))  # слышно в телефоне
-            bed *= np.float32(_db(ref_hp + TALK_BED_DB) / r) if r > 0 else np.float32(0)
-            fi, fo = min(int(0.4 * SR), (b - a) // 3), min(int(1.2 * SR), (b - a) // 3)
+            bed *= np.float32(_db(ref_hp + (DARK_BED_DB if dark else TALK_BED_DB)) / r) if r > 0 else np.float32(0)
+            fi = min(int((DARK_BED_IN if dark else 0.4) * SR), (b - a) // 3)
+            fo = min(int(1.2 * SR), (b - a) // 3)
             bed[:fi] *= np.linspace(0, 1, fi, dtype=np.float32)
             bed[-fo:] *= np.linspace(1, 0, fo, dtype=np.float32)
             _duck(bed, _slice(voice, a - start, b - start), -7.0)
             mix[a:b] += bed
             hiss_db[a // FADE_FRAME:b // FADE_FRAME + 1] = ref_hp + HISS_HOST_DB
-    for a0, b0, st in spans:  # звонящий — без подложки, шипение как под ведущим
-        if st == "call":
+    for a0, b0, st in spans:  # звонящий и тихая фраза после письма — без подложки, шипение как под ведущим
+        if st in ("call", "host_soft"):
             hiss_db[(start + a0) // FADE_FRAME:(start + b0) // FADE_FRAME + 1] = ref_hp + HISS_HOST_DB
     for at in ring_at:  # звонок студийного телефона — в тишине перед «Алло, вы в эфире»
         mix[start + at:start + at + len(ring)] += ring * np.float32(_db(ref_hp + RING_DB) / 0.35)
@@ -1172,6 +1254,13 @@ def studio(voice_chunks: list[bytes], styles: list[str], rate: int = 24000, seed
         _duck(bed, voice[a:a + ln], DUCK_DB)
         mix[start + a:start + a + ln] += bed
         del bed
+        if place is not None and len(place) > 2 * SR:  # фон места (подъезд, гараж, двор…) — петля ElevenLabs
+            amb = level(_band(np.resize(place, ln).astype(np.float32), 50, 12000), ROOM_DB, ref_phone, PHONE_BAND)
+            amb[:fi] *= np.linspace(0, 1, fi, dtype=np.float32)
+            amb[-fo:] *= np.linspace(1, 0, fo, dtype=np.float32)
+            _duck(amb, voice[a:a + ln], ROOM_DUCK_DB)
+            mix[start + a:start + a + ln] += amb
+            del amb
 
         # звуки по сюжету — каждый в своей паузе (вставлена под него), громкость — от речи в полосе телефона
         for p, snd in sfx_at:

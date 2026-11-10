@@ -23,7 +23,7 @@ from datetime import datetime
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import ai
 from config import Config
@@ -165,21 +165,17 @@ async def _send_draft(bot: Bot, db: Database, chat_id: int, progress, letter_id:
         await night.tg_retry(bot.send_message, chat_id, f"{ep['caption']}\n\n{html.escape(text[:2800])}\n\n"
                              f"<i>Озвучить не вышло{why}. Это текст.</i>", disable_web_page_preview=True)
         return False
-    voice = BufferedInputFile(ep["ogg"], "gossip.ogg")
-    try:
-        msg = await night.tg_retry(bot.send_voice, chat_id, voice, reply_markup=_kb(),
-                                   duration=ep.get("secs") or None,
-                                   caption=night._draft_caption(ep["caption"], ep.get("voice") or "", text))
-    except TelegramBadRequest as e:  # подпись не пустили — голосовое дороже подписи
-        if "caption" not in str(e).lower():
-            raise
-        logger.warning("gossip: подпись черновика не принята (%s) — без текста", e)
-        msg = await night.tg_retry(bot.send_voice, chat_id, voice, reply_markup=_kb(),
-                                   duration=ep.get("secs") or None,
-                                   caption=night._cut_vis(re.sub(r"<[^>]+>", "", ep["caption"]), 900))
-    await db.set_setting(DRAFT_KEY, json.dumps({"file_id": msg.voice.file_id, "caption": ep["caption"], "n": ep["n"],
-                                                "msg": msg.message_id, "chat": chat_id, "letter": ep.get("letter"),
-                                                "secs": ep.get("secs"), "own": own}, ensure_ascii=False))
+    dcap = night._draft_caption(ep["caption"], ep.get("voice") or "", text)
+    sent_at = time.time()
+    msg = await night.send_big_voice(bot, chat_id, ep["ogg"], "gossip.ogg", dcap,
+                                     night._cut_vis(re.sub(r"<[^>]+>", "", ep["caption"]), 900), reply_markup=_kb(),
+                                     duration=ep.get("secs") or None)
+    await db.set_setting(DRAFT_KEY, json.dumps({"file_id": msg.voice.file_id if msg else "", "caption": ep["caption"],
+                                                "n": ep["n"], "msg": msg.message_id if msg else None, "chat": chat_id,
+                                                "letter": ep.get("letter"), "secs": ep.get("secs"), "own": own,
+                                                "sent_at": sent_at, "dcap": dcap}, ensure_ascii=False))
+    if msg is None:
+        await night.keep_spare(bot, chat_id, DRAFT_KEY, ep["ogg"], "gs:again")
     return True
 
 
@@ -272,7 +268,10 @@ async def cb_draft(call: CallbackQuery, bot: Bot, db: Database, config: Config) 
     except ValueError:
         draft = {}
     action = (call.data or "")[3:]
-    if not draft or draft.get("msg") != (call.message.message_id if call.message else None):
+    if action == "again":
+        await night.send_again(bot, db, DRAFT_KEY, draft, call, _kb(), "gossip.ogg")
+        return
+    if not await night.adopt(db, DRAFT_KEY, draft, call):
         await call.answer("Этот черновик уже неактуален.", show_alert=True)
         return
 

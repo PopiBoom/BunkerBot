@@ -3007,6 +3007,7 @@ def _eleven_status(status: int, code: str = "") -> None:
 ELEVEN_HORROR_MODEL = os.getenv("ELEVEN_HORROR_MODEL", "").strip() or "eleven_v4"
 ELEVEN_TAG_MODELS = ("eleven_v4", "eleven_v3")  # понимают пометки интонации; остальным их вырезаем
 HOST_SPEED = 1.08  # ведущий рубрики говорит чуть быстрее обычного — как на FM (у v3/v4 скорость 0.7-1.2)
+HOST_SOFT_SPEED = 0.93  # первая фраза ведущего после письма (роль host_soft) — тише и медленнее, ещё под впечатлением
 ELEVEN_VOICES = {  # готовые голоса ElevenLabs (доступны любому ключу): ключ -> (voice_id, имя)
     "brian": ("nPczCjzI2devNBz1zQrb", "Brian - низкий, рассказчик"),
     "callum": ("N2lVS1w4EtoT3dr4eOWO", "Callum - хриплый, с хитрецой"),
@@ -3379,6 +3380,11 @@ async def eleven_music(plan: dict, model: str | None = None, key: str | None = N
     return b"", "content"
 
 
+# Фон места и голоса «через предмет» (владелец 10.11 выбрал из идей для /horror «1, 2, 7»): фон — ElevenLabs петлёй
+# (eleven_room), реплика из домофона / из-за двери / по телефону / из динамика — те же секунды письма обработкой в
+# radio (`through`), время — по меткам ElevenLabs (`span_time`).
+ROOM_SECS = 30
+THROUGH_VIA = ("intercom", "door", "phone", "speaker")
 # Звуки по сюжету и музыка под письмом (владелец 08.11: «1» и «5» из идей для /horror). Звук — ElevenLabs
 # /sound-generation (≈ 11 кредитов за секунду), музыка — /music без голоса (кредиты подписки, ≈ $0.15-0.3 за минуту).
 AMBIENT_SECS = 120   # музыки столько; письмо длиннее — радио повторяет её с плавным переходом
@@ -3432,8 +3438,54 @@ async def eleven_ambient(prompt: str = "", secs: float | None = None, strict: bo
     return await _eleven_bytes("music", body, "музыка под письмо", 240)
 
 
+async def eleven_room(prompt: str, secs: float = ROOM_SECS) -> bytes:
+    """Фон места действия письма (подъезд, гараж, двор…) — ровная петля до 30 с (ElevenLabs /sound-generation с
+    loop). ≈ 300 кредитов. b"" — нет ключа, пустое описание или сбой."""
+    text = " ".join((prompt or "").split())
+    if not text:
+        return b""
+    body = {"text": (text + ", quiet steady room tone, no music, no voices, no sudden sounds")[:450],
+            "duration_seconds": max(5.0, min(30.0, float(secs))), "prompt_influence": 0.5, "loop": True}
+    return await _eleven_bytes("sound-generation", body, f"фон места «{text[:50]}»", 90)
+
+
 def _norm_al(t: str) -> str:
     return t.lower().replace("ё", "е")
+
+
+def _al_words(text: str) -> list[tuple[int, int, str]]:
+    """Слова текста: [(начало, конец, слово в нижнем регистре, ё → е)]."""
+    return [(m.start(), m.end(), _norm_al(m.group())) for m in re.finditer(r"\w+", text)]
+
+
+def _find_words(words: list[tuple[int, int, str]], q: list[tuple[int, int, str]]) -> int:
+    """Где в словах words начинается подряд последовательность слов q (по написанию). -1 — нет."""
+    want = [w[2] for w in q]
+    seq = [w[2] for w in words]
+    for i in range(len(seq) - len(want) + 1):
+        if seq[i:i + len(want)] == want:
+            return i
+    return -1
+
+
+def span_time(quote: str) -> tuple[float, float] | None:
+    """С какой по какую секунду в озвученном письме звучат слова quote — по меткам ElevenLabs. Без меток None: по
+    доле текста ошибка в секунду-две, и обработка «через предмет» легла бы на чужие слова."""
+    al = letter_alignment[0]
+    if not al:
+        return None
+    text, starts = al
+    text = re.sub(r"\[[^\]]*\]", lambda m: " " * len(m.group()), text)  # пометки интонации — не слова (индексы те же)
+    words, q = _al_words(text), _al_words(strip_tags(quote or ""))
+    i = _find_words(words, q) if len(q) >= 2 else -1
+    if i < 0:
+        return None
+    a, b = words[i][0], words[i + len(q) - 1][1]
+    if a >= len(starts):
+        return None
+    t1 = float(starts[b]) if b < len(starts) else float(starts[-1]) + 0.25
+    t0 = max(0.0, float(starts[a]) - 0.06)
+    return (t0, t1 + 0.05) if 0.2 < t1 - t0 < 15 else None
 
 
 def sfx_time(after: str, letter: str, secs: float) -> float | None:
@@ -3776,11 +3828,11 @@ def _voices(horror: bool) -> list:
                     picked[("eleven", role)] = vid
                     return pcm
             return b""
-        return await eleven_speak(text, horror=horror, speed=HOST_SPEED if horror and role == "host" else None,
-                                  timestamps=role == "letter")
+        return await eleven_speak(text, horror=horror, speed=HOST_SOFT_SPEED if role == "host_soft" else
+                                  HOST_SPEED if horror and role == "host" else None, timestamps=role == "letter")
 
     async def yandex(text: str, role: str) -> bytes:  # у Яндекса до 5000 знаков за запрос — длинное частями
-        host = role == "host"
+        host = role in ("host", "host_soft")
         parts, cur = [], ""
         for para in (p.strip() for p in strip_tags(text).split("\n") if p.strip()):
             if cur and len(cur) + len(para) > YANDEX_PART:
@@ -3812,7 +3864,8 @@ def _voices(horror: bool) -> list:
                 av = picked.setdefault(("gpt", role), random.choice([x for x in _author_voices("gpt", role)
                                                                      if x != v] or ["echo"]))
                 return await _speak_long(strip_tags(text), AUTHOR_SPEAK, av, model)
-            return await _speak_long(strip_tags(text), HOST_SPEAK if role == "host" else HORROR_SPEAK if horror else
+            return await _speak_long(strip_tags(text), HOST_SPEAK if role in ("host", "host_soft") else
+                                     HORROR_SPEAK if horror else
                                      NIGHT_SPEAK, v, model)
         return say
 
@@ -4669,6 +4722,14 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
         "материала и в каком помещении, без музыки и голосов; secs — длина 1-4.\n"
         "music — по-английски одна фраза: какая мрачная инструментальная музыка подойдёт под это письмо (инструменты, "
         "настроение, темп), без барабанов, голосов и имён артистов.\n"
+        "ambience — по-английски одна фраза для генератора звуков: тихий ровный фон того места, где идёт главное "
+        "действие письма, — что там слышно ночью (гул, лампы, ветер, далёкая дорога, капли…), без музыки, голосов и "
+        "резких звуков.\n"
+        "through — 0-2 реплики, которые в письме звучат ЧЕРЕЗ предмет: из домофона, из-за двери или стены, по "
+        "телефону, из динамика (магнитофон, рация, объявление в транспорте). quote — ТОЧНО слова этой реплики из "
+        "letter, 2-15 слов, как написаны, без кавычек; via — intercom, door, phone или speaker. Если по сюжету "
+        "кто-то говорит через домофон, дверь или телефон — пусть его слова стоят в письме прямой речью. Таких реплик "
+        "нет — пустой список.\n"
         "Пометки интонации для голоса — по-английски в квадратных скобках перед фразой (вслух их не читают), скупо: "
         "ведущему — 1-2 на реплику ([excited], [laughs], [chuckles], [mischievously], [cheerful]; совет слушателю — "
         "[serious]); в письме — 2-4 на всё письмо: [sighs] или [nervous] в начале и середине; [whispers] — только "
@@ -4678,7 +4739,8 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
         '"payoff": "", "subject": "", '
         '"host_intro": "", "letter": ["Здравствуйте. ...", "..."], "host_outro": "", "title": "", '
         '"call": {"after": "", "gender": "f", "host_in": "", "text": "", "host_back": ""}, '
-        '"sfx": [{"after": "", "sound": "", "secs": 2}], "music": "", "motifs": [""], '
+        '"sfx": [{"after": "", "sound": "", "secs": 2}], "music": "", "ambience": "", '
+        '"through": [{"quote": "", "via": "intercom"}], "motifs": [""], '
         '"lore": {"name": "", "what": ""}}'
     )
     fix_brief = (f"Формат: {fname} — {fdesc}.\n" + (f"Манера автора: {sdesc}.\n" if sdesc else "")
@@ -4784,6 +4846,15 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
                         secs = 2.5
                     sfx.append({"after": str(x["after"]).strip()[:200], "sound": str(x["sound"]).strip()[:300],
                                 "secs": max(1.0, min(4.0, secs))})
+            letter_words = _al_words(strip_tags(" ".join(paras)))
+            through = []
+            for x in data.get("through") or []:
+                if not isinstance(x, dict):
+                    continue
+                q, via = " ".join(str(x.get("quote", "")).split())[:200], str(x.get("via", "")).strip().lower()
+                qw = _al_words(strip_tags(q))
+                if via in THROUGH_VIA and 2 <= len(qw) <= 20 and _find_words(letter_words, qw) >= 0:
+                    through.append({"quote": q, "via": via})
             return {"title": scrub(str(data.get("title", "")).strip())[:60], "subject": subject,
                     "premise": f"{place[:30]} | {marks[0][:25]} | тема:{kind if not listener else 'слушатель'} | "
                                f"формат:{fkey}"  # пометки — до приёма: историю тем режут по длине
@@ -4799,6 +4870,7 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
                                                         else "Спасибо, что позвонили… Ладно, я дочитаю."),
                              "after": call_after, "drop": call_drop} if call_text and call_in else None,
                     "sfx": sfx[:3], "music": scrub(str(data.get("music", "")).strip())[:400],
+                    "ambience": scrub(str(data.get("ambience", "")).strip())[:300], "through": through[:2],
                     "kind": kind if not listener else "слушатель", "format": fkey, "motifs": motif_list,
                     "author": {"gender": g, "age": age}, "style": skey, "ending": ekey, "lore": new_lore,
                     "lore_used": (lore or {}).get("name") or None, "place": place, "check": check,
@@ -4817,7 +4889,7 @@ async def horror_story(avoid: list[str], facts: str = "", today: date | None = N
                  "преступления)" + (f" — в нём было «{hit.group(0)}»" if hit else "") + ". Нужна другая история, "
                  "без этого.")
     return {"title": "", "subject": "", "premise": "", "paragraphs": [], "intro": "", "outro": "", "call": None,
-            "sfx": [], "music": "", "kind": "", "format": "письмо", "motifs": [], "author": {"gender": "m", "age": 30}}
+            "sfx": [], "music": "", "ambience": "", "through": [], "kind": "", "format": "письмо", "motifs": [], "author": {"gender": "m", "age": 30}}
 
 
 NIGHT_SYSTEM = (
