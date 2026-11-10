@@ -89,7 +89,8 @@ async def make_episode(db: Database, progress=night._noop, letter: dict | None =
         letter = {**letter, "trusted": letter.get("uid") in _parse_ids(os.getenv("ADMIN_IDS", ""))}
     story = await ai.gossip_story(used[-12:], facts, now.date(), listener=letter, own=own)
     if not story:
-        raise RuntimeError("ИИ не написал выпуск" + (f" ({ai.gossip_why[0]})" if ai.gossip_why[0] else ""))
+        raise RuntimeError(ai.gossip_why[0] if ai.gossip_why[0].startswith("ИИ отказался") else
+                           "ИИ не написал выпуск" + (f" ({ai.gossip_why[0]})" if ai.gossip_why[0] else ""))
     topic = story["subject"] or story["title"] or "без темы"
     await db.set_setting(HIST_KEY, json.dumps(
         (used + [f"тема:{story['theme'][:40]} | {topic} | {story.get('place', '')}"])[-30:], ensure_ascii=False))
@@ -202,7 +203,7 @@ async def _start(bot: Bot, db: Database, uid: int, letter_id: int | None, own: s
             pass
     except Exception as e:
         logger.exception("gossip draft failed")
-        await bot.send_message(uid, f"Выпуск не собрался: {html.escape(str(e))[:200]}")
+        await bot.send_message(uid, f"Выпуск не собрался: {html.escape(str(e))[:400]}")
     return True
 
 

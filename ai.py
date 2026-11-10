@@ -5002,6 +5002,7 @@ GOSSIP_LANDMARKS = ["торгушка «Ворошиловский»", "«Евр
 _GOSSIP_BAN = re.compile(r"войн|сталинград|мамаев|мемориал|фашист|теракт|самоубий|повесил(?:ся|ась|ись)|суицид|"
                          r"изнасил|педоф|наркот|закладк|онколог|\bрак\b|инвалид", re.IGNORECASE)
 gossip_why = [""]  # почему не вышел последний выпуск — в сообщение владельцу
+_GOSSIP_REFUSAL = re.compile(r"не (?:сделаю|буду|стану|могу)|отказыва", re.IGNORECASE)
 
 
 _NAME_WORD = re.compile(r"(?<![\w-])[А-ЯЁ][а-яё]{1,14}(?![\w-])")
@@ -5229,6 +5230,11 @@ async def gossip_story(avoid: list[str], facts: str = "", today: date | None = N
         except ValueError:
             logger.warning("gossip: ответ без JSON (%d знаков): %s", len(out), out[:300])
             gossip_why[0] = "ответ без JSON: " + " ".join(out.split())[:120]
+            if _GOSSIP_REFUSAL.search(out[:400]):  # ИИ отказался сам — повторять за деньги бессмысленно
+                first = re.split(r"(?<=[.!?])\s+", " ".join(out.split()))
+                gossip_why[0] = "ИИ отказался: " + " ".join(first[:3])[:300]
+                logger.info("gossip: ИИ отказался делать выпуск — не повторяю")
+                return {}
             continue
         vers = [v for v in (data.get("versions") or []) if isinstance(v, dict) and _lines(v.get("lines"))][:3]
         chances = _norm_chances([v.get("chance", 33) for v in vers])
