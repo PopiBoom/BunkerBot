@@ -238,7 +238,7 @@ def _name(message: Message) -> str:
 
 
 def _as_dicts(rows: list[tuple]) -> list[dict]:
-    return [{"id": r[0], "name": r[2], "text": r[3]} for r in rows]
+    return [{"id": r[0], "name": r[2], "text": r[3], "ts": r[4] if len(r) > 4 else None} for r in rows]
 
 
 def _bunker_active(chat_id: int) -> bool:

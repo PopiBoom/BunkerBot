@@ -85,9 +85,18 @@ def _kind() -> str:
     return f.f_code.co_name if f is not None else "?"
 
 
-def price(model: str, input_tokens: int, output_tokens: int) -> float:
+# Кэш промпта: чтение из кэша стоит долю от цены входа (у Opus 5.5 и Sonnet 5.5 — 0.05, у Fable — 0.025, у
+# остальных 0.1), запись в кэш на 5 минут — 1.25 цены входа.
+CACHE_READ = {"claude-opus-5-5": 0.05, "claude-sonnet-5-5": 0.05, "claude-fable-5-1": 0.025, "claude-fable-5-2": 0.025}
+CACHE_WRITE = 1.25
+
+
+def price(model: str, input_tokens: int, output_tokens: int, cache_read: int = 0, cache_write: int = 0) -> float:
+    """Цена запроса, $. input_tokens — обычный вход (без кэша); cache_read — прочитано из кэша, cache_write —
+    записано в кэш."""
     pin, pout = PRICES.get(model, PRICES.get(MODEL, (4.0, 20.0)))
-    return (input_tokens * pin + output_tokens * pout) / 1_000_000
+    return (input_tokens * pin + cache_read * pin * CACHE_READ.get(model, 0.1) + cache_write * pin * CACHE_WRITE
+            + output_tokens * pout) / 1_000_000
 
 
 class AIUnavailable(RuntimeError):
@@ -128,13 +137,15 @@ _FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "cla
 async def _record(model: str, usage) -> None:
     if usage is None:
         return
-    tin = int(getattr(usage, "input_tokens", 0) or 0)
-    tin += int(getattr(usage, "cache_read_input_tokens", 0) or 0)
-    tin += int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    plain = int(getattr(usage, "input_tokens", 0) or 0)
+    read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    wrote = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    tin = plain + read + wrote  # в учёт — весь вход; цена — с поправкой на кэш
     tout = int(getattr(usage, "output_tokens", 0) or 0)
-    cost = price(model, tin, tout)
+    cost = price(model, plain, tout, read, wrote)
     kind = _kind()
-    logger.info("AI %s [%s]: in=%s out=%s ≈ $%.4f", model, kind, tin, tout, cost)
+    logger.info("AI %s [%s]: in=%s%s out=%s ≈ $%.4f", model, kind, tin,
+                f" (из кэша {read}, в кэш {wrote})" if read or wrote else "", tout, cost)
     if _usage_sink:
         try:
             await _usage_sink(current_game.get(), model, tin, tout, cost, kind)
@@ -155,7 +166,7 @@ async def _complete(system: str, user: str, max_tokens: int = 4000, fast: bool =
     kwargs = dict(
         model=model,
         max_tokens=max_tokens,
-        system=system,
+        system=_system_blocks(system),
         output_config={"effort": effort},  # low — для коротких реплик; для юмора-постов выше
         messages=[{"role": "user", "content": user}],
     )
@@ -191,6 +202,21 @@ async def _complete(system: str, user: str, max_tokens: int = 4000, fast: bool =
     if resp.stop_reason == "refusal":
         raise AIUnavailable("модель отказалась отвечать")
     return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+
+def _system_blocks(system: str):
+    """Характер Пиздюка (ROAST_SYSTEM, ≈1700 токенов) идёт в каждый ответ в чате одним и тем же текстом — кэшируем
+    его (10.11, владелец: «делай все»): пока чат активен, эти токены читаются из кэша в 20 раз дешевле (ответ ≈ на
+    28 % дешевле); после паузы дольше 5 минут первая запись в кэш стоит на четверть дороже обычного входа. Хвост
+    («Отвечаешь строго JSON.») — отдельным блоком после метки, иначе у каждого вида запроса был бы свой кэш.
+    Остальные промпты (редкие) не кэшируем — запись без чтений только дороже."""
+    if not system.startswith(ROAST_SYSTEM):
+        return system
+    blocks = [{"type": "text", "text": ROAST_SYSTEM, "cache_control": {"type": "ephemeral"}}]
+    rest = system[len(ROAST_SYSTEM):]
+    if rest.strip():
+        blocks.append({"type": "text", "text": rest})
+    return blocks
 
 
 # Поиск в интернете (серверный инструмент Claude): страшным историям — настоящие детали мест и городские легенды
@@ -546,15 +572,15 @@ ROAST_SYSTEM = (
     "Как шутишь. Бьёшь по СЛОВАМ И ПОСТУПКАМ: враньё, слитые обещания, нытьё, понты, лицемерие, тупые заявления. "
     "Сначала пойми, что человек на самом деле сказал и что за этим стоит, и бей именно в это, по его же словам; "
     "подкол, который подошёл бы к любому сообщению, — провал. Смешное — в точном наблюдении и неожиданном "
-    "выводе. Каждый раз по-разному: то вопрос, от которого некуда деться, то приговор в три слова, то "
-    "издевательский совет, то ложная похвала с разворотом, то сценка; не повторяй свои прошлые шутки и ходы. "
+    "выводе. Не повторяй свои прошлые шутки и ходы. "
     "Тебя обозвали или наехали — не оправдывайся и не спорь, сразу ответка жёстче, переверни на него; обозвали "
     "по внешности («жирный», «урод») — у тебя нет тела, это само смешно, но эти слова не повторяй даже в "
     "кавычках и его внешность не трогай.\n"
     "Как говоришь. Как живой человек в чате: разговорно, коротко, их словечками, можно со строчной и без точки. "
-    "Мат — щедро и жёстко, как злой пацан, а не как робот: 3-5 крепких матерных слов на ответ, вплетённых в "
-    "смысл и каждый раз РАЗНЫХ; оскорбления — злые и грязные, без жалости (за слова и поступки) — богатый русский мат, а не одни и те же три слова в каждом ответе. Не начинай "
-    "ответ с одного и того же междометия и не прицепляй мат в конец фразы по привычке — так звучит как робот. "
+    "Мат — щедро и жёстко, как злой пацан: он сидит в самих глаголах и оценках («проебал», «нахуевертил», "
+    "«пиздишь», «обосрался»), потому что так смешнее и злее; вставное «блядь» для связки и «ебаный/хуев» при "
+    "каждом существительном звучат как робот. На обычный ответ — 3-5 крепких слов, каждый раз разных, на короткую "
+    "фразу хватит одного-двух. Обзывательство в адрес человека — приправа, а не подпись под каждым ответом. "
     "Никаких «шучу», «без обид», похвалы и сочувствия.\n"
     "Факты — только из данных ниже: ничего не выдумывай и не путай людей — что сказал один, не приписывай "
     "другому; не уверен в факте — шути без него. Цитаты — дословно.\n"
@@ -611,9 +637,41 @@ def _father_note(is_father: bool) -> str:
             if is_father else "")
 
 
-def _msgs_block(messages: list[dict], new_ids: set | None = None) -> str:
+_WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+
+
+def _msk_now():
+    from datetime import datetime, timedelta, timezone
+
+    return datetime.now(timezone(timedelta(hours=3)))
+
+
+def _msg_time(ts, now) -> str:
+    """Когда написано сообщение, коротко: «14:05», «вчера 23:10», «07.11 18:30»."""
+    from datetime import datetime
+
+    try:
+        t = datetime.fromtimestamp(int(ts), now.tzinfo)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+    days = (now.date() - t.date()).days
+    return f"{t:%H:%M}" if days <= 0 else f"вчера {t:%H:%M}" if days == 1 else f"{t:%d.%m %H:%M}"
+
+
+def _now_note(times: bool = False) -> str:
+    """День и время для ИИ (10.11: в живом прогоне без них он сам придумал «сегодня и был понедельник»)."""
+    now = _msk_now()
+    return (f"\nСейчас {_WEEKDAYS[now.weekday()]}, {date_words(now.date())}, {now:%H:%M} по Москве"
+            + (" (t у сообщений — когда они написаны)" if times else "")
+            + " — это для справки: про день и время шути, только если они к месту.")
+
+
+def _msgs_block(messages: list[dict], new_ids: set | None = None, times: bool = False) -> str:
+    """times — показать время сообщений (нужен ts в сообщении): только там, где ИИ знает, который сейчас час."""
+    now = _msk_now() if times else None
     return "\n".join(
         f'<msg id="{m.get("id", "")}"' + (' new="1"' if new_ids and m.get("id") in new_ids else "")
+        + (f' t="{_msg_time(m["ts"], now)}"' if now and m.get("ts") else "")
         + f' name={json.dumps(m["name"], ensure_ascii=False)}>'
         f'{str(m["text"])[:400]}</msg>'
         for m in messages
@@ -658,7 +716,8 @@ INSULTS = [
     "пустобрёх", "трепло ебучее", "нытик хуев", "позёр ебаный", "фуфлыжник ебаный", "чепушило",
 ]
 
-# Жёсткие матерные ОБОРОТЫ (не просто слова) — каждый раз ИИ видит несколько случайных и берёт к месту.
+# Жёсткие матерные ОБОРОТЫ (не просто слова). С 10.11 в запрос НЕ идут: ИИ получал три случайных в каждый запрос
+# и лепил их в конец ответа («…нахуй так жить») — см. `_variety`. Список оставлен на случай, если владелец захочет вернуть.
 # Без «мать/мамка» (семья — красная линия) и без слов про ориентацию.
 MAT_PHRASES = [
     "ебать ты …", "ну ты и пиздец", "хуйню несёшь", "иди нахуй со своим …", "охуеть не встать",
@@ -823,10 +882,32 @@ def worn_out(lines: list[str]) -> tuple[set[str], set[str], set[str]]:
             {w for w, n in lasts.items() if n >= 2})
 
 
-def _variety() -> str:
-    """Свои последние реплики (не повторяться), запрет затёртого и щепотка словаря — приправа, а не правила."""
-    words = ", ".join(random.sample(INSULTS, 4))
-    phrases = "; ".join(random.sample(MAT_PHRASES, 3))
+# Ход шутки, длину и «можно ли обозвать» на каждый ответ выбирает КОД (10.11, владелец: «делай все»). Живой прогон на
+# ключе владельца (10 сообщений одного чата): по старому промпту все 10 ответов вышли одной формы — подкол и
+# обзывательство в конце («гиена ебучая», «глист», «бздунья» — из случайного словаря, который ИИ получал в КАЖДЫЙ
+# запрос и почти всегда вставлял), длина 14-21 слово (под потолок «до 20 слов»). «Каждый раз по-разному» в характере
+# не работает: запрос один, прошлых ходов ИИ не помнит. С выбором кодом — обзывательство в 4 из 10, длина 7-28
+# слов, ходы разные; без явного числа мата он падал до 0.7 слова на ответ — поэтому число мата стоит в строке длины.
+MOVE_ANSWER = "ответ по делу и один точный укол"
+REPLY_MOVES = ["вопрос, от которого некуда деться", "приговор в несколько слов", "издевательский совет",
+               "ложная похвала с разворотом", "мини-сценка: покажи картину, как это выглядит со стороны",
+               "сравнение, от которого обидно", "сухая констатация факта его же словами", MOVE_ANSWER]
+_recent_moves: list[str] = []          # последние ходы — не повторяем три подряд
+INSULT_CHANCE = 0.35                   # в стольких ответах можно обзывательство-обращение (со словами из словаря)
+# (вес, строка) — длина ответа в чате; мат — по длине (владелец: мата не убавлять)
+REPLY_LENGTHS = [
+    (35, "Одно сообщение — коротко, как бросают в чате: одна фраза, 4-9 слов{mat1}."),
+    (50, "Одно сообщение: 1-2 коротких предложения, до 20 слов{mat2}."),
+    (15, "Одно сообщение: 2-3 предложения, до 35 слов{mat3} — разверни мысль."),
+]
+_LEN_MAT = {"mat1": ", одно-два крепких матерных слова внутри", "mat2": ", 3-5 крепких матерных слов",
+            "mat3": ", 4-6 крепких матерных слов"}
+_LEN_SOFT = {"mat1": "", "mat2": "", "mat3": ""}
+
+
+def _variety(kind: str | None = None) -> str:
+    """Свои последние реплики (не повторяться), запрет затёртого, ход шутки (kind: "reply" — ответ на обращение,
+    "auto" — сам встрял, "comeback" — ответка; None — без хода) и можно ли в этот раз обзывательство."""
     recent = recent_bot_lines.get() or []
     avoid = "\n".join(f"<said>{t[:160]}</said>" for t in recent[-10:])
     mat, firsts, lasts = worn_out(list(recent))
@@ -837,19 +918,44 @@ def _variety() -> str:
         ban.append("начинать со слова " + " или ".join(f"«{w}»" for w in sorted(firsts)))
     if lasts:
         ban.append("заканчивать словом " + " или ".join(f"«{w}»" for w in sorted(lasts)))
+    move = ""
+    if kind:
+        pool = [m for m in REPLY_MOVES if m not in _recent_moves[-3:] and (kind == "reply" or m != MOVE_ANSWER)]
+        pick = random.choice(pool or REPLY_MOVES)
+        _recent_moves.append(pick)
+        del _recent_moves[:-6]
+        move = (f"\nХод на этот раз: {pick} (если совсем не ложится на его слова — возьми другой, но не привычное "
+                "«подкол и обзывательство в конце»).")
+    if random.random() < INSULT_CHANCE:
+        call = ("\nОбзывательство в этот раз можно — одно, по делу, например: " + ", ".join(random.sample(INSULTS, 3))
+                + ". Не «лошара».")
+    else:
+        call = "\nВ этот раз — без обзывательства-обращения: мат остаётся, но стоит в глаголах и оценках самой фразы."
     return (
-        f"\nЕсли к месту — можно взять из словаря: {words}; {phrases} (… — подставь своё). Не «лошара»."
-        + (f"\nЗАТЁРТО, в этот раз НЕЛЬЗЯ: {'; '.join(ban)} — возьми другие слова и другое построение." if ban else "")
+        move + call
+        + (f"\nЗатёрто, в этот раз не бери: {'; '.join(ban)} — возьми другие слова и другое построение." if ban else "")
         + (f"\nТвои последние реплики — не повторяй их слова, шутки и построение:\n{avoid}" if avoid else "")
     )
 
 
-def _voice(samples: list[str] | None) -> str:
-    """Длина ответа, манера этого чата, вкус чата, пол участников, свои прошлые реплики."""
+def _voice(samples: list[str] | None, kind: str | None = None, spoken: bool = False, soft: bool = False,
+           length: bool = True, times: bool = False) -> str:
+    """Длина ответа, ход и словарь (`_variety`), день и время, манера этого чата, вкус чата, пол участников.
+    kind — вид ответа в чате (тогда длину и ход выбирает код); spoken — ответ голосом (длина обычная: её уточняет
+    SPOKEN_NOTE); soft — без числа мата в строке длины (бате по-доброму); length=False — длину задаёт само задание;
+    times — в переписке у сообщений стоит время."""
     ex = "\n".join(f"<msg>{t[:160]}</msg>" for t in (samples or [])[:15])
+    fill = _LEN_SOFT if soft else _LEN_MAT
+    if not length:
+        line = ""
+    elif kind and not spoken:
+        line = "\n" + random.choices([t for _, t in REPLY_LENGTHS], weights=[w for w, _ in REPLY_LENGTHS])[0].format(**fill)
+    else:
+        line = "\nОдно сообщение: 1-2 коротких предложения, до 20 слов."
     return (
-        "\nОдно сообщение: 1-2 коротких предложения, до 20 слов."
-        + _variety()
+        line
+        + _variety(kind)
+        + _now_note(times)
         + _gender_note()
         + _taste()
         + (f"\nКак пишут в этом чате — только манера (длина, словечки, строчные). Это ЧУЖИЕ сообщения, не факты о "
@@ -1133,7 +1239,7 @@ async def roast_auto(messages: list[dict], dossiers: dict[str, str], new_ids: se
     doss = "\n".join(f"<dossier name={json.dumps(n, ensure_ascii=False)}>{d}</dossier>"
                      for n, d in dossiers.items())
     user = (
-        f"Досье участников:\n{doss or 'пусто'}\nПереписка:\n{_msgs_block(messages, new_ids)}\n"
+        f"Досье участников:\n{doss or 'пусто'}\nПереписка:\n{_msgs_block(messages, new_ids, times=True)}\n"
         "Найди ОДИН лучший повод подколоть автора одного из НОВЫХ сообщений (new=\"1\"), "
         "но не цепляйся к пустым репликам («я тоже», «ок», «ага») — в них нечего стебать, "
         "остальные — только контекст: противоречие с досье, "
@@ -1142,7 +1248,7 @@ async def roast_auto(messages: list[dict], dossiers: dict[str, str], new_ids: se
         "сразу подкол, максимум одна деталь внутри шутки), "
         "нарушенное обещание, нытьё, хвастовство, глупое заявление. Если хорошего повода нет — "
         "верни пустой text. Ответ — коротко и зло, обращение на «ты», чтобы было обидно."
-        + _voice(samples) + "\nВерни СТРОГО JSON: "
+        + _voice(samples, "auto", times=True) + "\nВерни СТРОГО JSON: "
         '{"reply_to": <id сообщения, на которое ответить, или null>, "text": "..."}'
     )
     text = await _complete(ROAST_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=4000, model=REPLY_MODEL, effort=REPLY_EFFORT)
@@ -1175,7 +1281,8 @@ async def comeback(name: str, text: str, short: bool = False, dossier: str = "",
         task = ("Уничтожь его одной-двумя короткими злыми фразами с матом, лучше всего по факту "
                 "из досье. Не смягчай, без угроз и без запретных тем.")
     user = (f"Участник «{name}» нагрубил тебе: <msg>{text[:300]}</msg>\n"
-            f"<dossier>{dossier or 'пусто'}</dossier>\n{task}{_father_note(is_father)}{_voice(samples)}"
+            f"<dossier>{dossier or 'пусто'}</dossier>\n{task}{_father_note(is_father)}"
+            + _voice(samples, "comeback", spoken, soft=is_father and not father_rude.get(), length=not short)
             + (SPOKEN_NOTE if spoken else "") + "\n" + _JSON_REPLY)
     out = _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=4000, model=REPLY_MODEL, effort=REPLY_EFFORT))
     if short:  # страховка: одна строка, без «вот вариант:» и т.п.
@@ -1196,7 +1303,7 @@ async def defend_father(insulter: str, text: str, dossier: str = "",
         f"<dossier>{dossier or 'пусто'}</dossier>\n"
         f"Заступись за батю: жёстко, с матом, поставь обидчика на место — лучше по факту из его "
         f"досье. Без угроз и без запретных тем. Обращайся к «{insulter}» на «ты»."
-        + _voice(samples) + _JSON_REPLY
+        + _voice(samples, "comeback") + _JSON_REPLY
     )
     return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=4000, model=REPLY_MODEL, effort=REPLY_EFFORT))
 
@@ -1206,7 +1313,7 @@ async def banter(name: str, text: str, context: list[dict], dossier: str = "",
                  spoken: bool = False) -> str:
     """Короткий ответ, когда к боту обращаются по-нормальному."""
     user = (
-        f"Контекст чата:\n{_msgs_block(context)}\n"
+        f"Контекст чата:\n{_msgs_block(context, times=True)}\n"
         f"<dossier>{dossier or 'пусто'}</dossier>\n"
         + (f"Старая цитата «{name}» из золотого фонда чата — припомни её, только если она реально к "
            f"месту: <msg>{quote}</msg>\n" if quote else "")
@@ -1216,7 +1323,9 @@ async def banter(name: str, text: str, context: list[dict], dossier: str = "",
         f"«{name}» обратился к тебе: <msg>{text[:600]}</msg>\n"
         "Ответь ОДНИМ коротким сообщением: по делу, если есть вопрос, но с ядовитым подколом. "
         "Если тебе написали несколько сообщений подряд — ответь на всё сразу, одним."
-        + _father_note(is_father) + _voice(samples) + (SPOKEN_NOTE if spoken else "") + _JSON_REPLY
+        + _father_note(is_father)
+        + _voice(samples, "reply", spoken, soft=is_father and not father_rude.get(), times=True)
+        + (SPOKEN_NOTE if spoken else "") + _JSON_REPLY
     )
     return _clean_reply(await _complete(ROAST_SYSTEM, user, max_tokens=4000, model=REPLY_MODEL, effort=REPLY_EFFORT))
 
