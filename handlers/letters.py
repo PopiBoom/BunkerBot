@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import logging
 import time
 
@@ -159,6 +160,12 @@ def _is_writing(message: Message) -> bool:
     return not (message.text or "").startswith("/")
 
 
+def _is_admin(uid: int) -> bool:
+    from config import _parse_ids
+
+    return uid in _parse_ids(os.getenv("ADMIN_IDS", ""))
+
+
 @router.message(_is_writing)
 async def on_letter(message: Message, db: Database) -> None:
     uid = message.from_user.id
@@ -171,7 +178,7 @@ async def on_letter(message: Message, db: Database) -> None:
         await message.answer(KINDS[kind]["short"])
         return
     day = [x for x in await _load(db) if x.get("uid") == uid and time.time() - x.get("ts", 0) < 86400]
-    if len(day) >= DAY_LIMIT:
+    if len(day) >= DAY_LIMIT and not _is_admin(uid):  # админу — без лимита (владелец 10.11)
         _waiting.pop(uid, None)
         await message.answer("На сегодня писем хватит - редакция и так не спит. Приходи завтра.")
         return
