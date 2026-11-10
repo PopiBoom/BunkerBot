@@ -36,7 +36,6 @@ router = Router(name="gossip")
 DRAFT_KEY = "gossip_draft"
 COUNT_KEY = "gossip_no"
 HIST_KEY = "gossip_titles"   # прошлые выпуски: «тема:… | о чём слух | где» — не повторять
-NUM_ICONS = ["1️⃣", "2️⃣", "3️⃣"]
 # Музыка под выпуск (идея №9) — ElevenLabs /music без голоса, весёлая и «шпионско-комедийная»; нет ключа — синтезатор
 GOSSIP_MUSIC = ("playful comedic gossip talk-show background music, sneaky pizzicato strings, light brushed percussion "
                 "and finger snaps, bouncy upright bass, mischievous spy-comedy vibe, upbeat, bright major key, "
@@ -51,21 +50,18 @@ def _spawn(coro) -> None:
 
 
 def _caption(n: int, story: dict, now: datetime, weather: str, bot_username: str, author: str | None) -> str:
-    """Подпись выпуска (и в канале): рубрика и номер, о чём слух, кто прислал, версии с шансами, время и погода,
-    как слить свою сплетню."""
+    """Подпись выпуска (и в канале): рубрика и номер, о чём слух, кто прислал, время и погода, как слить свою
+    сплетню. Версий с шансами в подписи нет (10.11 владелец: «убери варианты» — они звучат в самом выпуске)."""
     from handlers.letters import deep_link
 
     subject = (story.get("subject") or story.get("title") or "без темы").strip()
     subject = subject[:1].upper() + subject[1:]
     when = f"{now:%H:%M}" + (f" · {html.escape(weather)}" if weather else "")
-    vers = "\n".join(f"{NUM_ICONS[i]} {html.escape(v['short'])} - <b>{v['chance']}%</b>"
-                     for i, v in enumerate(story.get("versions") or []) if i < len(NUM_ICONS))
     link = deep_link(bot_username, "gossip")
     return (f"🗣 <b>{ai.GOSSIP_RUBRIC.upper()}</b> · выпуск №{n}\n"
             f"🤫 <i>«{html.escape(subject[:90])}»</i>\n"
             + ("" if author is None else f"👤 Слил(а): {html.escape(author[:30])}\n" if author else
                "👤 Автор попросил не называть имя\n")
-            + (f"\n{vers}\n" if vers else "")
             + f"\n📻 Радио Волгограда · {when}"
             + (f"\n\n📨 Слить свою сплетню: <a href=\"{link}\">@{html.escape(bot_username)}</a>" if link else ""))
 
