@@ -47,6 +47,8 @@ FIRST_KEY = "night_first_sent"
 HORROR_FIRST_KEY = "horror_first_sent"
 HORROR_KEY = "horror_titles"
 MOTIFS_KEY = "horror_motifs"     # ключевые детали прошлых выпусков — не повторять (владелец: «ключи и т.д.»)
+SAID_KEY = "horror_said"         # что ведущий говорил в прошлых выпусках (начало, тема письма, приём звонка,
+#                                   реакция) — ИИ получает как «не повторяй» (владелец 10.11: образцы-фразы убраны)
 LORE_KEY = "horror_lore"         # сквозные персонажи рубрики (идея №7): [{"name", "what", "no", "where", "seen"}] —
 #                                   пополняется только при публикации, чтобы «выпуск №N» в эфире был настоящим
 TOPICS_KEY = "night_topics"
@@ -334,10 +336,16 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
         except (ValueError, TypeError):
             lore_all = []
         lore = None if letter else _lore_pick(lore_all, n_next, used)
+        try:
+            said = list(json.loads(await db.get_setting(SAID_KEY, "[]") or "[]"))
+        except (ValueError, TypeError):
+            said = []
         story = await ai.horror_story(used[-10:], facts, now.date(), listener=letter, comments=coms, motifs=motifs,
-                                      lore=lore)
+                                      lore=lore, said=said)
         if not story["paragraphs"]:
             raise RuntimeError("ИИ не написал историю")
+        if story.get("said"):
+            await db.set_setting(SAID_KEY, json.dumps((said + [story["said"]])[-ai.SAID_KEEP:], ensure_ascii=False))
         if story.get("motifs"):
             await db.set_setting(MOTIFS_KEY, json.dumps((motifs + story["motifs"])[-40:], ensure_ascii=False))
         if ai.eleven_key() and not ai.eleven_geo_blocked():  # музыка и звуки — пока озвучивается голос
@@ -445,7 +453,8 @@ async def make_episode(db: Database, horror: bool = False, progress=_noop, lette
                   + (f", манера «{story['style']}»" if story.get("style") else "")
                   + (f", концовка «{story['ending']}»" if story.get("ending") else "")
                   + (f", понятность {story['check']['clear']}/5" if (story.get("check") or {}).get("clear") else "")
-                  + (f", сквозное «{story['lore_used']}»" if story.get("lore_used") else ""))
+                  + (f", сквозное «{story['lore_used']}»" if story.get("lore_used") else "")
+                  + (f", правки письма: {', '.join(story['fixes'])}" if story.get("fixes") else ""))
         logger.info("horror: %s", extras)
         who = f"{who} · {extras}" if who else extras
         mix = await asyncio.to_thread(radio.studio, voice[:3], styles, ai.SPEAK_RATE, int(time.time()), events, music,
