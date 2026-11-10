@@ -1012,6 +1012,9 @@ Telegram-бот на aiogram 3 + Claude API. Владелец общается �
   `admin.spend_report` (Claude по функциям с долями и по моделям, ElevenLabs по функциям — `admin.ELEVEN_LABELS`):
   сам — владельцу в ЛС по понедельникам с 12:00 МСК (`spend_report_loop`, метка недели `spend_report_week`), сейчас —
   /admin «💸 Траты за неделю». У песен ElevenLabs Music заголовка списания может не быть — там 0 кредитов.
+- Перегрузка Claude (10.11 «Выпуск не собрался: Error code: 529 overloaded_error»): SDK повторял 2 раза за секунды.
+  Теперь `ai._complete` сам: 529/500/502/503 — длинная работа (max_tokens ≥ 8000: выпуски, истории) ждёт 10, 30, 60 с,
+  ответ в чате — 3 с; не помогло — тот же запрос моделью `EDIT_MODEL` (Sonnet); потом ошибка (и сторож).
 - `watchdog.py` — сторож (09.11, владелец): Claude API, ElevenLabs или прокси отвалились — владельцу в ЛС «⚠️ … не
   работает» один раз на сбой и «✅ … снова работает (не работал N мин)». Claude — из `ai._complete`
   (`watchdog.claude_error`: связь, 5xx/529, 429 — после `FAILS` 3 подряд; 401/403 и «credit balance» — сразу; плохой

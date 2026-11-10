@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextvars
 import json
@@ -181,18 +182,35 @@ async def _complete(system: str, user: str, max_tokens: int = 4000, fast: bool =
         ]}]
     if tools:  # серверные инструменты (поиск в интернете) — их крутит сам API
         kwargs["tools"] = tools
+    # 10.11 «Выпуск не собрался: Error code: 529 overloaded_error»: SDK повторяет 2 раза за пару секунд, а перегрузка
+    # у Anthropic длится дольше. Теперь: длинная работа (выпуски, истории — max_tokens ≥ 8000) ждёт 10, 30 и 60 с, ответ
+    # в чате — ещё раз через 3 с; не помогло — тот же запрос моделью EDIT_MODEL (Sonnet: перегрузка обычно у одной
+    # модели); потом — ошибка, как раньше.
+    waits = [10, 30, 60] if max_tokens >= 8000 else [3]
     for _ in range(4):
-        try:
-            if model in _FALLBACK_MODELS:
-                # При отказе API само переотправит запрос подходящей модели.
-                resp = await client.beta.messages.create(
-                    betas=["server-side-fallback-2026-07-01"], fallbacks="default", **kwargs
-                )
-            else:
-                resp = await client.messages.create(**kwargs)
-        except Exception as e:
-            watchdog.claude_error(e)  # связь, 5xx, ключ, деньги — сторож напишет владельцу
-            raise
+        for attempt in range(len(waits) + 2):
+            try:
+                if kwargs["model"] in _FALLBACK_MODELS:
+                    # При отказе API само переотправит запрос подходящей модели.
+                    resp = await client.beta.messages.create(
+                        betas=["server-side-fallback-2026-07-01"], fallbacks="default", **kwargs
+                    )
+                else:
+                    resp = await client.messages.create(**kwargs)
+                break
+            except Exception as e:
+                code = getattr(e, "status_code", None)
+                busy = code in (500, 502, 503, 529) or "overloaded" in str(e).lower()
+                if busy and attempt < len(waits):
+                    logger.warning("claude %s перегружен (%s) — жду %s с и повторяю", kwargs["model"], code, waits[attempt])
+                    await asyncio.sleep(waits[attempt])
+                    continue
+                if busy and attempt == len(waits) and kwargs["model"] != EDIT_MODEL:
+                    logger.warning("claude %s всё ещё перегружен — тот же запрос моделью %s", kwargs["model"], EDIT_MODEL)
+                    kwargs["model"] = model = EDIT_MODEL
+                    continue
+                watchdog.claude_error(e)  # связь, 5xx, ключ, деньги — сторож напишет владельцу
+                raise
         watchdog.ok("claude")
         await _record(getattr(resp, "model", None) or model, resp.usage)
         if resp.stop_reason != "pause_turn":
