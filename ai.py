@@ -5001,6 +5001,9 @@ GOSSIP_LANDMARKS = ["торгушка «Ворошиловский»", "«Евр
                     "маршрутка до Волжского", "МЕГА", "площадь Павших Борцов"]
 _GOSSIP_BAN = re.compile(r"войн|сталинград|мамаев|мемориал|фашист|теракт|самоубий|повесил(?:ся|ась|ись)|суицид|"
                          r"изнасил|педоф|наркот|закладк|онколог|\bрак\b|инвалид", re.IGNORECASE)
+gossip_why = [""]  # почему не вышел последний выпуск — в сообщение владельцу
+
+
 _NAME_WORD = re.compile(r"(?<![\w-])[А-ЯЁ][а-яё]{1,14}(?![\w-])")
 _NOT_NAMES = {"Волгоград", "Волгограда", "Волгограде", "Волга", "Волге", "Волгу", "Россия", "России", "Это", "Она",
               "Он", "Они", "Мы", "Вы", "Ты", "Я", "Все", "Всё", "Там", "Тут", "Так", "Как", "Когда", "Потом", "Вчера",
@@ -5215,15 +5218,17 @@ async def gossip_story(avoid: list[str], facts: str = "", today: date | None = N
         + ', "outro": ' + line + ', "title": ""}'
     )
     banned = asked_names = False
+    gossip_why[0] = ""
     must = _gossip_names((own or "") + " " + (str(listener.get("text", "")) if listener else ""))
     if listener and not listener.get("trusted"):  # у чужой сплетни фамилию ИИ может и убрать (измена, секс)
         must = [w for w in must if not re.search(r"(?:ов|ев|ин|ова|ева|ина)$", w.lower())]
-    for _ in range(3):
+    for _ in range(4):
         out = await _complete(GOSSIP_SYSTEM + " Отвечаешь строго JSON.", user, max_tokens=16000, effort="medium")
         try:
             data = _extract_json(out)
         except ValueError:
-            logger.warning("gossip: ответ без JSON (%d знаков): %s", len(out), out[:200])
+            logger.warning("gossip: ответ без JSON (%d знаков): %s", len(out), out[:300])
+            gossip_why[0] = "ответ без JSON: " + " ".join(out.split())[:120]
             continue
         vers = [v for v in (data.get("versions") or []) if isinstance(v, dict) and _lines(v.get("lines"))][:3]
         chances = _norm_chances([v.get("chance", 33) for v in vers])
@@ -5246,10 +5251,13 @@ async def gossip_story(avoid: list[str], facts: str = "", today: date | None = N
         if len(story["versions"]) < 3 or len(story["story"]) < 2 or not story["intro"]:
             logger.warning("gossip: неполный ответ (версий %d, реплик в теме %d) — ещё раз", len(story["versions"]),
                            len(story["story"]))
+            gossip_why[0] = f"неполный ответ: версий {len(story['versions'])}, реплик в теме {len(story['story'])}"
             continue
         if _GOSSIP_BAN.search(whole):
+            gossip_why[0] = f"запретное слово «{_GOSSIP_BAN.search(whole).group(0)}»"
             if banned:
-                return {}
+                logger.info("gossip: опять запретное (%s)", _GOSSIP_BAN.search(whole).group(0))
+                continue
             banned = True
             logger.info("gossip: запретное (%s) — переделка", _GOSSIP_BAN.search(whole).group(0))
             user += ("\n\nВ прошлом варианте было запретное (война, смерть, болезни, наркотики, насилие и т.п.). "

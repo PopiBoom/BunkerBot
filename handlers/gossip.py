@@ -89,7 +89,7 @@ async def make_episode(db: Database, progress=night._noop, letter: dict | None =
         letter = {**letter, "trusted": letter.get("uid") in _parse_ids(os.getenv("ADMIN_IDS", ""))}
     story = await ai.gossip_story(used[-12:], facts, now.date(), listener=letter, own=own)
     if not story:
-        raise RuntimeError("ИИ не написал выпуск")
+        raise RuntimeError("ИИ не написал выпуск" + (f" ({ai.gossip_why[0]})" if ai.gossip_why[0] else ""))
     topic = story["subject"] or story["title"] or "без темы"
     await db.set_setting(HIST_KEY, json.dumps(
         (used + [f"тема:{story['theme'][:40]} | {topic} | {story.get('place', '')}"])[-30:], ensure_ascii=False))
