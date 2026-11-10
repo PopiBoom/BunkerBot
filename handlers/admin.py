@@ -972,6 +972,8 @@ async def _restore_db(message: Message, bot: Bot, db: Database) -> None:
 
 # Подписи к функциям ai.py в «Расходах ИИ» (имя функции, откуда пошёл запрос, — ai._kind)
 KIND_LABELS = {
+    "reaction_reply": "ответ на реакцию под шуткой",
+    "chat_memes": "мемы чата (раз в сутки)",
     "banter": "ответы на обращения к боту", "roast_auto": "бот встревает сам", "roast_photo": "комменты к фото/видео",
     "roast_user": "/roast", "comeback": "ответки на наезды", "defend_father": "защита бати",
     "is_father_insult": "проверка наездов на батю", "describe_photo": "описания фото (Haiku)",

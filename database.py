@@ -410,6 +410,15 @@ class Database:
             await db.commit()
             return True
 
+    async def bot_line(self, chat_id: int, msg_id: int) -> tuple[str, int] | None:
+        """(текст, когда) реплики бота по id сообщения; None — это не сообщение бота."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT text, ts FROM chat_messages WHERE chat_id = ? AND msg_id = ? AND user_id = 0 LIMIT 1",
+                (chat_id, msg_id))
+            row = await cur.fetchone()
+            return (str(row[0]), int(row[1])) if row else None
+
     async def scored_lines(self, chat_id: int, good: bool, limit: int = 5) -> list[str]:
         """Шутки бота, которые чату зашли (good) или не зашли — за последние 60 дней."""
         since = int(time.time()) - 60 * 86400

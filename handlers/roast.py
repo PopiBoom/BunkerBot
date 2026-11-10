@@ -400,6 +400,11 @@ async def _remember_lines(db: Database, chat_id: int) -> None:
     ai.chat_genders.set(genders)
     ai.liked_lines.set(await db.scored_lines(chat_id, True))
     ai.disliked_lines.set(await db.scored_lines(chat_id, False))
+    ai.spar.set(None)  # перепалку ставит только _reply_once — у остальных ответов её нет
+    try:  # внутренние мемы чата — собираются раз в сутки (_refresh_memes)
+        ai.chat_memes_var.set(json.loads(await db.get_setting(f"chat_memes:{chat_id}", "") or "{}").get("items") or [])
+    except (ValueError, AttributeError):
+        ai.chat_memes_var.set([])
 
 
 _gender_ready: set[int] = set()
@@ -426,8 +431,9 @@ async def _ensure_genders(db: Database, chat_id: int) -> None:
 
 
 TYPE_SPEED = 18          # символов в секунду — «печатает» столько, сколько человек
-SPLIT_CHANCE = 0.15     # иногда разбивает ответ на два сообщения: подкол, потом добивка (обе части — полные)
-SPLIT_MIN = 40          # символов в каждой части — иначе вторым сообщением летел огрызок «пиздец, … нахуй»
+SPLIT_CHANCE = 0.3      # разбивает ответ на два сообщения: подкол, потом добивка (10.11 владелец: «пишет как
+#                         человек» — было 0.15)
+SPLIT_MIN = 25          # символов в каждой части и не меньше трёх слов — иначе вторым летел огрызок «пиздец, … нахуй»
 
 
 # Сколько бот уже «печатал», пока думал (ставит _typing_on): столько не ждём второй раз перед отправкой
@@ -663,7 +669,16 @@ async def _say_human(bot: Bot, chat_id: int, text: str, reply_to: int | None = N
                      to_user: int | None = None) -> None:
     """Ответ «как человек»: «печатает…» по длине текста, иногда двумя сообщениями подряд; voice — голосовым."""
     text = (text or "").strip()
-    if voice and await _say_voice(bot, chat_id, text, reply_to, to_user):
+    if voice and await _say_voice(bot, chat_id, " ".join(text.split()), reply_to, to_user):
+        return
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    if 2 <= len(lines) <= 3 and len(text) <= 300:  # ИИ дописал фразу вдогонку (ai.PS_CHANCE) — отдельными сообщениями
+        why = _why.get() or {}
+        for i, ln in enumerate(lines):
+            if i:
+                _mark(why.get("kind", "") + " (вдогонку)", "")
+            await _typing(bot, chat_id, ln, 1.0, 3.5)
+            await _say(bot, chat_id, ln, reply_to=None if i else reply_to)
         return
     parts = re.split(r"(?<=[.!?…])\s+", text)
     if len(parts) >= 2 and len(text) > 50 and random.random() < SPLIT_CHANCE:
@@ -675,7 +690,7 @@ async def _say_human(bot: Bot, chat_id: int, text: str, reply_to: int | None = N
             first.append(p)
             acc += len(p) + 1
         one, two = " ".join(first), " ".join(parts[len(first):])
-        if len(one) >= SPLIT_MIN and len(two) >= SPLIT_MIN:
+        if min(len(one), len(two)) >= SPLIT_MIN and min(len(one.split()), len(two.split())) >= 3:
             await _typing(bot, chat_id, one, 1.0, 3.5)
             await _say(bot, chat_id, one, reply_to=reply_to)
             why = _why.get() or {}
@@ -1091,14 +1106,68 @@ def _react_score(reactions) -> int:
     return score
 
 
+# Бот отвечает на реакцию под своей шуткой (10.11, владелец выбрал из идей «реагирует на реакции»): на 🤡/👎 —
+# огрызается, на 🔥 — самодовольничает. Не на каждую: шанс, пауза на чат, только свежие реплики, раз на человека.
+REACT_REPLY_BAD, REACT_REPLY_GOOD = 0.5, 0.25
+REACT_REPLY_GAP = 10 * 60     # сек между такими ответами в одном чате
+REACT_REPLY_FRESH = 30 * 60   # реплике бота не больше стольких секунд
+_react_replied: dict[int, float] = {}
+_react_seen: set[tuple[int, int, int]] = set()
+REACT_BACK_BAD = ["{n}, клоуна в зеркале поищи.", "{n}, обиделся на правду - бывает.", "{n}, шутка не виновата, что ты такой."]
+REACT_BACK_GOOD = ["{n}, я знаю, что я хорош.", "{n}, хоть у кого-то тут вкус есть.", "{n}, учись, пока я жив."]
+
+
+async def _react_back(bot: Bot, db: Database, event: MessageReactionUpdated, good: bool, config) -> None:
+    chat_id, user = event.chat.id, event.user
+    key = (chat_id, event.message_id, user.id)
+    now = time.time()
+    if key in _react_seen or now - _react_replied.get(chat_id, 0) < REACT_REPLY_GAP:
+        return
+    if random.random() >= (REACT_REPLY_GOOD if good else REACT_REPLY_BAD):
+        return
+    row = await db.bot_line(chat_id, event.message_id)
+    if (not row or now - row[1] > REACT_REPLY_FRESH or row[0].startswith("[") or _bunker_active(chat_id)
+            or not await _enabled(db) or await db.is_optout(chat_id, user.id)):
+        return
+    _react_seen.add(key)
+    if len(_react_seen) > 2000:
+        _react_seen.clear()
+    _react_replied[chat_id] = now
+    emoji = next((getattr(r, "emoji", "") for r in event.new_reaction or [] if getattr(r, "emoji", "")), "")
+    name = (user.first_name or "ты").strip()
+    is_father = user.id == _father_id(config or (_cfg_ref[0] if _cfg_ref else None))
+    await asyncio.sleep(random.uniform(2.0, 5.0))  # заметил не сразу
+    text = ""
+    if ai.available():
+        try:
+            await _remember_lines(db, chat_id)
+            if is_father:
+                ai.father_rude.set(random.random() < ai.FATHER_RUDE_CHANCE)
+            text = await ai.reaction_reply(name, row[0], emoji, good, is_father)
+            text = await ai.polish(text, row[0], author=ai.FATHER_NAME if is_father else name) if text else ""
+        except Exception as e:
+            logger.warning("reaction reply failed: %s", e)
+    if not text and not is_father:
+        text = random.choice(REACT_BACK_GOOD if good else REACT_BACK_BAD).format(n=name)
+    if text:
+        _mark("ответ на реакцию " + emoji, text)
+        await _say_human(bot, chat_id, ai.vary_father(text) if is_father else text, reply_to=event.message_id)
+
+
 @router.message_reaction()
-async def on_bot_line_reaction(event: MessageReactionUpdated, db: Database) -> None:
-    """Реакция на сообщение бота — плюс или минус шутке. Потом бот лучшие берёт за образец."""
+async def on_bot_line_reaction(event: MessageReactionUpdated, db: Database, bot: Bot, config=None) -> None:
+    """Реакция на сообщение бота — плюс или минус шутке (потом бот лучшие берёт за образец), а иногда бот на неё
+    отвечает (`_react_back`)."""
     if event.user is not None and event.user.is_bot:
         return
     delta = _react_score(event.new_reaction) - _react_score(event.old_reaction)
     if delta and await db.score_bot_line(event.chat.id, event.message_id, delta):
         logger.info("шутка бота %s/%s: %+d", event.chat.id, event.message_id, delta)
+        if event.user is not None and event.new_reaction:
+            try:
+                await _react_back(bot, db, event, delta > 0, config)
+            except Exception as e:
+                logger.warning("react back failed: %s", e)
 
 
 # ---------- команды ----------
@@ -1561,6 +1630,8 @@ async def _maybe_rhyme(message: Message, bot: Bot, config) -> bool:
 
 _thread: dict[tuple[int, int], list[float]] = {}  # когда бот отвечал этому человеку
 THREAD_WINDOW = 180                                # перепалка — ответы за последние 3 минуты
+SPAR_MAX = 5   # столько раундов подряд бот держит перепалку (10.11, владелец: «держит перепалку»; раньше отвечал всё
+#                реже: 0.5 → 0.3 → 0.15); последний раунд — финальная фраза, дальше — только реакция
 _EMPTY = re.compile(r"^\W*(да|нет|ага|угу|и\s*ч[её]|ч[её]|ну\s*и\s*\w+|знаю|ок|окей|пофиг|похуй|ладно|"
                     r"мм+|хм+|ха(ха)*|ахах\w*|лол|кек|\+|\)+|не\s*буду|буду|пойду|делай|сам\s*такой|"
                     r"я\s*тоже|и\s*я|тоже|согласен|согласна|понял|поняла|ясно|понятно|норм|база|жиза|"
@@ -1632,9 +1703,13 @@ async def _reply_once(bot: Bot, db: Database, chat_id: int, items: list[tuple[Me
     if who and not is_father:
         n = _thread_load(chat_id, who.id)
         empty = bool(_EMPTY.match(last_msg.text or ""))
-        chance = 1.0 if n < 2 else {2: 0.5, 3: 0.3}.get(n, 0.15)
+        chance = 1.0 if n < SPAR_MAX else 0.0
         if voice_back:  # голосом говорят дольше — разговор голосом бот поддерживает охотнее
-            chance = 1.0 if n < 3 else 0.5
+            chance = 1.0 if n < SPAR_MAX else 0.5
+        if n >= 1 and not empty and chance:  # перепалка: ИИ видит весь обмен и какой это раунд
+            rows = await db.recent_messages(chat_id, limit=40, since=int(time.time()) - 2 * THREAD_WINDOW)
+            ai.spar.set({"round": n + 1, "last": n + 1 >= SPAR_MAX,
+                         "lines": [("ты" if r[1] == 0 else name, r[3]) for r in rows if r[1] in (0, who.id)][-8:]})
         if empty and n >= 1:
             chance = min(chance, 0.3)
         if random.random() > chance:
@@ -2465,6 +2540,33 @@ DOSSIER_VERSION_KEY = "dossier_version"
 DOSSIER_VERSION = "3"  # 2 — Sonnet, факты с датами и цитатами; 3 — без категорий, мелочи, толкований и пометок
 
 
+MEMES_EVERY = 24 * 3600
+
+
+async def _refresh_memes(db: Database) -> None:
+    """Раз в сутки — внутренние мемы чата за неделю: бот изредка вставляет их к месту (ai.MEME_CHANCE)."""
+    if not ai.available():
+        return
+    for chat_id in await db.active_chats(int(time.time()) - 86400):
+        key = f"chat_memes:{chat_id}"
+        try:
+            cur = json.loads(await db.get_setting(key, "") or "{}")
+        except ValueError:
+            cur = {}
+        if time.time() - float(cur.get("ts", 0)) < MEMES_EVERY or _bunker_active(chat_id):
+            continue
+        rows = await db.recent_messages(chat_id, limit=600, since=int(time.time()) - 7 * 86400)
+        rows = [r for r in rows if r[1] > 0 and len(str(r[3])) > 3]
+        items = []
+        if len(rows) >= 30:
+            try:
+                items = await ai.chat_memes(_as_dicts(rows))
+            except Exception as e:
+                logger.warning("chat memes failed in %s: %s", chat_id, e)
+        await db.set_setting(key, json.dumps({"ts": time.time(), "items": items}, ensure_ascii=False))  # и при сбое — не чаще раза в сутки
+        logger.info("мемы чата %s: %s", chat_id, [m["meme"] for m in items])
+
+
 async def _heavy(bot: Bot, db: Database) -> None:
     """Раз в 10 минут: чистка старого, досье, итоги недели."""
     await db.purge_old_messages(int(time.time()) - KEEP_DAYS * 86400)
@@ -2472,6 +2574,10 @@ async def _heavy(bot: Bot, db: Database) -> None:
         await db.reset_dossier_times()
         await db.set_setting(DOSSIER_VERSION_KEY, DOSSIER_VERSION)
         logger.info("досье: пересобираю все в новом формате (%s)", DOSSIER_VERSION)
+    try:
+        await _refresh_memes(db)
+    except Exception as e:
+        logger.warning("memes refresh failed: %s", e)
     for chat_id, user_id, name, old in await db.users_needing_dossier(limit=8):
         msgs = await db.messages_since_dossier(chat_id, user_id)
         if not msgs:
