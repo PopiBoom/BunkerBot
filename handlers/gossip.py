@@ -81,6 +81,12 @@ async def make_episode(db: Database, progress=night._noop, letter: dict | None =
     day = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"][now.weekday()]
     facts = f"сегодня {ai.date_words(now.date())}, {day}; сейчас {night._clock(now)}; " + (
         cond["line"] or "погода неизвестна")
+    if letter:  # сплетню через бота прислал сам админ — фамилии оставляем, как в своей (владелец 10.11)
+        import os
+
+        from config import _parse_ids
+
+        letter = {**letter, "trusted": letter.get("uid") in _parse_ids(os.getenv("ADMIN_IDS", ""))}
     story = await ai.gossip_story(used[-12:], facts, now.date(), listener=letter, own=own)
     if not story:
         raise RuntimeError("ИИ не написал выпуск")
